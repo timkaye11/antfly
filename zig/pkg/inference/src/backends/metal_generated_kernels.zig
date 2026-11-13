@@ -608,6 +608,14 @@ pub const Kernels = struct {
         ) != 0) return error.GeneratedMetalDispatchFailed;
     }
 
+    /// Exact-window owners may roll host publication metadata back only while
+    /// their provider frame is still active and unsubmitted.
+    pub fn runBoundedCoalescedOnActiveRuntime(self: *Kernels, owner_runtime: *mr.RawMetalDecodeRuntime, submission_epoch: u64, params: Params, inputs: []const Ref, output: Ref, write_mask: u8) !void {
+        if (!mr.hasActiveFrame(owner_runtime) or mr.hasSubmittedFrame(owner_runtime) or mr.frameCommandBufferCount(owner_runtime) != submission_epoch) return error.ContextTransactionBusy;
+        try self.runCoalescedOnActiveRuntime(owner_runtime, params, inputs, output, write_mask);
+        if (!mr.hasActiveFrame(owner_runtime) or mr.hasSubmittedFrame(owner_runtime) or mr.frameCommandBufferCount(owner_runtime) != submission_epoch) return error.ContextTransactionBusy;
+    }
+
     fn runOnActiveRuntimeImpl(
         self: *Kernels,
         comptime coalesced: bool,
@@ -728,6 +736,12 @@ pub const Kernels = struct {
             group[2],
             write_mask,
         ) != 0) return error.GeneratedMetalDispatchFailed;
+    }
+
+    pub fn runThreadgroupsPipelineBoundedCoalescedOnActiveRuntime(self: *Kernels, owner_runtime: *mr.RawMetalDecodeRuntime, submission_epoch: u64, pipeline: *mr.RawMetalGeneratedPipeline, params: Params, inputs: []const Ref, output: Ref, grid: [3]usize, group: [3]usize, write_mask: u8) !void {
+        if (!mr.hasActiveFrame(owner_runtime) or mr.hasSubmittedFrame(owner_runtime) or mr.frameCommandBufferCount(owner_runtime) != submission_epoch) return error.ContextTransactionBusy;
+        try self.runThreadgroupsPipelineCoalescedOnActiveRuntime(owner_runtime, pipeline, params, inputs, output, grid, group, write_mask);
+        if (!mr.hasActiveFrame(owner_runtime) or mr.hasSubmittedFrame(owner_runtime) or mr.frameCommandBufferCount(owner_runtime) != submission_epoch) return error.ContextTransactionBusy;
     }
 
     fn runThreadgroupsPipelineOnActiveRuntimeImpl(

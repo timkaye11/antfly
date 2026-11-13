@@ -50,6 +50,7 @@ const metal_runtime = @import("metal_runtime.zig");
 const owner_alloc = @import("../runtime/kv/host_allocation_tracker.zig");
 const context_teacher_forced = @import("context_teacher_forced.zig");
 const attention_match_storage = @import("../ops/metal_attention_match_storage.zig");
+const checkpoint = @import("../runtime/kv/attention_match_checkpoint.zig");
 const AttentionMatchControl = @import("../runtime/kv/attention_match.zig").Control;
 
 fn fingerprintU32(hash: *std.crypto.hash.sha2.Sha256, value: usize) !void {
@@ -222,6 +223,30 @@ const SlotBinding = struct {
     }
 };
 
+const ExactExportSourceSnapshot = struct {
+    slot: usize,
+    written_tokens: usize,
+    position_offset: usize,
+    key_handle: *anyopaque,
+    value_handle: *anyopaque,
+    key_capacity: usize,
+    value_capacity: usize,
+    key_row_bytes: usize,
+    value_row_stride: usize,
+    info_tokens: usize,
+    info_position_offset: usize,
+
+    fn matches(self: @This(), binding: SlotBinding, info: MetalKvStorage.SlotInfo) bool {
+        return binding.slot == self.slot and binding.selected_positions == null and binding.physical_base_tokens == 0 and
+            binding.ring_page_count == 0 and binding.logical_contiguous and binding.written_tokens == self.written_tokens and
+            binding.position_offset == self.position_offset and info.encoded_key_handle != null and info.v_handle != null and
+            info.encoded_key_handle.? == self.key_handle and info.v_handle.? == self.value_handle and
+            info.encoded_key_capacity == self.key_capacity and info.v_capacity == self.value_capacity and
+            info.key_row_bytes == self.key_row_bytes and info.v_row_stride == self.value_row_stride and
+            info.tokens == self.info_tokens and info.position_offset == self.info_position_offset;
+    }
+};
+
 pub const AttentionMatchBinding = struct {
     diagnostic_only: bool = false,
     sequence: storage_runtime.SequenceId,
@@ -245,6 +270,20 @@ pub const AttentionMatchBinding = struct {
             self.rollback_tokens,
         });
         self.device.deinit();
+    }
+};
+
+pub const AttentionMatchLocalCapacityPolicy = enum { legacy_spare512_v1, exact_window_causal_union_v1 };
+const AttentionMatchLocalCapacityState = struct {
+    policy: AttentionMatchLocalCapacityPolicy = .legacy_spare512_v1,
+    locked: bool = false,
+    fn configure(self: *@This(), requested: AttentionMatchLocalCapacityPolicy) !void {
+        if (self.locked and self.policy != requested) return error.AttentionMatchLocalCapacityPolicyChanged;
+        self.policy = requested;
+    }
+    fn lock(self: *@This()) attention_match_storage.RunnerOptions {
+        self.locked = true;
+        return .{ .exact_local_window_capacity = self.policy == .exact_window_causal_union_v1 };
     }
 };
 
@@ -274,8 +313,10 @@ pub const MetalKvStorage = struct {
     /// leave this null and disclose their retained residency separately.
     owner_allocation_tracker: ?*owner_alloc.HostAllocationTracker = null,
     slot_accounted_live_bytes: [metal_runtime.attention_span_slot_capacity]usize = @splat(0),
+    last_owner_transition: if (builtin.is_test) struct { slot: usize = 0, prior: usize = 0, newly_allocated: usize = 0, final: usize = 0 } else void = if (builtin.is_test) .{} else {},
     cyclic_page_table_cache: storage_runtime.CyclicPageTableCache = .{},
     attention_match_runner: ?attention_match_storage.Runner = null,
+    attention_match_local_capacity: AttentionMatchLocalCapacityState = .{},
     attention_match_binding: ?*AttentionMatchBinding = null,
     attention_match_revision: u64 = 0,
 
@@ -315,6 +356,45 @@ pub const MetalKvStorage = struct {
             .owner_allocation_tracker = owner_allocation_tracker,
         };
         return self;
+    }
+
+    fn ownerBindingEmpty(self: *const MetalKvStorage) bool {
+        if (metal_runtime.hasActiveFrame(self.runtime) or metal_runtime.hasSubmittedFrame(self.runtime)) return false;
+        if (self.slot_map.count() != 0 or self.global_layer_slots.count() != 0 or
+            self.attention_match_binding != null or self.attention_match_runner != null or
+            self.cyclic_page_table_cache.offsets.items.len != 0)
+            return false;
+        for (self.leased_slots) |leased| if (leased) return false;
+        for (self.slot_accounted_live_bytes) |bytes| if (bytes != 0) return false;
+        for (self.slot_ring_page_count) |pages| if (pages != 0) return false;
+        for (self.slot_ring_policy_initialized) |initialized| if (initialized) return false;
+        for (self.slot_buffer_capacity_tokens) |capacity| if (capacity != 0) return false;
+        return true;
+    }
+
+    fn prepareRequestOwnerDetach(self: *MetalKvStorage) !void {
+        if (metal_runtime.hasActiveFrame(self.runtime) or metal_runtime.hasSubmittedFrame(self.runtime) or
+            self.slot_map.count() != 0 or self.attention_match_binding != null)
+            return error.ContextFrameOwnershipMismatch;
+        self.global_layer_slots.clearRetainingCapacity();
+        for (self.leased_slots, 0..) |leased, slot| if (leased) try self.discardPrivateSlotRequired(slot);
+        self.cyclic_page_table_cache.deinit(self.allocator);
+        if (self.attention_match_runner) |*runner| runner.deinit();
+        self.attention_match_runner = null;
+        if (!self.ownerBindingEmpty()) return error.ContextFrameOwnershipMismatch;
+    }
+
+    pub fn bindRequestOwnerTracker(self: *MetalKvStorage, tracker: *owner_alloc.HostAllocationTracker) !void {
+        if (self.owner_allocation_tracker != null or !self.ownerBindingEmpty())
+            return error.ContextFrameOwnershipMismatch;
+        self.owner_allocation_tracker = tracker;
+    }
+
+    pub fn unbindRequestOwnerTracker(self: *MetalKvStorage, tracker: *owner_alloc.HostAllocationTracker) !void {
+        if (self.owner_allocation_tracker != tracker)
+            return error.ContextFrameOwnershipMismatch;
+        try self.prepareRequestOwnerDetach();
+        self.owner_allocation_tracker = null;
     }
 
     fn allocateSlot(self: *MetalKvStorage) !usize {
@@ -363,6 +443,17 @@ pub const MetalKvStorage = struct {
         self.slot_buffer_capacity_tokens[slot] = 0;
     }
 
+    fn discardPrivateSlotRequired(self: *MetalKvStorage, slot: usize) !void {
+        if (slot >= self.leased_slots.len or !self.leased_slots[slot]) return error.UnsafeExactCloneSourceDiscard;
+        if (metal_runtime.termite_metal_decode_runtime_discard_paged_kv_slot(self.runtime, slot) != 0)
+            return error.UnsafeExactCloneSourceDiscard;
+        try self.reconcileSlotAccounting(slot, 0);
+        self.leased_slots[slot] = false;
+        self.slot_ring_page_count[slot] = 0;
+        self.slot_ring_policy_initialized[slot] = false;
+        self.slot_buffer_capacity_tokens[slot] = 0;
+    }
+
     fn slotAllocationInfo(self: *MetalKvStorage, slot: usize) !metal_runtime.PagedKvSlotAllocationInfo {
         var info: metal_runtime.PagedKvSlotAllocationInfo = undefined;
         if (metal_runtime.termite_metal_decode_runtime_attention_span_slot_allocation_info(self.runtime, slot, &info) != 0)
@@ -389,6 +480,7 @@ pub const MetalKvStorage = struct {
         const prior = self.slot_accounted_live_bytes[slot];
         const info = try self.slotAllocationInfo(slot);
         const final = if (info.leased == 0) 0 else try slotLiveBytes(info);
+        if (comptime builtin.is_test) self.last_owner_transition = .{ .slot = slot, .prior = prior, .newly_allocated = newly_allocated_bytes, .final = final };
         try tracker.recordDeviceTransition(.private_device, prior, newly_allocated_bytes, final);
         self.slot_accounted_live_bytes[slot] = final;
     }
@@ -682,6 +774,10 @@ pub const MetalKvStorage = struct {
         return @ptrCast(@alignCast(hook.ctx));
     }
 
+    pub fn configureAttentionMatchLocalCapacityPolicy(self: *MetalKvStorage, requested: AttentionMatchLocalCapacityPolicy) !void {
+        try self.attention_match_local_capacity.configure(requested);
+    }
+
     pub fn attentionMatchBackend(
         self: *MetalKvStorage,
         allocator: std.mem.Allocator,
@@ -691,9 +787,10 @@ pub const MetalKvStorage = struct {
         if (self.format != .f16) return error.UnsupportedMetalKvCheckpointEncoding;
         const tracker = self.owner_allocation_tracker orelse return error.ContextPhysicalAccountingUnavailable;
         if (self.attention_match_runner == null) {
-            self.attention_match_runner = try attention_match_storage.Runner.init(
+            self.attention_match_runner = try attention_match_storage.Runner.initWithOptions(
                 max_device_bytes,
                 tracker,
+                self.attention_match_local_capacity.lock(),
             );
         } else self.attention_match_runner.?.raiseMaxDeviceBytes(max_device_bytes);
         return self.attention_match_runner.?.backend(allocator, limits);
@@ -702,6 +799,10 @@ pub const MetalKvStorage = struct {
     pub fn attentionMatchRunner(self: *MetalKvStorage) ?*attention_match_storage.Runner {
         if (self.attention_match_runner) |*runner| return runner;
         return null;
+    }
+
+    pub fn attentionMatchExactLocalWindowCapacity(self: *const MetalKvStorage) bool {
+        return if (self.attention_match_runner) |runner| runner.exact_local_window_capacity else false;
     }
 
     pub fn retireExactKvForAttentionMatch(self: *MetalKvStorage) void {
@@ -771,7 +872,8 @@ pub const MetalKvStorage = struct {
         for (request.donors) |donor| {
             const width = try std.math.mul(usize, donor.heads, donor.dim);
             const row_bytes = try std.math.mul(usize, width, @sizeOf(f16));
-            const buffer_bytes = try std.math.mul(usize, request.capacity, row_bytes);
+            const capacity_rows: usize = if (donor.capacity_rows == 0) request.capacity else donor.capacity_rows;
+            const buffer_bytes = try std.math.mul(usize, capacity_rows, row_bytes);
             // Metal private buffers may round their backing allocation to a
             // 16 KiB VM page. Bound K and V independently before allocating.
             const rounded = try std.math.add(usize, buffer_bytes, 16 * 1024 - 1);
@@ -801,12 +903,18 @@ pub const MetalKvStorage = struct {
             return error.DeviceKvCloneUnsupported;
 
         const allocation_bound = try cloneAllocationBytes(request);
+        const admitted_host_staging_bytes = try request.hostStagingBytes(@sizeOf(f16));
         try request.check();
 
         const Staged = struct {
             key: SlotKey,
             slot: usize,
             layout: @TypeOf(destination.rowLayout(1, 1)),
+            capacity_rows: usize,
+            ring_page_count: usize,
+            sliding_window_tokens: usize,
+            written_tokens: usize,
+            position_offset: usize,
         };
         var staged: [256]Staged = undefined;
 
@@ -816,10 +924,24 @@ pub const MetalKvStorage = struct {
             const key = SlotKey{ .sequence_id = request.source_sequence, .layer_index = donor.layer };
             const binding = source.slot_map.get(key) orelse return error.InvalidDeviceKvClone;
             const layout = source.rowLayout(donor.heads, donor.dim);
-            if (binding.selected_positions != null or binding.ring_page_count != 0 or
-                !binding.logical_contiguous or binding.physical_base_tokens != 0 or
-                binding.written_tokens != request.tokens or binding.position_offset != 0)
+            const capacity_rows: usize = if (donor.capacity_rows == 0) request.capacity else donor.capacity_rows;
+            const expected_ring_rows = try std.math.mul(usize, binding.ring_page_count, request.page_size);
+            if (binding.selected_positions != null or binding.physical_base_tokens != 0) {
+                std.log.err("device_kv_clone_layout_rejection group=binding_selection_base source_sequence={d} destination_sequence={d} layer={d} heads={d} dim={d} selected_positions_present={} physical_base_tokens={d}", .{ request.source_sequence, request.destination_sequence, donor.layer, donor.heads, donor.dim, binding.selected_positions != null, binding.physical_base_tokens });
                 return error.UnsupportedDeviceKvCloneLayout;
+            }
+            if (binding.written_tokens != request.tokens or binding.position_offset != 0) {
+                std.log.err("device_kv_clone_layout_rejection group=binding_token_offset source_sequence={d} destination_sequence={d} layer={d} written_tokens={d} request_tokens={d} position_offset={d}", .{ request.source_sequence, request.destination_sequence, donor.layer, binding.written_tokens, request.tokens, binding.position_offset });
+                return error.UnsupportedDeviceKvCloneLayout;
+            }
+            if (binding.ring_page_count == 0 and (donor.host_staged_ring or !binding.logical_contiguous or capacity_rows < request.tokens)) {
+                std.log.err("device_kv_clone_layout_rejection group=binding_contiguous source_sequence={d} destination_sequence={d} layer={d} ring_page_count={d} host_staged_ring={} logical_contiguous={} capacity_rows={d} request_tokens={d} page_size={d}", .{ request.source_sequence, request.destination_sequence, donor.layer, binding.ring_page_count, donor.host_staged_ring, binding.logical_contiguous, capacity_rows, request.tokens, request.page_size });
+                return error.UnsupportedDeviceKvCloneLayout;
+            }
+            if (binding.ring_page_count != 0 and (!donor.host_staged_ring or binding.logical_contiguous or capacity_rows != expected_ring_rows)) {
+                std.log.err("device_kv_clone_layout_rejection group=binding_ring source_sequence={d} destination_sequence={d} layer={d} ring_page_count={d} host_staged_ring={} logical_contiguous={} capacity_rows={d} expected_ring_rows={d} page_size={d}", .{ request.source_sequence, request.destination_sequence, donor.layer, binding.ring_page_count, donor.host_staged_ring, binding.logical_contiguous, capacity_rows, expected_ring_rows, request.page_size });
+                return error.UnsupportedDeviceKvCloneLayout;
+            }
             const info = try source.slotInfo(binding.slot);
             const key_bytes = try std.math.mul(usize, request.tokens, layout.key_row_bytes);
             const value_bytes = try std.math.mul(
@@ -827,15 +949,25 @@ pub const MetalKvStorage = struct {
                 try std.math.mul(usize, request.tokens, layout.v_row_stride),
                 @sizeOf(f16),
             );
+            const required_key_capacity = @min(key_bytes, capacity_rows * layout.key_row_bytes);
+            const required_value_capacity = @min(value_bytes, capacity_rows * layout.v_row_stride * @sizeOf(f16));
             if (info.tokens != request.tokens or info.position_offset != 0 or
                 info.key_row_bytes != layout.key_row_bytes or info.v_row_stride != layout.v_row_stride or
                 info.encoded_key_handle == null or info.v_handle == null or
-                info.encoded_key_capacity < key_bytes or info.v_capacity < value_bytes)
+                info.encoded_key_capacity < required_key_capacity or info.v_capacity < required_value_capacity)
+            {
+                std.log.err("device_kv_clone_layout_rejection group=slot_info source_sequence={d} destination_sequence={d} layer={d} info_tokens={d} request_tokens={d} info_position_offset={d} info_key_row_bytes={d} expected_key_row_bytes={d} info_v_row_stride={d} expected_v_row_stride={d} encoded_key_handle_present={} v_handle_present={} encoded_key_capacity={d} required_key_capacity={d} v_capacity={d} required_value_capacity={d}", .{ request.source_sequence, request.destination_sequence, donor.layer, info.tokens, request.tokens, info.position_offset, info.key_row_bytes, layout.key_row_bytes, info.v_row_stride, layout.v_row_stride, info.encoded_key_handle != null, info.v_handle != null, info.encoded_key_capacity, required_key_capacity, info.v_capacity, required_value_capacity });
                 return error.UnsupportedDeviceKvCloneLayout;
+            }
             staged[index] = .{
                 .key = .{ .sequence_id = request.destination_sequence, .layer_index = donor.layer },
                 .slot = binding.slot,
                 .layout = layout,
+                .capacity_rows = capacity_rows,
+                .ring_page_count = binding.ring_page_count,
+                .sliding_window_tokens = binding.sliding_window_tokens,
+                .written_tokens = binding.written_tokens,
+                .position_offset = binding.position_offset,
             };
         }
         try destination.slot_map.ensureUnusedCapacity(destination.allocator, @intCast(request.donors.len));
@@ -843,13 +975,14 @@ pub const MetalKvStorage = struct {
         var staged_count: usize = 0;
         errdefer for (staged[0..staged_count]) |entry| destination.discardPrivateSlot(entry.slot);
         var copied_bytes: usize = 0;
+        var peak_host_staging_bytes: usize = 0;
         for (staged[0..request.donors.len]) |*entry| {
             try request.check();
             const source_slot = entry.slot;
             var destination_slot = try destination.allocateSlot();
             errdefer destination.discardPrivateSlot(destination_slot);
 
-            const requested_buffer_bytes = try std.math.mul(usize, request.capacity, entry.layout.key_row_bytes);
+            const requested_buffer_bytes = try std.math.mul(usize, entry.capacity_rows, entry.layout.key_row_bytes);
             const rounded = try std.math.add(usize, requested_buffer_bytes, 16 * 1024 - 1);
             const per_donor_bound = try std.math.mul(usize, rounded & ~@as(usize, 16 * 1024 - 1), 2);
             var allocation = try destination.slotAllocationInfo(destination_slot);
@@ -863,9 +996,9 @@ pub const MetalKvStorage = struct {
             }
             try destination.reserveSlotCapacity(
                 destination_slot,
-                request.capacity,
+                entry.capacity_rows,
                 request.page_size,
-                0,
+                entry.ring_page_count,
                 entry.layout.key_row_bytes,
                 entry.layout.v_row_stride,
             );
@@ -873,23 +1006,59 @@ pub const MetalKvStorage = struct {
             if (try slotLiveBytes(allocation) > per_donor_bound)
                 return error.DeviceKvCloneBudgetExceeded;
 
-            const clone_rc = metal_runtime.termite_metal_decode_runtime_clone_attention_span_slot_prefix(
-                destination.runtime,
-                source_slot,
-                destination_slot,
-                @backingInt(destination.format),
-                request.tokens,
-                entry.layout.key_row_bytes,
-                entry.layout.v_row_stride,
-                0,
-            );
-            if (clone_rc != 0) return error.DeviceKvCloneUnsupported;
+            if (entry.ring_page_count == 0) {
+                const clone_rc = metal_runtime.termite_metal_decode_runtime_clone_attention_span_slot_prefix(
+                    destination.runtime,
+                    source_slot,
+                    destination_slot,
+                    @backingInt(destination.format),
+                    request.tokens,
+                    entry.layout.key_row_bytes,
+                    entry.layout.v_row_stride,
+                    0,
+                );
+                if (clone_rc != 0) return error.DeviceKvCloneUnsupported;
+            } else {
+                // Preserve the physical ring and its logical-page mapping.
+                // Only the bounded local ring is staged through host memory;
+                // global full-history donors remain device-to-device clones.
+                const source_info = try source.slotInfo(source_slot);
+                const destination_info = try destination.slotInfo(destination_slot);
+                const key_bytes = try std.math.mul(usize, entry.capacity_rows, entry.layout.key_row_bytes);
+                const value_row_bytes = try std.math.mul(usize, entry.layout.v_row_stride, @sizeOf(f16));
+                const value_bytes = try std.math.mul(usize, entry.capacity_rows, value_row_bytes);
+                peak_host_staging_bytes = @max(peak_host_staging_bytes, try std.math.add(usize, key_bytes, value_bytes));
+                if (peak_host_staging_bytes > admitted_host_staging_bytes)
+                    return error.DeviceKvCloneHostStagingBudgetExceeded;
+                const key_staging = try destination.allocator.alloc(u8, key_bytes);
+                defer destination.allocator.free(key_staging);
+                const value_staging = try destination.allocator.alloc(u8, value_bytes);
+                defer destination.allocator.free(value_staging);
+                try request.check();
+                if (metal_runtime.termite_metal_buffer_download(destination.runtime, source_info.encoded_key_handle.?, 0, key_staging.ptr, key_bytes) != 0 or
+                    metal_runtime.termite_metal_buffer_download(destination.runtime, source_info.v_handle.?, 0, value_staging.ptr, value_bytes) != 0 or
+                    metal_runtime.termite_metal_buffer_upload(destination.runtime, destination_info.encoded_key_handle.?, 0, key_staging.ptr, key_bytes) != 0 or
+                    metal_runtime.termite_metal_buffer_upload(destination.runtime, destination_info.v_handle.?, 0, value_staging.ptr, value_bytes) != 0)
+                    return error.DeviceKvCloneUnsupported;
+                if (metal_runtime.termite_metal_decode_runtime_publish_attention_span_slot_ring(
+                    destination.runtime,
+                    destination_slot,
+                    entry.written_tokens,
+                    entry.capacity_rows,
+                    entry.layout.key_row_bytes,
+                    entry.layout.v_row_stride,
+                    entry.position_offset,
+                ) != 0) return error.DeviceKvCloneUnsupported;
+            }
+            allocation = try destination.slotAllocationInfo(destination_slot);
+            if (try slotLiveBytes(allocation) > per_donor_bound)
+                return error.DeviceKvCloneBudgetExceeded;
             entry.slot = destination_slot;
-            destination.slot_ring_page_count[destination_slot] = 0;
+            destination.slot_ring_page_count[destination_slot] = entry.ring_page_count;
             destination.slot_ring_policy_initialized[destination_slot] = true;
             copied_bytes = try std.math.add(usize, copied_bytes, try std.math.mul(
                 usize,
-                request.tokens,
+                if (entry.ring_page_count == 0) request.tokens else entry.capacity_rows,
                 try std.math.mul(usize, entry.layout.key_row_bytes, 2),
             ));
             staged_count += 1;
@@ -902,10 +1071,12 @@ pub const MetalKvStorage = struct {
             destination.slot_map.putAssumeCapacityNoClobber(entry.key, .{
                 .slot = entry.slot,
                 .sequence_owned = true,
-                .logical_contiguous = true,
+                .logical_contiguous = entry.ring_page_count == 0,
+                .ring_page_count = entry.ring_page_count,
+                .sliding_window_tokens = entry.sliding_window_tokens,
                 .physical_base_tokens = 0,
-                .written_tokens = request.tokens,
-                .position_offset = 0,
+                .written_tokens = entry.written_tokens,
+                .position_offset = entry.position_offset,
             });
         }
         staged_count = 0;
@@ -913,8 +1084,99 @@ pub const MetalKvStorage = struct {
         return .{
             .allocation_bound_bytes = allocation_bound,
             .copied_bytes = copied_bytes,
+            .peak_host_staging_bytes = peak_host_staging_bytes,
             .donors = request.donors.len,
         };
+    }
+
+    fn exportExactLayerRanges(ctx: *anyopaque, request: storage_runtime.ExactLayerRangeExportRequest) anyerror!storage_runtime.ExactLayerRangeExportResult {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        if (self.format != .f16 or self.attention_match_binding != null or metal_runtime.hasActiveFrame(self.runtime) or metal_runtime.hasSubmittedFrame(self.runtime)) return error.DeviceKvExportUnsupported;
+        const admitted = try request.validate();
+        try request.check();
+        var copies: [256]metal_runtime.ExactKvRangeCopy = undefined;
+        var observed: [256]ExactExportSourceSnapshot = undefined;
+        for (request.ranges, 0..) |range, i| {
+            const binding = self.slot_map.get(.{ .sequence_id = request.source_sequence, .layer_index = range.layer_index }) orelse {
+                std.log.err("exact_range_export_source_rejected group=missing_binding sequence={d} layer={d} expected_tokens={d} expected_offset={d}", .{ request.source_sequence, range.layer_index, request.expected_written_tokens, request.expected_position_offset });
+                return error.InvalidExactLayerRangeExportSource;
+            };
+            if (binding.selected_positions != null or binding.physical_base_tokens != 0 or binding.ring_page_count != 0 or !binding.logical_contiguous or binding.written_tokens != request.expected_written_tokens or binding.position_offset != request.expected_position_offset) {
+                std.log.err("exact_range_export_source_rejected group=binding sequence={d} layer={d} slot={d} selected_positions={} physical_base={d} ring_pages={d} contiguous={} written={d} expected_tokens={d} offset={d} expected_offset={d}", .{ request.source_sequence, range.layer_index, binding.slot, binding.selected_positions != null, binding.physical_base_tokens, binding.ring_page_count, binding.logical_contiguous, binding.written_tokens, request.expected_written_tokens, binding.position_offset, request.expected_position_offset });
+                return error.InvalidExactLayerRangeExportSource;
+            }
+            const layout = self.rowLayout(range.num_kv_heads, range.head_dim);
+            const info = try self.slotInfo(binding.slot);
+            const bytes = try std.math.mul(usize, range.rows, layout.key_row_bytes);
+            const source_offset = try std.math.mul(usize, range.source_start, layout.key_row_bytes);
+            if (info.tokens != request.expected_written_tokens or info.position_offset != request.expected_position_offset or
+                info.key_row_bytes != layout.key_row_bytes or info.v_row_stride != layout.v_row_stride or
+                info.encoded_key_handle == null or info.v_handle == null or source_offset > info.encoded_key_capacity or
+                bytes > info.encoded_key_capacity - source_offset or source_offset > info.v_capacity or
+                bytes > info.v_capacity - source_offset)
+            {
+                std.log.err("exact_range_export_source_rejected group=slot sequence={d} layer={d} slot={d} info_tokens={d} expected_tokens={d} info_offset={d} expected_offset={d} key_row={d} expected_key_row={d} value_stride={d} expected_value_stride={d} key_handle={} value_handle={} source_offset={d} bytes={d} key_capacity={d} value_capacity={d}", .{ request.source_sequence, range.layer_index, binding.slot, info.tokens, request.expected_written_tokens, info.position_offset, request.expected_position_offset, info.key_row_bytes, layout.key_row_bytes, info.v_row_stride, layout.v_row_stride, info.encoded_key_handle != null, info.v_handle != null, source_offset, bytes, info.encoded_key_capacity, info.v_capacity });
+                return error.InvalidExactLayerRangeExportSource;
+            }
+            observed[i] = .{
+                .slot = binding.slot,
+                .written_tokens = binding.written_tokens,
+                .position_offset = binding.position_offset,
+                .key_handle = info.encoded_key_handle.?,
+                .value_handle = info.v_handle.?,
+                .key_capacity = info.encoded_key_capacity,
+                .value_capacity = info.v_capacity,
+                .key_row_bytes = info.key_row_bytes,
+                .value_row_stride = info.v_row_stride,
+                .info_tokens = info.tokens,
+                .info_position_offset = info.position_offset,
+            };
+            copies[i] = .{ .src_k = info.encoded_key_handle.?, .src_v = info.v_handle.?, .src_k_offset = source_offset, .src_v_offset = source_offset, .dst_k = range.destination_k.handle, .dst_v = range.destination_v.handle, .dst_k_offset = range.destination_k.byte_offset, .dst_v_offset = range.destination_v.byte_offset, .bytes = bytes, .rows = @intCast(range.rows), .source_start = @intCast(range.source_start), .heads = range.num_kv_heads, .dim = range.head_dim, .destination_head_capacity_rows = @intCast(range.destination_head_capacity_rows), .destination_ring_capacity_rows = @intCast(range.destination_ring_capacity_rows), .destination_layout = @backingInt(range.destination_layout) };
+        }
+        for (request.ranges) |range| for (copies[0..request.ranges.len]) |source| if (range.destination_k.handle == source.src_k.? or range.destination_k.handle == source.src_v.? or range.destination_v.handle == source.src_k.? or range.destination_v.handle == source.src_v.?) return error.AliasedExactLayerRangeExport;
+        try request.check();
+        if (metal_runtime.termite_metal_exact_kv_range_copy_batch(self.runtime, copies[0..request.ranges.len].ptr, request.ranges.len) != 0) return error.MetalExactLayerRangeExportFailed;
+        try request.check();
+        for (request.ranges, 0..) |range, i| {
+            const binding = self.slot_map.get(.{ .sequence_id = request.source_sequence, .layer_index = range.layer_index }) orelse return error.ExactLayerRangeExportSourceChanged;
+            const info = try self.slotInfo(binding.slot);
+            if (!observed[i].matches(binding, info))
+                return error.ExactLayerRangeExportSourceChanged;
+        }
+        // The exact range batch consumes source/destination Metal handles and
+        // offsets directly. No host allocation or materialization occurs in
+        // this exporter before the fenced completion receipt.
+        return .{ .copied_bytes = admitted, .layers = request.ranges.len, .fenced = true, .peak_host_staging_bytes = 0 };
+    }
+
+    test "exact export source snapshot rejects binding and buffer mutation" {
+        var key: u8 = 0;
+        var value: u8 = 0;
+        var other: u8 = 0;
+        var binding: SlotBinding = .{ .slot = 3, .logical_contiguous = true, .written_tokens = 8 };
+        var info: SlotInfo = .{ .encoded_key_handle = &key, .encoded_key_capacity = 64, .v_handle = &value, .v_capacity = 64, .tokens = 8, .key_row_bytes = 8, .v_row_stride = 4 };
+        const snapshot: ExactExportSourceSnapshot = .{
+            .slot = 3,
+            .written_tokens = 8,
+            .position_offset = 0,
+            .key_handle = &key,
+            .value_handle = &value,
+            .key_capacity = 64,
+            .value_capacity = 64,
+            .key_row_bytes = 8,
+            .value_row_stride = 4,
+            .info_tokens = 8,
+            .info_position_offset = 0,
+        };
+        try std.testing.expect(snapshot.matches(binding, info));
+        binding.ring_page_count = 1;
+        try std.testing.expect(!snapshot.matches(binding, info));
+        binding.ring_page_count = 0;
+        info.encoded_key_handle = &other;
+        try std.testing.expect(!snapshot.matches(binding, info));
+        info.encoded_key_handle = &key;
+        info.tokens = 7;
+        try std.testing.expect(!snapshot.matches(binding, info));
     }
 
     fn traceKvGather() bool {
@@ -1460,6 +1722,53 @@ pub const MetalKvStorage = struct {
         self.releaseSequenceSlots(sequence_id);
     }
 
+    fn discardExactCloneSourceOp(ctx: *anyopaque, sequence_id: storage_runtime.SequenceId) anyerror!storage_runtime.ExactCloneSourceDiscard {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        if (sequence_id == 0 or self.attention_match_binding != null or
+            metal_runtime.hasActiveFrame(self.runtime) or metal_runtime.hasSubmittedFrame(self.runtime))
+            return error.UnsafeExactCloneSourceDiscard;
+        var referenced: [metal_runtime.attention_span_slot_capacity]bool = @splat(false);
+        var keys: [metal_runtime.attention_span_slot_capacity]SlotKey = undefined;
+        var key_count: usize = 0;
+        var it = self.slot_map.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.sequence_id != sequence_id or entry.value_ptr.selected_positions != null or
+                entry.value_ptr.slot >= referenced.len or key_count == keys.len)
+                return error.UnsafeExactCloneSourceDiscard;
+            keys[key_count] = entry.key_ptr.*;
+            key_count += 1;
+            referenced[entry.value_ptr.slot] = true;
+        }
+        if (key_count == 0) return error.UnsafeExactCloneSourceDiscard;
+        var globals = self.global_layer_slots.iterator();
+        while (globals.next()) |entry| {
+            if (entry.value_ptr.* >= referenced.len or !referenced[entry.value_ptr.*])
+                return error.UnsafeExactCloneSourceDiscard;
+        }
+        var slot_count: usize = 0;
+        for (self.leased_slots, 0..) |leased, slot| {
+            if (leased != referenced[slot]) return error.UnsafeExactCloneSourceDiscard;
+            if (leased) slot_count += 1;
+        }
+        if (slot_count == 0) return error.UnsafeExactCloneSourceDiscard;
+        const before = self.allocationSnapshot();
+        for (keys[0..key_count]) |key| {
+            const removed = self.slot_map.fetchRemove(key) orelse return error.UnsafeExactCloneSourceDiscard;
+            if (removed.value.selected_positions) |positions| self.allocator.free(positions);
+        }
+        self.global_layer_slots.clearRetainingCapacity();
+        for (referenced, 0..) |selected, slot| if (selected) try self.discardPrivateSlotRequired(slot);
+        const after = self.allocationSnapshot();
+        if (after.live_bytes != 0 or before.live_bytes < after.live_bytes)
+            return error.UnsafeExactCloneSourceDiscard;
+        return .{
+            .slots = slot_count,
+            .live_bytes_before = before.live_bytes,
+            .live_bytes_after = after.live_bytes,
+            .physically_released_bytes = before.live_bytes - after.live_bytes,
+        };
+    }
+
     /// The storage/runtime ABI can stage and atomically publish compacted K/V
     /// rows with an explicit absolute-position table. Production admission is
     /// a separate pipeline qualification decision; this bit only describes
@@ -1605,36 +1914,50 @@ pub const MetalKvStorage = struct {
             .sequence_id = range.sequence,
             .layer_index = range.layer,
         }) orelse return error.DeviceReadUnsupported;
-        if (binding.selected_positions != null or binding.ring_page_count != 0 or
-            !binding.logical_contiguous or binding.position_offset != 0 or
-            binding.written_tokens != range.logical_length)
+        if (binding.selected_positions != null or binding.position_offset != 0 or
+            binding.written_tokens != range.logical_length or
+            (binding.ring_page_count == 0 and !binding.logical_contiguous) or
+            (binding.ring_page_count != 0 and binding.logical_contiguous))
             return error.UnsupportedKvSnapshotLayout;
         const info = try self.slotInfo(binding.slot);
         const row_bytes = std.math.mul(usize, width, @sizeOf(f16)) catch return error.InvalidKvCheckpoint;
-        if (info.key_row_bytes != row_bytes or info.v_row_stride != width or info.tokens < range.logical_length)
+        if (info.key_row_bytes != row_bytes or info.v_row_stride != width or
+            (binding.ring_page_count == 0 and info.tokens < range.logical_length))
             return error.UnsupportedKvSnapshotLayout;
-        const first_row = std.math.add(usize, binding.physical_base_tokens, range.start) catch return error.InvalidKvCheckpoint;
-        const byte_offset = std.math.mul(usize, first_row, row_bytes) catch return error.InvalidKvCheckpoint;
         const byte_count = std.math.mul(usize, range.count, row_bytes) catch return error.InvalidKvCheckpoint;
-        if (byte_offset > info.encoded_key_capacity or byte_count > info.encoded_key_capacity - byte_offset or
-            byte_offset > info.v_capacity or byte_count > info.v_capacity - byte_offset)
-            return error.InvalidKvCheckpoint;
         const encoded_keys = std.mem.sliceAsBytes(keys)[0..byte_count];
         const encoded_values = std.mem.sliceAsBytes(values)[0..byte_count];
-        if (metal_runtime.termite_metal_buffer_download(
-            self.runtime,
-            info.encoded_key_handle orelse return error.DeviceReadUnsupported,
-            byte_offset,
-            @ptrCast(encoded_keys.ptr),
-            byte_count,
-        ) != 0) return error.MetalDeviceReadFailed;
-        if (metal_runtime.termite_metal_buffer_download(
-            self.runtime,
-            info.v_handle orelse return error.DeviceReadUnsupported,
-            byte_offset,
-            @ptrCast(encoded_values.ptr),
-            byte_count,
-        ) != 0) return error.MetalDeviceReadFailed;
+        if (binding.ring_page_count == 0) {
+            const first_row = std.math.add(usize, binding.physical_base_tokens, range.start) catch return error.InvalidKvCheckpoint;
+            const byte_offset = std.math.mul(usize, first_row, row_bytes) catch return error.InvalidKvCheckpoint;
+            if (byte_offset > info.encoded_key_capacity or byte_count > info.encoded_key_capacity - byte_offset or
+                byte_offset > info.v_capacity or byte_count > info.v_capacity - byte_offset) return error.InvalidKvCheckpoint;
+            if (metal_runtime.termite_metal_buffer_download(self.runtime, info.encoded_key_handle.?, byte_offset, @ptrCast(encoded_keys.ptr), byte_count) != 0 or
+                metal_runtime.termite_metal_buffer_download(self.runtime, info.v_handle.?, byte_offset, @ptrCast(encoded_values.ptr), byte_count) != 0)
+                return error.MetalDeviceReadFailed;
+        } else {
+            const visible = try qualificationVisibleRange(binding, range.logical_length, self.page_size_tokens);
+            if (range.start < visible.start) return error.UnsupportedKvSnapshotLayout;
+            var logical = range.start;
+            var destination_row: usize = 0;
+            while (destination_row < range.count) {
+                const page_remaining = self.page_size_tokens - logical % self.page_size_tokens;
+                const rows = @min(page_remaining, range.count - destination_row);
+                const logical_page = logical / self.page_size_tokens;
+                const physical_page = storage_runtime.physicalPageForLogical(logical_page, binding.ring_page_count);
+                const physical_row = physical_page * self.page_size_tokens + logical % self.page_size_tokens;
+                const source_offset = try std.math.mul(usize, physical_row, row_bytes);
+                const segment_bytes = try std.math.mul(usize, rows, row_bytes);
+                const destination_offset = try std.math.mul(usize, destination_row, row_bytes);
+                if (source_offset > info.encoded_key_capacity or segment_bytes > info.encoded_key_capacity - source_offset or
+                    source_offset > info.v_capacity or segment_bytes > info.v_capacity - source_offset) return error.InvalidKvCheckpoint;
+                if (metal_runtime.termite_metal_buffer_download(self.runtime, info.encoded_key_handle.?, source_offset, encoded_keys[destination_offset..].ptr, segment_bytes) != 0 or
+                    metal_runtime.termite_metal_buffer_download(self.runtime, info.v_handle.?, source_offset, encoded_values[destination_offset..].ptr, segment_bytes) != 0)
+                    return error.MetalDeviceReadFailed;
+                logical += rows;
+                destination_row += rows;
+            }
+        }
         const readback_bytes = std.math.mul(usize, byte_count, 2) catch return error.InvalidKvCheckpoint;
         if (metal_runtime.termite_metal_decode_runtime_attention_span_slot_note_readback(
             self.runtime,
@@ -1853,6 +2176,230 @@ pub const MetalKvStorage = struct {
         /// shared consumers that never own a storage binding.
         owner_layers: []const u32,
     };
+
+    pub const QualificationInventoryEntry = struct {
+        layer: u32,
+        window: u32,
+        rows: u32,
+        capacity_rows: u32,
+        start_row: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        key_row_bytes: u64,
+        value_row_bytes: u64,
+        key_capacity_bytes: u64,
+        value_capacity_bytes: u64,
+        installed_physical_bytes: u64,
+    };
+
+    pub const QualificationInventoryOwned = struct {
+        allocator: std.mem.Allocator,
+        context_instance_id: u64,
+        sequence_id: storage_runtime.SequenceId,
+        source_revision: u64,
+        logical_tokens: u32,
+        entries: []QualificationInventoryEntry,
+        installed_physical_bytes: u64,
+        descriptor_sha256: [32]u8,
+
+        pub fn deinit(self: *@This()) void {
+            self.allocator.free(self.entries);
+            self.* = undefined;
+        }
+    };
+
+    pub const RawInventorySeal = struct {
+        token_sha256: [32]u8,
+        shape_sha256: [32]u8,
+        binary_sha256: [32]u8,
+        source_freeze_sha256: [32]u8,
+        pub fn validate(self: @This()) !void {
+            inline for (.{ self.token_sha256, self.shape_sha256, self.binary_sha256, self.source_freeze_sha256 }) |digest|
+                if (std.mem.allEqual(u8, &digest, 0)) return error.UnqualifiedCompactionArtifact;
+        }
+    };
+
+    pub const RawHeadAuthority = struct {
+        sequence_id: storage_runtime.SequenceId,
+        source_revision: u64,
+        logical_tokens: u32,
+        logical_blocks: []const block.KvBlockId,
+        donor_layer: u32,
+        head_index: u32,
+        window: u32,
+    };
+
+    /// Bounded one-head readback from the genuine ordinary pre-fit source.
+    /// The admission covers this returned head plus the mandatory downstream
+    /// clone, so OpenFn cannot create an unaccounted second live copy.
+    pub fn downloadRawExactHead(
+        self: *MetalKvStorage,
+        allocator: std.mem.Allocator,
+        authority: RawHeadAuthority,
+        max_two_copy_host_bytes: usize,
+        control: AttentionMatchControl,
+    ) !attention_match_storage.DownloadedHead {
+        try control.check();
+        if (self.format != .f16 or self.attention_match_binding != null or authority.source_revision == 0 or
+            authority.source_revision != self.attention_match_revision or authority.logical_tokens == 0 or
+            authority.head_index >= self.num_kv_heads or max_two_copy_host_bytes == 0)
+            return error.AttentionMatchSourceChanged;
+        if (metal_runtime.hasActiveFrame(self.runtime)) return error.AttentionMatchSourceChanged;
+        if (metal_runtime.hasSubmittedFrame(self.runtime)) try metal_runtime.waitFrame(self.runtime);
+        if (metal_runtime.hasActiveFrame(self.runtime) or metal_runtime.hasSubmittedFrame(self.runtime)) return error.AttentionMatchSourceChanged;
+        const binding = self.slot_map.get(.{ .sequence_id = authority.sequence_id, .layer_index = authority.donor_layer }) orelse
+            return error.AttentionMatchSourceChanged;
+        if (binding.written_tokens != authority.logical_tokens or binding.sliding_window_tokens != authority.window)
+            return error.AttentionMatchSourceChanged;
+        const info = try self.slotInfo(binding.slot);
+        const visible = try qualificationVisibleRange(binding, authority.logical_tokens, self.page_size_tokens);
+        const rows = visible.count;
+        const dim: usize = self.head_dim;
+        if (dim == 0 or dim > 512) return error.AttentionMatchSourceChanged;
+        const vector_count = try std.math.mul(usize, rows, dim);
+        const metadata_bytes = try std.math.mul(usize, rows, 2 * @sizeOf(u64) + @sizeOf(f32));
+        const vector_bytes = try std.math.mul(usize, vector_count, 2 * @sizeOf(f32));
+        const one_copy_bytes = try std.math.add(usize, metadata_bytes, vector_bytes);
+        const two_copy_bytes = try std.math.mul(usize, one_copy_bytes, 2);
+        if (two_copy_bytes > max_two_copy_host_bytes) return error.CompactionWorkspaceLimit;
+        const positions = try allocator.alloc(u64, rows);
+        errdefer allocator.free(positions);
+        const coverage = try allocator.alloc(u64, rows);
+        errdefer allocator.free(coverage);
+        const bias = try allocator.alloc(f32, rows);
+        errdefer allocator.free(bias);
+        const keys = try allocator.alloc(f32, vector_count);
+        errdefer allocator.free(keys);
+        const values = try allocator.alloc(f32, vector_count);
+        errdefer allocator.free(values);
+        const spans = try allocator.alloc(checkpoint.packed_storage.Span, 0);
+        errdefer allocator.free(spans);
+        const compressed_keys = try allocator.alloc(u8, 0);
+        errdefer allocator.free(compressed_keys);
+        const compressed_values = try allocator.alloc(u8, 0);
+        errdefer allocator.free(compressed_values);
+        const source_row_values = try std.math.mul(usize, self.num_kv_heads, dim);
+        const source_row_bytes = try std.math.mul(usize, source_row_values, @sizeOf(f16));
+        if (info.key_row_bytes != source_row_bytes or info.v_row_stride != source_row_values or
+            info.encoded_key_handle == null or info.v_handle == null)
+            return error.AttentionMatchSourceChanged;
+        var raw_key: [512]f16 = undefined;
+        var raw_value: [512]f16 = undefined;
+        for (0..rows) |row| {
+            if (row % 64 == 0) try control.check();
+            const logical_row = visible.start + row;
+            const physical_row = try qualificationPhysicalRow(binding, authority.logical_blocks, self.page_size_tokens, logical_row);
+            const base = try std.math.add(usize, try std.math.mul(usize, physical_row, source_row_bytes), try std.math.mul(usize, authority.head_index, dim * @sizeOf(f16)));
+            const head_bytes = try std.math.mul(usize, dim, @sizeOf(f16));
+            if (base > info.encoded_key_capacity or head_bytes > info.encoded_key_capacity - base or
+                base > info.v_capacity or head_bytes > info.v_capacity - base)
+                return error.AttentionMatchSourceChanged;
+            if (metal_runtime.termite_metal_buffer_download(self.runtime, info.encoded_key_handle.?, base, @ptrCast(raw_key[0..dim].ptr), head_bytes) != 0 or
+                metal_runtime.termite_metal_buffer_download(self.runtime, info.v_handle.?, base, @ptrCast(raw_value[0..dim].ptr), head_bytes) != 0)
+                return error.DeviceReadFallback;
+            positions[row] = logical_row;
+            coverage[row] = logical_row + 1;
+            bias[row] = 0;
+            for (keys[row * dim ..][0..dim], values[row * dim ..][0..dim], raw_key[0..dim], raw_value[0..dim]) |*key, *value, source_key, source_value| {
+                key.* = @floatCast(source_key);
+                value.* = @floatCast(source_value);
+            }
+        }
+        try control.check();
+        if (self.attention_match_revision != authority.source_revision) return error.AttentionMatchSourceChanged;
+        return .{ .allocator = allocator, .value = .{ .dim = @intCast(dim), .positions = positions, .coverage_ends = coverage, .keys = keys, .values = values, .bias = bias, .compressed = .{ .spans = spans, .keys = compressed_keys, .values = compressed_values } } };
+    }
+
+    /// Metadata-only inventory of the genuine pre-fit Metal KV source. This
+    /// does not require or accept an installed attention-match candidate.
+    pub fn qualificationInventoryDeviceHook(
+        hook: storage_runtime.DeviceWriteHook,
+        allocator: std.mem.Allocator,
+        request: QualificationFingerprintRequest,
+    ) !QualificationInventoryOwned {
+        if (!builtin.is_test) return error.QualificationOnly;
+        return inventoryDeviceHook(hook, allocator, request, null);
+    }
+
+    /// Production raw-prefill inventory seam. The caller must carry the
+    /// authenticated token/shape/binary/freeze tuple; the storage independently
+    /// validates every observed sequence, revision, geometry and byte count.
+    pub fn rawStructuralInventoryDeviceHook(
+        hook: storage_runtime.DeviceWriteHook,
+        allocator: std.mem.Allocator,
+        request: QualificationFingerprintRequest,
+        seal: RawInventorySeal,
+    ) !QualificationInventoryOwned {
+        try seal.validate();
+        return inventoryDeviceHook(hook, allocator, request, seal);
+    }
+
+    fn inventoryDeviceHook(
+        hook: storage_runtime.DeviceWriteHook,
+        allocator: std.mem.Allocator,
+        request: QualificationFingerprintRequest,
+        seal: ?RawInventorySeal,
+    ) !QualificationInventoryOwned {
+        if (hook.vtable != &hook_vtable) return error.OrdinaryExactMetalKvRequired;
+        const self: *MetalKvStorage = @ptrCast(@alignCast(hook.ctx));
+        if (request.context_instance_id == 0 or request.logical_tokens == 0 or request.position_offset != 0 or
+            self.format != .f16 or metal_runtime.hasActiveFrame(self.runtime))
+            return error.InvalidQualificationFingerprint;
+        if (metal_runtime.hasSubmittedFrame(self.runtime)) try metal_runtime.waitFrame(self.runtime);
+        if (metal_runtime.hasActiveFrame(self.runtime) or metal_runtime.hasSubmittedFrame(self.runtime) or self.attention_match_revision == 0)
+            return error.InvalidQualificationFingerprint;
+        try validateQualificationOwnerLayers(request.owner_layers, self.global_layer_slots.count() + @as(usize, self.countSequenceOwnedLayers(request.sequence_id)));
+        const entries = try allocator.alloc(QualificationInventoryEntry, request.owner_layers.len);
+        errdefer allocator.free(entries);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly.ordinary-exact-context.structural-inventory.v1\x00");
+        if (seal) |authority| {
+            hash.update("raw-prefill\x00");
+            hash.update(&authority.token_sha256);
+            hash.update(&authority.shape_sha256);
+            hash.update(&authority.binary_sha256);
+            hash.update(&authority.source_freeze_sha256);
+        } else hash.update("qualification-only\x00");
+        try fingerprintU32(&hash, request.logical_tokens);
+        try fingerprintU32(&hash, self.num_kv_heads);
+        try fingerprintU32(&hash, self.head_dim);
+        var physical: u64 = 0;
+        for (request.owner_layers, entries) |layer, *entry| {
+            const binding = self.slot_map.get(.{ .sequence_id = request.sequence_id, .layer_index = layer }) orelse return error.InvalidQualificationFingerprint;
+            if (binding.written_tokens != request.logical_tokens) return error.InvalidQualificationFingerprint;
+            const info = try self.slotInfo(binding.slot);
+            const allocation = try self.slotAllocationInfo(binding.slot);
+            if (allocation.leased == 0 or allocation.installed_live_bytes == 0 or
+                allocation.active_frame_retained_bytes != 0 or allocation.submitted_frame_retained_bytes != 0)
+                return error.InvalidQualificationFingerprint;
+            const visible = try qualificationVisibleRange(binding, request.logical_tokens, self.page_size_tokens);
+            const value_row_bytes = try std.math.mul(usize, info.v_row_stride, @sizeOf(f16));
+            entry.* = .{
+                .layer = layer,
+                .window = @intCast(binding.sliding_window_tokens),
+                .rows = @intCast(visible.count),
+                .capacity_rows = @intCast(self.slot_buffer_capacity_tokens[binding.slot]),
+                .start_row = @intCast(if (binding.ring_page_count == 0) 0 else visible.start % self.slot_buffer_capacity_tokens[binding.slot]),
+                .kv_heads = self.num_kv_heads,
+                .head_dim = self.head_dim,
+                .key_row_bytes = @intCast(info.key_row_bytes),
+                .value_row_bytes = @intCast(value_row_bytes),
+                .key_capacity_bytes = @intCast(info.encoded_key_capacity),
+                .value_capacity_bytes = @intCast(info.v_capacity),
+                .installed_physical_bytes = allocation.installed_live_bytes,
+            };
+            physical = std.math.add(u64, physical, entry.installed_physical_bytes) catch return error.QualificationFingerprintOverflow;
+            inline for (.{ entry.layer, entry.window, entry.rows, entry.capacity_rows, entry.start_row, entry.kv_heads, entry.head_dim }) |value| try fingerprintU32(&hash, value);
+            inline for (.{ entry.key_row_bytes, entry.value_row_bytes, entry.key_capacity_bytes, entry.value_capacity_bytes, entry.installed_physical_bytes }) |value| {
+                var frame: [8]u8 = undefined;
+                std.mem.writeInt(u64, &frame, value, .little);
+                hash.update(&frame);
+            }
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return .{ .allocator = allocator, .context_instance_id = request.context_instance_id, .sequence_id = request.sequence_id, .source_revision = self.attention_match_revision, .logical_tokens = request.logical_tokens, .entries = entries, .installed_physical_bytes = physical, .descriptor_sha256 = digest };
+    }
 
     /// Qualification-only raw fingerprint of an ordinary exact Metal KV
     /// context. Serving never calls this method: it deliberately drains and
@@ -2073,6 +2620,18 @@ test "attention_match exact source validates actual local and global slot widths
     try std.testing.expectError(error.InvalidKvCheckpoint, MetalKvStorage.validateExactAttentionMatchGeometry(2, 512, &heads, info, 3));
 }
 
+test "context attention match local capacity policy locks on first owner allocation" {
+    var legacy: AttentionMatchLocalCapacityState = .{};
+    try std.testing.expect(!legacy.lock().exact_local_window_capacity);
+    try legacy.configure(.legacy_spare512_v1);
+    try std.testing.expectError(error.AttentionMatchLocalCapacityPolicyChanged, legacy.configure(.exact_window_causal_union_v1));
+    var exact: AttentionMatchLocalCapacityState = .{};
+    try exact.configure(.exact_window_causal_union_v1);
+    try std.testing.expect(exact.lock().exact_local_window_capacity);
+    try exact.configure(.exact_window_causal_union_v1);
+    try std.testing.expectError(error.AttentionMatchLocalCapacityPolicyChanged, exact.configure(.legacy_spare512_v1));
+}
+
 test "Metal KV rollout flags recognize common false values" {
     try std.testing.expect(!MetalKvStorage.flagValueEnabled(""));
     try std.testing.expect(!MetalKvStorage.flagValueEnabled("0"));
@@ -2217,6 +2776,8 @@ test "context ordinary exact fingerprint excludes SWA ring slack" {
 const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
     .readExactAttentionMatchKv = MetalKvStorage.readExactAttentionMatchKv,
     .cloneExactPrefix = MetalKvStorage.cloneExactPrefix,
+    .exportExactLayerRanges = MetalKvStorage.exportExactLayerRanges,
+    .discardExactCloneSource = MetalKvStorage.discardExactCloneSourceOp,
     .writeLayerKvSuffix = MetalKvStorage.writeLayerKvSuffix,
     .gatherLayerKv = MetalKvStorage.gatherLayerKv,
     .gatherLayerKeys = MetalKvStorage.gatherLayerKeys,
@@ -2265,6 +2826,205 @@ test "MetalKvStorage.create rejects unsupported dtype" {
     );
 }
 
+test "request owner detach rejects live binding and permits fresh owner reuse" {
+    const allocator = std.testing.allocator;
+    const metal = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(metal);
+    if (metal_runtime.termite_metal_decode_runtime_ready(metal) == 0) return error.SkipZigTest;
+
+    const storage = try MetalKvStorage.create(allocator, metal, .f16, 1, 2, 4);
+    const hook = storage.deviceWriteHook();
+    defer hook.deinit(allocator);
+    var first = owner_alloc.HostAllocationTracker.init(null, 0);
+    var second = owner_alloc.HostAllocationTracker.init(null, 0);
+    try storage.bindRequestOwnerTracker(&first);
+    _ = try storage.acquireBinding(.{ .sequence_id = 17, .layer_index = 0 }, 1, 4, false, false);
+    try std.testing.expectError(error.ContextFrameOwnershipMismatch, storage.unbindRequestOwnerTracker(&first));
+    storage.releaseSequenceSlots(17);
+    try storage.unbindRequestOwnerTracker(&first);
+    try std.testing.expect(storage.owner_allocation_tracker == null);
+    try storage.bindRequestOwnerTracker(&second);
+    try storage.unbindRequestOwnerTracker(&second);
+}
+
+test "context request owner empty proof is hook local while foreign hook owns live device KV" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const runtime = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(runtime);
+    if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    const dim: usize = 256;
+    const foreign = try MetalKvStorage.create(allocator, runtime, .f16, 1, dim, 4);
+    defer foreign.deviceWriteHook().deinit(allocator);
+    const local = try MetalKvStorage.create(allocator, runtime, .f16, 1, dim, 4);
+    defer local.deviceWriteHook().deinit(allocator);
+
+    const rows: usize = 65;
+    const bytes = rows * dim * @sizeOf(f32);
+    const k_handle = metal_runtime.termite_metal_buffer_alloc(runtime, bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(k_handle);
+    const v_handle = metal_runtime.termite_metal_buffer_alloc(runtime, bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(v_handle);
+    const values = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(values);
+    for (values, 0..) |*value, i| value.* = @floatFromInt(i);
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(runtime, k_handle, 0, values.ptr, bytes));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(runtime, v_handle, 0, values.ptr, bytes));
+
+    const foreign_hook = foreign.deviceWriteHook();
+    try foreign_hook.writeLayerKvSuffix(.{ .sequence_id = 91, .layer_index = 0, .total_token_count = 17, .suffix_token_count = 17, .position_offset = 0, .num_kv_heads = 1, .head_dim = dim }, .{ .handle = k_handle, .byte_offset = 0, .byte_len = bytes }, .{ .handle = v_handle, .byte_offset = 0, .byte_len = bytes });
+    // The native span writer derives suffix_start from its installed token
+    // count and consumes suffix rows starting at the caller's device offset.
+    const suffix_offset = 17 * dim * @sizeOf(f32);
+    try foreign_hook.writeLayerKvSuffix(.{ .sequence_id = 91, .layer_index = 0, .total_token_count = rows, .suffix_token_count = rows - 17, .position_offset = 0, .num_kv_heads = 1, .head_dim = dim }, .{ .handle = k_handle, .byte_offset = suffix_offset, .byte_len = bytes - suffix_offset }, .{ .handle = v_handle, .byte_offset = suffix_offset, .byte_len = bytes - suffix_offset });
+    const foreign_before = foreign_hook.allocationSnapshot();
+    const foreign_slot = foreign.slot_map.get(.{ .sequence_id = 91, .layer_index = 0 }).?.slot;
+    const foreign_info = try foreign.slotAllocationInfo(foreign_slot);
+    const foreign_transition = try foreign.slotTransitionInfo(foreign_slot);
+    std.debug.print("owner-kv-growth stage=foreign hook_live={d} hook_kv={d} slot_key={d} slot_value={d} slot_installed={d} transition_nonce={d} transition_new={d}\n", .{ foreign_before.live_bytes, foreign_before.kv_bytes, foreign_info.key_allocated_bytes, foreign_info.value_allocated_bytes, foreign_info.installed_live_bytes, foreign_transition.operation_nonce, foreign_transition.newly_allocated_bytes });
+    try std.testing.expect(foreign_before.live_bytes > 0);
+
+    const local_hook = local.deviceWriteHook();
+    var first = owner_alloc.HostAllocationTracker.init(null, 0);
+    var second = owner_alloc.HostAllocationTracker.init(null, 0);
+    try local.bindRequestOwnerTracker(&first);
+    try local_hook.writeLayerKvSuffix(.{ .sequence_id = 92, .layer_index = 0, .total_token_count = 17, .suffix_token_count = 17, .position_offset = 0, .num_kv_heads = 1, .head_dim = dim }, .{ .handle = k_handle, .byte_offset = 0, .byte_len = bytes }, .{ .handle = v_handle, .byte_offset = 0, .byte_len = bytes });
+    const first_17 = first.snapshot();
+    const local_17 = local_hook.allocationSnapshot();
+    const local_slot = local.slot_map.get(.{ .sequence_id = 92, .layer_index = 0 }).?.slot;
+    const slot_17 = try local.slotAllocationInfo(local_slot);
+    const transition_17 = try local.slotTransitionInfo(local_slot);
+    std.debug.print("owner-kv-growth stage=17 hook_live={d} hook_kv={d} owner_live={d} owner_peak={d} slot_key={d} slot_value={d} slot_installed={d} slot_active={d} slot_submitted={d} transition_nonce={d} transition_new={d}\n", .{ local_17.live_bytes, local_17.kv_bytes, first_17.private_device_live_bytes, first_17.private_device_peak_bytes, slot_17.key_allocated_bytes, slot_17.value_allocated_bytes, slot_17.installed_live_bytes, slot_17.active_frame_retained_bytes, slot_17.submitted_frame_retained_bytes, transition_17.operation_nonce, transition_17.newly_allocated_bytes });
+    try std.testing.expect(local_17.kv_bytes > 0);
+    try std.testing.expectEqual(local_17.live_bytes, first_17.private_device_live_bytes);
+    try local_hook.writeLayerKvSuffix(.{ .sequence_id = 92, .layer_index = 0, .total_token_count = rows, .suffix_token_count = rows - 17, .position_offset = 0, .num_kv_heads = 1, .head_dim = dim }, .{ .handle = k_handle, .byte_offset = suffix_offset, .byte_len = bytes - suffix_offset }, .{ .handle = v_handle, .byte_offset = suffix_offset, .byte_len = bytes - suffix_offset });
+    const first_65 = first.snapshot();
+    const local_65 = local_hook.allocationSnapshot();
+    try std.testing.expect(local_65.kv_bytes > local_17.kv_bytes);
+    try std.testing.expectEqual(local_65.live_bytes, first_65.private_device_live_bytes);
+    const growth = local.last_owner_transition;
+    const slot_65 = try local.slotAllocationInfo(local_slot);
+    const transition_65 = try local.slotTransitionInfo(local_slot);
+    std.debug.print("owner-kv-growth stage=65 hook_live={d} hook_kv={d} owner_live={d} owner_peak={d} slot_key={d} slot_value={d} slot_installed={d} slot_active={d} slot_submitted={d} native_nonce={d} native_new={d} reconciled_prior={d} reconciled_new={d} reconciled_final={d}\n", .{ local_65.live_bytes, local_65.kv_bytes, first_65.private_device_live_bytes, first_65.private_device_peak_bytes, slot_65.key_allocated_bytes, slot_65.value_allocated_bytes, slot_65.installed_live_bytes, slot_65.active_frame_retained_bytes, slot_65.submitted_frame_retained_bytes, transition_65.operation_nonce, transition_65.newly_allocated_bytes, growth.prior, growth.newly_allocated, growth.final });
+    const expected_overlap = first_17.private_device_live_bytes + growth.newly_allocated;
+    try std.testing.expectEqual(@max(first_17.private_device_peak_bytes, expected_overlap), first_65.private_device_peak_bytes);
+    try std.testing.expect(first_65.private_device_live_bytes > first_17.private_device_live_bytes);
+
+    const gathered_k = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(gathered_k);
+    const gathered_v = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(gathered_v);
+    try local_hook.gatherLayerKv(.{ .sequence_id = 92, .layer_index = 0, .token_count = rows, .num_kv_heads = 1, .head_dim = dim }, gathered_k, gathered_v);
+    for (values, gathered_k, gathered_v) |expected, actual_k, actual_v| {
+        try std.testing.expectEqual(@as(f32, @floatCast(@as(f16, @floatCast(expected)))), actual_k);
+        try std.testing.expectEqual(@as(f32, @floatCast(@as(f16, @floatCast(expected)))), actual_v);
+    }
+    var logical_blocks: [17]block.KvBlockId = undefined;
+    for (&logical_blocks, 0..) |*id, index| id.* = @intCast(index);
+    const one_copy_bytes = rows * (2 * @sizeOf(u64) + @sizeOf(f32) + 2 * dim * @sizeOf(f32));
+    const raw_authority: MetalKvStorage.RawHeadAuthority = .{ .sequence_id = 92, .source_revision = local.attention_match_revision, .logical_tokens = rows, .logical_blocks = &logical_blocks, .donor_layer = 0, .head_index = 0, .window = 0 };
+    try std.testing.expectError(error.CompactionWorkspaceLimit, local.downloadRawExactHead(allocator, raw_authority, 2 * one_copy_bytes - 1, .{}));
+    var stale = raw_authority;
+    stale.source_revision += 1;
+    try std.testing.expectError(error.AttentionMatchSourceChanged, local.downloadRawExactHead(allocator, stale, 2 * one_copy_bytes, .{}));
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, local.downloadRawExactHead(allocator, raw_authority, 2 * one_copy_bytes, .{ .check_fn = Cancel.check }));
+    var downloaded = try local.downloadRawExactHead(allocator, raw_authority, 2 * one_copy_bytes, .{});
+    defer downloaded.deinit();
+    try std.testing.expectEqual(rows, downloaded.value.positions.len);
+    try std.testing.expectEqual(@as(u64, 0), downloaded.value.positions[0]);
+    try std.testing.expectEqual(@as(u64, rows), downloaded.value.coverage_ends[rows - 1]);
+    try std.testing.expectEqualSlices(f32, gathered_k, downloaded.value.keys);
+    try std.testing.expectEqualSlices(f32, gathered_v, downloaded.value.values);
+    try std.testing.expectError(error.ContextFrameOwnershipMismatch, local.unbindRequestOwnerTracker(&first));
+    local.releaseSequenceSlots(92);
+    const first_released = first.snapshot();
+    std.debug.print("owner-kv-growth stage=released owner_live={d} owner_peak={d} foreign_live={d} foreign_kv={d}\n", .{ first_released.private_device_live_bytes, first_released.private_device_peak_bytes, foreign_hook.allocationSnapshot().live_bytes, foreign_hook.allocationSnapshot().kv_bytes });
+    try std.testing.expectEqual(@as(u64, 0), first_released.private_device_live_bytes);
+    try local.unbindRequestOwnerTracker(&first);
+
+    try local.bindRequestOwnerTracker(&second);
+    try local_hook.writeLayerKvSuffix(.{ .sequence_id = 93, .layer_index = 0, .total_token_count = 17, .suffix_token_count = 17, .position_offset = 0, .num_kv_heads = 1, .head_dim = dim }, .{ .handle = k_handle, .byte_offset = 0, .byte_len = bytes }, .{ .handle = v_handle, .byte_offset = 0, .byte_len = bytes });
+    try std.testing.expect(second.snapshot().private_device_live_bytes > 0);
+    local.releaseSequenceSlots(93);
+    try std.testing.expectEqual(@as(u64, 0), second.snapshot().private_device_live_bytes);
+    try local.unbindRequestOwnerTracker(&second);
+    const foreign_after = foreign_hook.allocationSnapshot();
+    std.debug.print("owner-kv-growth stage=foreign-after hook_live={d} hook_kv={d} before_live={d} before_kv={d}\n", .{ foreign_after.live_bytes, foreign_after.kv_bytes, foreign_before.live_bytes, foreign_before.kv_bytes });
+    try std.testing.expectEqual(foreign_before.live_bytes, foreign_after.live_bytes);
+    try std.testing.expectEqual(foreign_before.kv_bytes, foreign_after.kv_bytes);
+}
+
+test "compiled owner drain reconciles active and submitted retired KV generations before committed snapshot" {
+    if (!build_options.enable_metal or !metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const compiled_runtime = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(compiled_runtime);
+    if (metal_runtime.termite_metal_decode_runtime_ready(compiled_runtime) == 0) return error.SkipZigTest;
+    const outer_runtime = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(outer_runtime);
+    if (metal_runtime.termite_metal_decode_runtime_ready(outer_runtime) == 0) return error.SkipZigTest;
+
+    const compiled = try MetalKvStorage.create(allocator, compiled_runtime, .f16, 1, 256, 8);
+    const compiled_hook = compiled.deviceWriteHook();
+    defer compiled_hook.deinit(allocator);
+    const outer = try MetalKvStorage.create(allocator, outer_runtime, .f16, 1, 256, 8);
+    const outer_hook = outer.deviceWriteHook();
+    defer outer_hook.deinit(allocator);
+    var tracker = owner_alloc.HostAllocationTracker.init(null, 0);
+    try compiled.bindRequestOwnerTracker(&tracker);
+    const binding = try compiled.acquireBinding(.{ .sequence_id = 501, .layer_index = 0 }, 1, 128, false, false);
+    const row_bytes = 256 * @sizeOf(f16);
+
+    try compiled.reserveSlotCapacity(binding.slot, 16, 16, 0, row_bytes, row_bytes);
+    const installed_initial = (try compiled.slotAllocationInfo(binding.slot)).installed_live_bytes;
+    try std.testing.expect(installed_initial > 0);
+
+    try metal_runtime.beginFrame(compiled_runtime);
+    try compiled.reserveSlotCapacity(binding.slot, 32, 16, 0, row_bytes, row_bytes);
+    const active = try compiled.slotAllocationInfo(binding.slot);
+    try std.testing.expect(active.active_frame_retained_bytes > 0);
+    const active_accounted = tracker.snapshot();
+    try std.testing.expectEqual(@as(u64, @intCast(try MetalKvStorage.slotLiveBytes(active))), active_accounted.private_device_live_bytes);
+    try outer_hook.drainForOwnerSnapshot();
+    try std.testing.expect(metal_runtime.hasActiveFrame(compiled_runtime));
+    try std.testing.expectEqual(active_accounted.private_device_live_bytes, tracker.snapshot().private_device_live_bytes);
+
+    try compiled_hook.drainForOwnerSnapshot();
+    try std.testing.expect(!metal_runtime.hasActiveFrame(compiled_runtime));
+    const after_active = try compiled.slotAllocationInfo(binding.slot);
+    try std.testing.expectEqual(@as(u64, 0), after_active.active_frame_retained_bytes);
+    try std.testing.expectEqual(after_active.installed_live_bytes, tracker.snapshot().private_device_live_bytes);
+
+    try metal_runtime.beginFrame(compiled_runtime);
+    try compiled.reserveSlotCapacity(binding.slot, 64, 16, 0, row_bytes, row_bytes);
+    try metal_runtime.submitFrame(compiled_runtime);
+    const submitted = try compiled.slotAllocationInfo(binding.slot);
+    try std.testing.expect(submitted.submitted_frame_retained_bytes > 0);
+    const submitted_accounted = tracker.snapshot();
+    try std.testing.expectEqual(@as(u64, @intCast(try MetalKvStorage.slotLiveBytes(submitted))), submitted_accounted.private_device_live_bytes);
+    try outer_hook.drainForOwnerSnapshot();
+    try std.testing.expect(metal_runtime.hasSubmittedFrame(compiled_runtime));
+    try std.testing.expectEqual(submitted_accounted.private_device_live_bytes, tracker.snapshot().private_device_live_bytes);
+
+    try compiled_hook.drainForOwnerSnapshot();
+    try std.testing.expect(!metal_runtime.hasSubmittedFrame(compiled_runtime));
+    const committed = try compiled.slotAllocationInfo(binding.slot);
+    try std.testing.expectEqual(@as(u64, 0), committed.submitted_frame_retained_bytes);
+    try std.testing.expectEqual(committed.installed_live_bytes, tracker.snapshot().private_device_live_bytes);
+    try std.testing.expect(tracker.snapshot().private_device_peak_bytes > committed.installed_live_bytes);
+
+    compiled.releaseSequenceSlots(501);
+    try compiled.unbindRequestOwnerTracker(&tracker);
+    try std.testing.expectEqual(@as(u64, 0), tracker.snapshot().private_device_live_bytes);
+}
+
 test "KeyFormat.fromKvDType covers supported dtypes" {
     try std.testing.expectEqual(KeyFormat.polar4, KeyFormat.fromKvDType(.polar4).?);
     try std.testing.expectEqual(KeyFormat.turbo3, KeyFormat.fromKvDType(.turbo3).?);
@@ -2278,6 +3038,115 @@ test "KeyFormat.fromKvDType covers supported dtypes" {
     try std.testing.expect(!KeyFormat.raw_f32.isCompressed());
     try std.testing.expect(!KeyFormat.f16.isCompressed());
     try std.testing.expect(KeyFormat.int8_per_head.isCompressed());
+}
+
+test "exact layer export mixes head-major and wrapped ring bitwise on one Metal hook" {
+    if (!build_options.enable_metal or builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const metal = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(metal);
+    if (metal_runtime.termite_metal_decode_runtime_ready(metal) == 0) return error.SkipZigTest;
+
+    const source = try MetalKvStorage.create(allocator, metal, .f16, 2, 512, 16);
+    const hook = source.deviceWriteHook();
+    defer hook.deinit(allocator);
+    const rows: usize = 17;
+    const heads: usize = 2;
+    const dim: usize = 512;
+    const elements = rows * heads * dim;
+    const input_k = try allocator.alloc(f32, elements);
+    defer allocator.free(input_k);
+    const input_v = try allocator.alloc(f32, elements);
+    defer allocator.free(input_v);
+    for (input_k, input_v, 0..) |*k, *v, i| {
+        const row = i / (heads * dim);
+        const head = (i / dim) % heads;
+        const lane = i % dim;
+        k.* = @floatFromInt(1 + row * 4 + head * 2 + lane % 2);
+        v.* = -k.*;
+    }
+    const input_bytes = elements * @sizeOf(f32);
+    const input_k_handle = metal_runtime.termite_metal_buffer_alloc(metal, input_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(input_k_handle);
+    const input_v_handle = metal_runtime.termite_metal_buffer_alloc(metal, input_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(input_v_handle);
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(metal, input_k_handle, 0, @ptrCast(input_k.ptr), input_bytes));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(metal, input_v_handle, 0, @ptrCast(input_v.ptr), input_bytes));
+    const blocks = [_]u32{ 0, 1 };
+    for ([_]u32{ 1, 4 }) |layer| try hook.writeLayerKvSuffix(.{
+        .sequence_id = 77,
+        .layer_index = layer,
+        .total_token_count = rows,
+        .suffix_token_count = rows,
+        .position_offset = 0,
+        .num_kv_heads = heads,
+        .head_dim = dim,
+        .logical_blocks = &blocks,
+        .page_size_tokens = 16,
+    }, .{ .handle = input_k_handle, .byte_offset = 0, .byte_len = input_bytes }, .{
+        .handle = input_v_handle,
+        .byte_offset = 0,
+        .byte_len = input_bytes,
+    });
+
+    const global_capacity: usize = 20;
+    const global_bytes = global_capacity * heads * dim * @sizeOf(f16);
+    const ring_capacity: usize = 8;
+    const ring_bytes = ring_capacity * heads * dim * @sizeOf(f16);
+    const global_k = metal_runtime.termite_metal_buffer_alloc(metal, global_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(global_k);
+    const global_v = metal_runtime.termite_metal_buffer_alloc(metal, global_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(global_v);
+    const ring_k = metal_runtime.termite_metal_buffer_alloc(metal, ring_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(ring_k);
+    const ring_v = metal_runtime.termite_metal_buffer_alloc(metal, ring_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(ring_v);
+    const sentinel = try allocator.alloc(u16, global_bytes / @sizeOf(u16));
+    defer allocator.free(sentinel);
+    @memset(sentinel, 0x7bcd);
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(metal, global_k, 0, @ptrCast(sentinel.ptr), global_bytes));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(metal, global_v, 0, @ptrCast(sentinel.ptr), global_bytes));
+    const ranges = [_]storage_runtime.ExactLayerRangeExport{
+        .{ .layer_index = 1, .source_start = 0, .rows = rows, .num_kv_heads = heads, .head_dim = dim, .destination_layout = .head_major, .destination_head_capacity_rows = global_capacity, .destination_k = .{ .handle = global_k, .byte_offset = 0, .byte_len = global_bytes }, .destination_v = .{ .handle = global_v, .byte_offset = 0, .byte_len = global_bytes } },
+        .{ .layer_index = 4, .source_start = rows - ring_capacity, .rows = ring_capacity, .num_kv_heads = heads, .head_dim = dim, .destination_layout = .token_major_ring, .destination_ring_capacity_rows = ring_capacity, .destination_k = .{ .handle = ring_k, .byte_offset = 0, .byte_len = ring_bytes }, .destination_v = .{ .handle = ring_v, .byte_offset = 0, .byte_len = ring_bytes } },
+    };
+    try std.testing.expectError(error.ExactLayerRangeExportBudgetExceeded, hook.exportExactLayerRanges(.{
+        .source_sequence = 77,
+        .expected_written_tokens = rows,
+        .ranges = &ranges,
+        .max_bytes = 1,
+    }));
+    var aliased = ranges;
+    aliased[1].destination_k = aliased[0].destination_k;
+    try std.testing.expectError(error.InvalidExactLayerRangeExport, hook.exportExactLayerRanges(.{
+        .source_sequence = 77,
+        .expected_written_tokens = rows,
+        .ranges = &aliased,
+        .max_bytes = std.math.maxInt(usize),
+    }));
+    const receipt = try hook.exportExactLayerRanges(.{ .source_sequence = 77, .expected_written_tokens = rows, .ranges = &ranges, .max_bytes = 2 * (rows + ring_capacity) * heads * dim * @sizeOf(f16) });
+    try std.testing.expectEqual(@as(?usize, 0), receipt.peak_host_staging_bytes);
+    try std.testing.expect(receipt.fenced);
+    try std.testing.expectEqual(@as(usize, 2), receipt.layers);
+    const observed_global = try allocator.alloc(u16, global_bytes / 2);
+    defer allocator.free(observed_global);
+    const observed_ring = try allocator.alloc(u16, ring_bytes / 2);
+    defer allocator.free(observed_ring);
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, global_k, 0, @ptrCast(observed_global.ptr), global_bytes));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, ring_k, 0, @ptrCast(observed_ring.ptr), ring_bytes));
+    for (0..rows) |row| for (0..heads) |head| for (0..dim) |lane| {
+        const source_index = (row * heads + head) * dim + lane;
+        const global_index = (head * global_capacity + row) * dim + lane;
+        try std.testing.expectEqual(@as(u16, @bitCast(@as(f16, @floatCast(input_k[source_index])))), observed_global[global_index]);
+    };
+    for (0..heads) |head| for (rows..global_capacity) |row| for (0..dim) |lane|
+        try std.testing.expectEqual(@as(u16, 0x7bcd), observed_global[(head * global_capacity + row) * dim + lane]);
+    for (rows - ring_capacity..rows) |row| for (0..heads) |head| for (0..dim) |lane| {
+        const source_index = (row * heads + head) * dim + lane;
+        const ring_index = ((row % ring_capacity) * heads + head) * dim + lane;
+        try std.testing.expectEqual(@as(u16, @bitCast(@as(f16, @floatCast(input_k[source_index])))), observed_ring[ring_index]);
+    };
 }
 
 test "attention_match Metal exact prefix clone is transactional owner independent and records readback" {
@@ -2511,6 +3380,187 @@ test "attention_match Metal exact prefix clone is transactional owner independen
     }, &source_after_release_k, &source_after_release_v);
     try std.testing.expectEqualSlices(f32, &source_k, &source_after_release_k);
     try std.testing.expectEqualSlices(f32, &source_v, &source_after_release_v);
+}
+
+test "attention_match Metal exact prefix clone preserves split SWA geometry and chronology" {
+    if (!build_options.enable_metal or builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const metal = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(metal);
+    if (metal_runtime.termite_metal_decode_runtime_ready(metal) == 0) return error.SkipZigTest;
+
+    const source = try MetalKvStorage.create(allocator, metal, .f16, 1, 2, 4);
+    const source_hook = source.deviceWriteHook();
+    defer source_hook.deinit(allocator);
+    const destination = try MetalKvStorage.create(allocator, metal, .f16, 1, 2, 4);
+    const destination_hook = destination.deviceWriteHook();
+    defer destination_hook.deinit(allocator);
+
+    const tokens: usize = 12;
+    const width: usize = 2;
+    // Same LIFO recycle shape proven by KvManager: the first three logical
+    // pages remain uniquely owned but their physical IDs are reversed.
+    const blocks = [_]u32{ 2, 1, 0, 3 };
+    var keys: [tokens * width]f32 = undefined;
+    var values: [tokens * width]f32 = undefined;
+    for (&keys, &values, 0..) |*key, *value, index| {
+        key.* = @floatFromInt(index + 1);
+        value.* = -key.*;
+    }
+    const bytes = keys.len * @sizeOf(f32);
+    const key_handle = metal_runtime.termite_metal_buffer_alloc(metal, bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(key_handle);
+    const value_handle = metal_runtime.termite_metal_buffer_alloc(metal, bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(value_handle);
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(metal, key_handle, 0, @ptrCast(&keys), bytes));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(metal, value_handle, 0, @ptrCast(&values), bytes));
+
+    try source_hook.writeLayerKvSuffix(.{
+        .sequence_id = 31,
+        .layer_index = 0,
+        .total_token_count = tokens,
+        .suffix_token_count = tokens,
+        .position_offset = 0,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+        .logical_blocks = &blocks,
+        .page_size_tokens = 4,
+        .sequence_owned_global = true,
+    }, .{ .handle = key_handle, .byte_offset = 0, .byte_len = bytes }, .{ .handle = value_handle, .byte_offset = 0, .byte_len = bytes });
+    const chunk_tokens: usize = 4;
+    const chunk_bytes = chunk_tokens * width * @sizeOf(f32);
+    for (0..3) |chunk_index| {
+        const chunk_end = (chunk_index + 1) * chunk_tokens;
+        const chunk_offset = chunk_index * chunk_bytes;
+        try source_hook.writeLayerKvSuffix(.{
+            .sequence_id = 31,
+            .layer_index = 1,
+            .total_token_count = chunk_end,
+            .suffix_token_count = chunk_tokens,
+            .position_offset = 0,
+            .num_kv_heads = 1,
+            .head_dim = 2,
+            .logical_blocks = &blocks,
+            .page_size_tokens = 4,
+            .sliding_window = 5,
+            .max_inflight_tokens = 1,
+            .allow_swa_ring = true,
+        }, .{ .handle = key_handle, .byte_offset = chunk_offset, .byte_len = chunk_bytes }, .{ .handle = value_handle, .byte_offset = chunk_offset, .byte_len = chunk_bytes });
+    }
+
+    const request: storage_runtime.device_clone.Request = .{
+        .source_sequence = 31,
+        .destination_sequence = 32,
+        .tokens = tokens,
+        .capacity = 16,
+        .page_size = 4,
+        .source_blocks = &blocks,
+        .destination_blocks = &blocks,
+        .logical_block_policy = .metal_sequence_slot_owned,
+        .donors = &.{
+            .{ .layer = 0, .heads = 1, .dim = 2, .capacity_rows = 16 },
+            .{ .layer = 1, .heads = 1, .dim = 2, .capacity_rows = 8, .host_staged_ring = true },
+        },
+        .max_bytes = 1024 * 1024,
+        .max_host_staging_bytes = 64,
+    };
+    var host_capped = request;
+    host_capped.max_host_staging_bytes -= 1;
+    try std.testing.expectError(
+        error.DeviceKvCloneHostStagingBudgetExceeded,
+        destination_hook.cloneExactPrefix(source_hook, host_capped),
+    );
+    try std.testing.expectEqual(@as(usize, 0), destination.slot_map.count());
+    try std.testing.expectEqual(@as(u64, 0), destination_hook.allocationSnapshot().live_bytes);
+
+    const result = try destination_hook.cloneExactPrefix(source_hook, request);
+    try std.testing.expectEqual(@as(usize, 2), result.donors);
+    try std.testing.expectEqual(@as(usize, (tokens + 8) * width * @sizeOf(f16) * 2), result.copied_bytes);
+
+    const reader = try destination_hook.attentionMatchReader();
+    var global_k: [tokens * width]f32 = undefined;
+    var global_v: [tokens * width]f32 = undefined;
+    try reader.read_fn(reader.context, .{
+        .sequence = 32,
+        .layer = 0,
+        .logical_length = tokens,
+        .start = 0,
+        .count = tokens,
+        .heads = 1,
+        .dim = 2,
+    }, &global_k, &global_v);
+    for (global_k, keys) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+    for (global_v, values) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+
+    const local_start = tokens - 5;
+    var local_k: [5 * width]f32 = undefined;
+    var local_v: [5 * width]f32 = undefined;
+    try reader.read_fn(reader.context, .{
+        .sequence = 32,
+        .layer = 1,
+        .logical_length = tokens,
+        .start = local_start,
+        .count = 5,
+        .heads = 1,
+        .dim = 2,
+    }, &local_k, &local_v);
+    for (local_k, keys[local_start * width ..]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+    for (local_v, values[local_start * width ..]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+
+    const source_reader = try source_hook.attentionMatchReader();
+    var source_local_k: [5 * width]f32 = undefined;
+    var source_local_v: [5 * width]f32 = undefined;
+    try source_reader.read_fn(source_reader.context, .{
+        .sequence = 31,
+        .layer = 1,
+        .logical_length = tokens,
+        .start = local_start,
+        .count = 5,
+        .heads = 1,
+        .dim = 2,
+    }, &source_local_k, &source_local_v);
+    try std.testing.expectEqualSlices(f32, &local_k, &source_local_k);
+    try std.testing.expectEqualSlices(f32, &local_v, &source_local_v);
+    try source_hook.writeLayerKvSuffix(.{
+        .sequence_id = 99,
+        .layer_index = 0,
+        .total_token_count = 1,
+        .suffix_token_count = 1,
+        .position_offset = 0,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+        .logical_blocks = &blocks,
+        .page_size_tokens = 4,
+        .sequence_owned_global = true,
+    }, .{ .handle = key_handle, .byte_offset = 0, .byte_len = width * @sizeOf(f32) }, .{ .handle = value_handle, .byte_offset = 0, .byte_len = width * @sizeOf(f32) });
+    try std.testing.expectError(error.UnsafeExactCloneSourceDiscard, source_hook.discardExactCloneSource(31));
+    var other_k: [width]f32 = undefined;
+    var other_v: [width]f32 = undefined;
+    try source_hook.gatherLayerKv(.{ .sequence_id = 99, .layer_index = 0, .token_count = 1, .num_kv_heads = 1, .head_dim = 2 }, &other_k, &other_v);
+    try std.testing.expectApproxEqAbs(keys[0], other_k[0], 1e-3);
+    source_hook.releaseSequence(99);
+    const discarded = try source_hook.discardExactCloneSource(31);
+    try std.testing.expectEqual(@as(usize, 2), discarded.slots);
+    try std.testing.expect(discarded.physically_released_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 0), discarded.live_bytes_after);
+    try std.testing.expectEqual(@as(usize, 0), source.slot_map.count());
+    var destination_after_discard_k: [5 * width]f32 = undefined;
+    var destination_after_discard_v: [5 * width]f32 = undefined;
+    try reader.read_fn(reader.context, .{
+        .sequence = 32,
+        .layer = 1,
+        .logical_length = tokens,
+        .start = local_start,
+        .count = 5,
+        .heads = 1,
+        .dim = 2,
+    }, &destination_after_discard_k, &destination_after_discard_v);
+    try std.testing.expectEqualSlices(f32, &local_k, &destination_after_discard_k);
+    try std.testing.expectEqualSlices(f32, &local_v, &destination_after_discard_v);
+    destination_hook.releaseSequence(32);
+    try std.testing.expectEqual(@as(usize, 0), destination.slot_map.count());
 }
 
 test "selected Metal repack validates committed physical source rows" {

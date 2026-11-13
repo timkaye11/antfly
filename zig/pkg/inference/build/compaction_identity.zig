@@ -61,6 +61,10 @@ const canonical_sources = [_]Source{
     .{ .logical_name = "build.zig", .path = "build.zig" },
     .{ .logical_name = "build/compaction_identity.zig", .path = "build/compaction_identity.zig" },
     .{ .logical_name = "backends/metal_kernels.m", .path = "src/backends/metal_kernels.m" },
+    .{ .logical_name = "backends/metal_buffer_observation.h", .path = "src/backends/metal_buffer_observation.h" },
+    .{ .logical_name = "backends/metal_compile_options.h", .path = "src/backends/metal_compile_options.h" },
+    .{ .logical_name = "backends/metal_mtp_head.h", .path = "src/backends/metal_mtp_head.h" },
+    .{ .logical_name = "backends/metal_mtp_head_impl.h", .path = "src/backends/metal_mtp_head_impl.h" },
     .{ .logical_name = "server/model_manager.zig", .path = "src/server/model_manager.zig" },
     .{ .logical_name = "tools/compaction_identity.zig", .path = "tools/compaction_identity.zig" },
     .{ .logical_name = "context_capture_coverage.zig", .path = "src/context_capture_coverage.zig" },
@@ -85,6 +89,7 @@ const canonical_sources = [_]Source{
     .{ .logical_name = "backends/context_stored_all36_coordinator_fixture.zig", .path = "src/backends/context_stored_all36_coordinator_fixture.zig" },
     .{ .logical_name = "backends/context_stored_installed_invocation.zig", .path = "src/backends/context_stored_installed_invocation.zig" },
     .{ .logical_name = "context_stored_installed_caller.zig", .path = "src/context_stored_installed_caller.zig" },
+    .{ .logical_name = "context_compiled_packed_observation.zig", .path = "src/context_compiled_packed_observation.zig" },
     .{ .logical_name = "backends/context_attention.metal", .path = "src/backends/context_attention.metal" },
     .{ .logical_name = "backends/context_attention_match.metal", .path = "src/backends/context_attention_match.metal" },
     .{ .logical_name = "ops/metal_attention_match_fit.zig", .path = "src/ops/metal_attention_match_fit.zig" },
@@ -141,6 +146,14 @@ const canonical_sources = [_]Source{
     .{ .logical_name = "runtime/file_snapshot.zig", .path = "src/runtime/file_snapshot.zig" },
     .{ .logical_name = "runtime/kv/attention_matching.zig", .path = "src/runtime/kv/attention_matching.zig" },
     .{ .logical_name = "runtime/kv/attention_match.zig", .path = "src/runtime/kv/attention_match.zig" },
+    // Range-shared fitter policy, ownership, admission, and cache equality are
+    // explicit identity roots; do not rely only on incidental transitive imports.
+    .{ .logical_name = "runtime/kv/attention_match_joint_chunk_mass_replay.zig", .path = "src/runtime/kv/attention_match_joint_chunk_mass_replay.zig" },
+    .{ .logical_name = "runtime/kv/attention_match_joint_replay_planner.zig", .path = "src/runtime/kv/attention_match_joint_replay_planner.zig" },
+    .{ .logical_name = "runtime/kv/attention_match_joint_training_source.zig", .path = "src/runtime/kv/attention_match_joint_training_source.zig" },
+    .{ .logical_name = "runtime/kv/attention_match_training_page_cache.zig", .path = "src/runtime/kv/attention_match_training_page_cache.zig" },
+    .{ .logical_name = "runtime/kv/attention_match_chunk_training_cache.zig", .path = "src/runtime/kv/attention_match_chunk_training_cache.zig" },
+    .{ .logical_name = "runtime/kv/attention_match_global_training_cache.zig", .path = "src/runtime/kv/attention_match_global_training_cache.zig" },
     .{ .logical_name = "runtime/kv/attention_match_checkpoint.zig", .path = "src/runtime/kv/attention_match_checkpoint.zig" },
     .{ .logical_name = "runtime/kv/attention_match_codec.zig", .path = "src/runtime/kv/attention_match_codec.zig" },
     .{ .logical_name = "runtime/kv/attention_match_packed.zig", .path = "src/runtime/kv/attention_match_packed.zig" },
@@ -172,3 +185,24 @@ const canonical_sources = [_]Source{
     .{ .logical_name = "lib/tokenizer/src/hf_tokenizer.zig", .path = "../../lib/tokenizer/src/hf_tokenizer.zig" },
     .{ .logical_name = "lib/tokenizer/src/tokenizer.zig", .path = "../../lib/tokenizer/src/tokenizer.zig" },
 };
+
+test "quoted Metal kernel helper includes are canonical identity inputs" {
+    const metal_source = @embedFile("../src/backends/metal_kernels.m");
+    var lines = std.mem.splitScalar(u8, metal_source, '\n');
+    var quoted_includes: usize = 0;
+    while (lines.next()) |line| {
+        const prefix = "#include \"";
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const rest = line[prefix.len..];
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse return error.InvalidQuotedInclude;
+        const name = rest[0..end];
+        quoted_includes += 1;
+        var matches: usize = 0;
+        for (canonical_sources) |source| {
+            if (std.mem.startsWith(u8, source.path, "src/backends/") and
+                std.mem.eql(u8, source.path["src/backends/".len..], name)) matches += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), matches);
+    }
+    try std.testing.expectEqual(@as(usize, 4), quoted_includes);
+}

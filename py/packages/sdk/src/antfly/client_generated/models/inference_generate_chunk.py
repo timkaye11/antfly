@@ -35,6 +35,12 @@ class InferenceGenerateChunk:
             streaming responses emit this only on the final chunk, after the finish chunk
             and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
         speculation (InferenceGenerateSpeculationStatus | None | Unset):
+        generated_token_ids (list[int] | Unset): Qualification-only unfiltered generated token IDs on terminal usage
+            chunks.
+        applied_suppress_token_ids (list[int] | Unset): Exact deduplicated request-local suppression union applied
+            during token selection.
+        eos_token_ids (list[int] | Unset): EOS token IDs used by the request-scoped fixed-length mask.
+        fixed_length_mask_eos (bool | Unset): True when request-scoped EOS suppression was active.
     """
 
     id: str
@@ -45,6 +51,10 @@ class InferenceGenerateChunk:
     context: InferenceContextDiagnostics | Unset = UNSET
     usage: InferenceGenerateUsage | None | Unset = UNSET
     speculation: InferenceGenerateSpeculationStatus | None | Unset = UNSET
+    generated_token_ids: list[int] | Unset = UNSET
+    applied_suppress_token_ids: list[int] | Unset = UNSET
+    eos_token_ids: list[int] | Unset = UNSET
+    fixed_length_mask_eos: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -84,6 +94,20 @@ class InferenceGenerateChunk:
         else:
             speculation = self.speculation
 
+        generated_token_ids: list[int] | Unset = UNSET
+        if not isinstance(self.generated_token_ids, Unset):
+            generated_token_ids = self.generated_token_ids
+
+        applied_suppress_token_ids: list[int] | Unset = UNSET
+        if not isinstance(self.applied_suppress_token_ids, Unset):
+            applied_suppress_token_ids = self.applied_suppress_token_ids
+
+        eos_token_ids: list[int] | Unset = UNSET
+        if not isinstance(self.eos_token_ids, Unset):
+            eos_token_ids = self.eos_token_ids
+
+        fixed_length_mask_eos = self.fixed_length_mask_eos
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -101,6 +125,14 @@ class InferenceGenerateChunk:
             field_dict["usage"] = usage
         if speculation is not UNSET:
             field_dict["speculation"] = speculation
+        if generated_token_ids is not UNSET:
+            field_dict["generated_token_ids"] = generated_token_ids
+        if applied_suppress_token_ids is not UNSET:
+            field_dict["applied_suppress_token_ids"] = applied_suppress_token_ids
+        if eos_token_ids is not UNSET:
+            field_dict["eos_token_ids"] = eos_token_ids
+        if fixed_length_mask_eos is not UNSET:
+            field_dict["fixed_length_mask_eos"] = fixed_length_mask_eos
 
         return field_dict
 
@@ -168,6 +200,14 @@ class InferenceGenerateChunk:
 
         speculation = _parse_speculation(d.pop("speculation", UNSET))
 
+        generated_token_ids = cast(list[int], d.pop("generated_token_ids", UNSET))
+
+        applied_suppress_token_ids = cast(list[int], d.pop("applied_suppress_token_ids", UNSET))
+
+        eos_token_ids = cast(list[int], d.pop("eos_token_ids", UNSET))
+
+        fixed_length_mask_eos = d.pop("fixed_length_mask_eos", UNSET)
+
         inference_generate_chunk = cls(
             id=id,
             object_=object_,
@@ -177,6 +217,10 @@ class InferenceGenerateChunk:
             context=context,
             usage=usage,
             speculation=speculation,
+            generated_token_ids=generated_token_ids,
+            applied_suppress_token_ids=applied_suppress_token_ids,
+            eos_token_ids=eos_token_ids,
+            fixed_length_mask_eos=fixed_length_mask_eos,
         )
 
         inference_generate_chunk.additional_properties = d

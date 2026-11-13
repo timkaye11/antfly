@@ -27,6 +27,7 @@ const gpt_arch = @import("architectures/gpt.zig");
 const gemma4_runtime = @import("architectures/gemma4_runtime.zig");
 const session_factory = @import("architectures/session_factory.zig");
 const generation = @import("pipelines/generation.zig");
+const prompt_lookup = @import("pipelines/prompt_lookup.zig");
 const graph_mod = @import("graph/root.zig");
 const kernel_jit = graph_mod.kernel_jit;
 const quant_matmul = @import("graph/quant_matmul.zig");
@@ -139,6 +140,7 @@ const Options = struct {
     no_bos: bool = false,
     raw_decode_bench: bool = false,
     ignore_eos: bool = false,
+    fixed_length_mask_eos: bool = false,
     cache_dtype: ?[]const u8 = null,
     cache_compaction_ratio: ?f32 = null,
     context_policy: runtime.context_policy.Policy = .{},
@@ -507,6 +509,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .cache_compaction_ratio = opts.cache_compaction_ratio,
         .context_policy = opts.context_policy,
         .ignore_eos = opts.ignore_eos,
+        .fixed_length_mask_eos = opts.fixed_length_mask_eos,
         .enable_thinking = opts.enable_thinking,
         .qwen3vl_parity_json_path = opts.qwen3vl_parity_json_path,
         .qwen3vl_parity_patch_path = opts.qwen3vl_parity_patch_path,
@@ -791,27 +794,46 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         budget_limits.backend_limit_bytes / (1024 * 1024),
         budget_limits.combined_limit_bytes / (1024 * 1024),
     });
+    const request_suppress_policy = try generation.RequestSuppressPolicy.init(gpt_config, config);
+    const request_suppress_token_ids = if (config.fixed_length_mask_eos)
+        request_suppress_policy.ids()
+    else
+        &.{};
     const compiled_whole_model_route = graph_mode and
         explicit_partition_backend == .metal and
         compiled_attachment_target == .whole_model and
         backend_kind == .metal and
         graph_mod.metal_executor.supportsSession(model.session);
     const live_whole_model_route = liveWholeModelExecutorRequested(&opts, gpt_config) and
+        liveWholeModelExecutorSupportsGenerationConfig(config, request_suppress_token_ids, backend_kind == .metal) and
         backend_kind == .metal and
         !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
         config.draft_model == null and
         !config.speculation_requested and
         opts.video_path == null and opts.image_count == 0 and
         opts.audio_count == 0;
-    const kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
-        if (compiled_whole_model_route or live_whole_model_route)
-            .metal_whole_model
-        else
-            .standard,
+    // Prompt lookup needs transactional suffix rollback. Select full-history
+    // KV before memory admission so budget accounting and runtime storage agree.
+    const whole_model_prompt_lookup_policy = wholeModelPromptLookupStructuralEligible(
+        platform.env.getenvBool("ANTFLY_INFERENCE_PROMPT_LOOKUP"),
+        live_whole_model_route,
         gpt_config,
         config,
-        kv_dtype,
+        dumpGenerateLogitsPath() != null,
+        platform.env.getenv("TERMITE_METAL_TEACHER_FORCE_TOKEN_IDS") != null,
     );
+    const kv_capacity_policy: runtime.tier.memory.GenerationKvCapacityPolicy = if (whole_model_prompt_lookup_policy)
+        .full_history
+    else
+        generation.generationKvCapacityPolicyForRoute(
+            if (compiled_whole_model_route or live_whole_model_route)
+                .metal_whole_model
+            else
+                .standard,
+            gpt_config,
+            config,
+            kv_dtype,
+        );
     const draft_kv_dtype = if (draft_model) |loaded| blk: {
         const requested_draft_kv_dtype = if (opts.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
@@ -838,6 +860,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .workspace_capacity = model.session.generationWorkspaceCapacity(),
         .backend_owns_kv = explicit_partition_backend == .pjrt,
         .fixed_prefill_shape = explicit_partition_backend == .pjrt,
+        .additional_backend_scratch_bytes = try generation.generationRequestAdditionalBackendScratchBytes(backend_kind, gpt_config),
+        .metal_e4_transient_down_scratch_bytes = try generation.generationRequestMetalE4TransientDownScratchBytes(backend_kind, gpt_config),
+        .additional_backend_weight_bytes = try generation.boundedPleF16MirrorRequestWeightBytes(backend_kind, gpt_config),
     };
     var budget_component_count: usize = 1;
     if (draft_gpt_config) |draft_cfg| {
@@ -847,6 +872,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 .kv_dtype = draft_kv_dtype.?,
                 .config = draft_cfg,
                 .workspace_capacity = draft_model.?.session.generationWorkspaceCapacity(),
+                .additional_backend_scratch_bytes = try generation.generationRequestAdditionalBackendScratchBytes(draft_backend_kind.?, draft_cfg),
+                .metal_e4_transient_down_scratch_bytes = try generation.generationRequestMetalE4TransientDownScratchBytes(draft_backend_kind.?, draft_cfg),
+                .additional_backend_weight_bytes = try generation.boundedPleF16MirrorRequestWeightBytes(draft_backend_kind.?, draft_cfg),
             };
             budget_component_count = 2;
         }
@@ -896,6 +924,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         media_budget_credit.bytes,
     );
     defer generation_resources.release();
+    const admitted_target_estimate = try budget_components[0].estimate(prompt_tokens, budget_max_tokens, config.prefill_chunk_size);
+    const e2b_f16_mirror_admission = generation.NativeGenerationPipeline.makeE2bF16MirrorAdmission(&run_budget, admitted_target_estimate, config.prefill_chunk_size, gpt_config);
+
     // Memory admission precedes the execution barrier. Approximate context
     // owns replay/publication state exclusively; exact requests may share the
     // normal scheduler until an older exclusive waiter reaches the front.
@@ -929,6 +960,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         started_at,
         loaded_model_at,
         encoded_prompt_at,
+        e2b_f16_mirror_admission,
+        request_suppress_token_ids,
     ) catch |err| {
         print("error: live whole-model generate failed for {s} with backend {s}: {s}\n", .{
             opts.model_dir,
@@ -946,12 +979,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     // A requested live route can decline when the installed executor lacks an
     // operation. Re-admit the actual fallback route before it allocates a cache;
     // a split-ring estimate must never leak into a full-history execution.
-    const fallback_kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
-        if (compiled_whole_model_route) .metal_whole_model else .standard,
-        gpt_config,
-        config,
-        kv_dtype,
-    );
+    const fallback_kv_capacity_policy: runtime.tier.memory.GenerationKvCapacityPolicy = if (whole_model_prompt_lookup_policy)
+        .full_history
+    else
+        generation.generationKvCapacityPolicyForRoute(
+            if (compiled_whole_model_route) .metal_whole_model else .standard,
+            gpt_config,
+            config,
+            kv_dtype,
+        );
     if (fallback_kv_capacity_policy != kv_capacity_policy) {
         generation_resources.release();
         budget_components[0].kv_capacity_policy = fallback_kv_capacity_policy;
@@ -1090,6 +1126,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .explicit_scratch_limit = if (opts.scratch_budget_mb != 0) budget_limits.scratch_limit_bytes else 0,
         .gpt_config = gpt_config,
         .kv_dtype = kv_dtype,
+        .e2b_f16_mirror_admission = e2b_f16_mirror_admission,
         .shared_moe_cache = model.shared_moe_cache,
         .tokenizer = tokenizer,
         .add_bos_token = !opts.no_bos and model.manifest.add_bos_token,
@@ -3750,7 +3787,7 @@ fn metalStatsCompactJson(
         \\,
         \\"q6_high_row_mm_matrix":{d}
         \\}},
-        \\"lm_head_q4_q6_refine":{{"dispatches":{d},"resident_sampling_rejections":{d}}},
+        \\"lm_head_q4_q6_refine":{{"dispatches":{d},"full_q6_argmax_dispatches":{d},"resident_sampling_rejections":{d}}},
         \\"q4_0_policy":{{
         \\"mmv_nr4_nsg2":{d},
         \\"mmv_nr8_nsg2":{d},
@@ -3765,6 +3802,7 @@ fn metalStatsCompactJson(
         .{
             provider.metal_runtime_q6_k_high_row_mm_matrix_dispatches,
             provider.metal_runtime_lm_head_q4_q6_refine_dispatches,
+            provider.metal_runtime_lm_head_q6_full_argmax_dispatches,
             provider.metal_runtime_lm_head_q4_resident_sampling_rejections,
             provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches,
             provider.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches,
@@ -4428,6 +4466,28 @@ fn writeJsonTiming(
         );
         const profile_json = try profile_out.toOwnedSlice(allocator);
         defer allocator.free(profile_json);
+        const prompt_lookup_json = try std.fmt.allocPrint(allocator,
+            \\"prompt_lookup_requested":{},
+            \\"prompt_lookup_enabled":{},
+            \\"prompt_lookup_attempts":{d},
+            \\"prompt_lookup_hits":{d},
+            \\"prompt_lookup_proposed":{d},
+            \\"prompt_lookup_matched":{d},
+            \\"prompt_lookup_target_passes":{d},
+            \\"prompt_lookup_target_rows":{d},
+            \\"prompt_lookup_rollback_tokens":{d},
+        , .{
+            stats.prompt_lookup_requested,
+            stats.prompt_lookup_enabled,
+            stats.prompt_lookup.lookup_attempts,
+            stats.prompt_lookup.lookup_hits,
+            stats.prompt_lookup.proposed_tokens,
+            stats.prompt_lookup.accepted_proposal_tokens,
+            stats.prompt_lookup.target_verify_passes,
+            stats.prompt_lookup.target_verify_rows,
+            stats.prompt_lookup.rollback_tokens,
+        });
+        defer allocator.free(prompt_lookup_json);
         break :blk try std.fmt.allocPrint(
             allocator,
             \\{{
@@ -4442,6 +4502,7 @@ fn writeJsonTiming(
             \\"corrections":{d},
             \\"bonus":{d},
             \\"adaptive_fallbacks":{d},
+            \\{s}
             \\"mtp_enabled":{},
             \\"mtp_graph_replay":"{s}",
             \\"mtp_acceptance_permille":{d},
@@ -4473,6 +4534,7 @@ fn writeJsonTiming(
                 stats.correction_tokens,
                 stats.bonus_tokens,
                 stats.adaptive_fallbacks,
+                prompt_lookup_json,
                 stats.mtp_enabled,
                 stats.mtp_graph_replay_status,
                 stats.acceptancePermille(),
@@ -6205,7 +6267,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d} q6_high_row_mm_matrix={d} lm_head_q4_q6_refine_dispatches={d} lm_head_q4_resident_sampling_rejections={d}\n",
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d} q6_high_row_mm_matrix={d} lm_head_q4_q6_refine_dispatches={d} lm_head_q6_full_argmax_dispatches={d} lm_head_q4_resident_sampling_rejections={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce,
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_1,
@@ -6224,6 +6286,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_f16_input,
             metal_snapshot.provider.metal_runtime_q6_k_high_row_mm_matrix_dispatches,
             metal_snapshot.provider.metal_runtime_lm_head_q4_q6_refine_dispatches,
+            metal_snapshot.provider.metal_runtime_lm_head_q6_full_argmax_dispatches,
             metal_snapshot.provider.metal_runtime_lm_head_q4_resident_sampling_rejections,
         },
     );
@@ -6505,6 +6568,49 @@ fn isPureGreedyConfig(config: generation.GenerationConfig) bool {
         config.presence_penalty == 0;
 }
 
+fn wholeModelPromptLookupStructuralEligible(
+    requested: bool,
+    live_whole_model_route: bool,
+    gpt_config: gpt_mod.Config,
+    config: generation.GenerationConfig,
+    diagnostic_logits: bool,
+    teacher_forcing: bool,
+) bool {
+    return requested and live_whole_model_route and
+        config.context_policy.mode == .exact and isPureGreedyConfig(config) and
+        config.grammar == null and config.token_observer == null and
+        gemma4_runtime.supportsPreparedDenseRuntimeConfig(gpt_config) and
+        !gemma4_runtime.isQualifiedA4bArchitecture(gpt_config) and
+        runtimeTokenDecodeEnabled() and
+        !envFlagEnabled("TERMITE_METAL_DISABLE_DECODER_RUNTIME_EXECUTOR") and
+        !diagnostic_logits and !teacher_forcing;
+}
+
+fn livePromptLookupEligible(
+    requested: bool,
+    runtime_supported: bool,
+    greedy_decode: bool,
+    diagnostic_host_logits: bool,
+    teacher_forcing: bool,
+    has_grammar_or_logprobs: bool,
+    allow_swa_ring: bool,
+) bool {
+    return requested and runtime_supported and greedy_decode and
+        !diagnostic_host_logits and !teacher_forcing and
+        !has_grammar_or_logprobs and !allow_swa_ring;
+}
+
+test "live prompt lookup admission fails closed for unsupported request modes" {
+    try std.testing.expect(livePromptLookupEligible(true, true, true, false, false, false, false));
+    try std.testing.expect(!livePromptLookupEligible(false, true, true, false, false, false, false));
+    try std.testing.expect(!livePromptLookupEligible(true, false, true, false, false, false, false));
+    try std.testing.expect(!livePromptLookupEligible(true, true, false, false, false, false, false));
+    try std.testing.expect(!livePromptLookupEligible(true, true, true, true, false, false, false));
+    try std.testing.expect(!livePromptLookupEligible(true, true, true, false, true, false, false));
+    try std.testing.expect(!livePromptLookupEligible(true, true, true, false, false, true, false));
+    try std.testing.expect(!livePromptLookupEligible(true, true, true, false, false, false, true));
+}
+
 fn liveWholeModelDeclineError(err: anyerror) bool {
     return switch (err) {
         error.UnsupportedOperation,
@@ -6629,6 +6735,33 @@ fn runLiveWholeModelExecutorReuseProbe(
     printLiveWholeModelExecutorDetails(&runtime_model);
 }
 
+fn liveWholeModelExecutorSupportsGenerationConfig(
+    config: generation.GenerationConfig,
+    request_suppress_token_ids: []const i32,
+    request_suppression_backend_supported: bool,
+) bool {
+    if (!config.fixed_length_mask_eos) return request_suppress_token_ids.len == 0;
+    return request_suppression_backend_supported and config.ignore_eos and config.max_tokens > 0 and
+        isPureGreedyConfig(config) and config.grammar == null and
+        !config.speculation_requested and config.draft_model == null and
+        request_suppress_token_ids.len > 0;
+}
+
+fn generationBudgetAllowsPipelineRearm(generated: usize, max_tokens: usize) bool {
+    return generated < max_tokens and max_tokens - generated > 1;
+}
+
+test "known generation budget disables only the terminal pipeline continuation" {
+    try std.testing.expect(generationBudgetAllowsPipelineRearm(0, 300));
+    try std.testing.expect(generationBudgetAllowsPipelineRearm(1, 300));
+    try std.testing.expect(generationBudgetAllowsPipelineRearm(298, 300));
+    try std.testing.expect(!generationBudgetAllowsPipelineRearm(299, 300));
+    try std.testing.expect(!generationBudgetAllowsPipelineRearm(1, 2));
+    try std.testing.expect(!generationBudgetAllowsPipelineRearm(0, 1));
+    try std.testing.expect(!generationBudgetAllowsPipelineRearm(0, 0));
+    try std.testing.expect(!generationBudgetAllowsPipelineRearm(std.math.maxInt(usize), std.math.maxInt(usize)));
+}
+
 fn tryRunLiveWholeModelExecutorGenerate(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -6644,8 +6777,15 @@ fn tryRunLiveWholeModelExecutorGenerate(
     started_at: std.Io.Timestamp,
     loaded_model_at: std.Io.Timestamp,
     encoded_prompt_at: std.Io.Timestamp,
+    e2b_f16_mirror_admission: ?ops.DecoderRuntimeE2bF16MirrorAdmission,
+    request_suppress_token_ids: []const i32,
 ) !bool {
     if (config.context_policy.mode != .exact) return false;
+    if (!liveWholeModelExecutorSupportsGenerationConfig(
+        config,
+        request_suppress_token_ids,
+        model.session.backend() == .metal,
+    )) return false;
     if (!liveWholeModelExecutorRequested(opts, gpt_config)) return false;
     if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
     if (config.draft_model != null or config.speculation_requested) return false;
@@ -6679,32 +6819,69 @@ fn tryRunLiveWholeModelExecutorGenerate(
     // Passing the complete long-context prompt to prepare() would preplan and
     // reserve full-prompt Metal scratch before chunked execution begins.
     const prefill_chunk_size = liveWholeModelPrefillChunkSize(config, prompt_ids.len);
+    const prompt_lookup_requested = platform.env.getenvBool("ANTFLY_INFERENCE_PROMPT_LOOKUP");
+    const runtime_caps = runtime_model.capabilities();
+    const prompt_lookup_prepare = prompt_lookup_requested and
+        runtime_caps.supports_greedy_verify_transaction and
+        runtimeTokenDecodeEnabled() and
+        isPureGreedyConfig(config);
 
     var warmed_runtime_at = created_runtime_at;
     var runtime_prewarm_ms: u64 = 0;
+    const whole_model_backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .pjrt, .wasm => return false,
+    };
+    const bounded_ple_prepare_required = (try generation.boundedPleQ6RequestScratchBytes(
+        whole_model_backend_kind,
+        gpt_config,
+        platform.env.getenvBool("TERMITE_METAL_ENABLE_BOUNDED_PLE_Q6_ROWS"),
+        platform.env.getenvBool("TERMITE_METAL_DISABLE_BOUNDED_PLE_Q6_ROWS"),
+    )) != 0;
+    const mirror_prepare_required = whole_model_backend_kind == .metal and generation.gemmaF16MirrorPrepareRequested(
+        gpt_config,
+        e2b_f16_mirror_admission != null,
+    );
+    const request_prepare_required = bounded_ple_prepare_required or mirror_prepare_required;
+    const prepare_request: graph_mod.model_runtime.PrepareRequest = .{
+        .kv_tokens_hint = prefill_chunk_size,
+        // Greedy Metal owns and enforces a copy of request suppression across
+        // every pipeline arm and continuation. Prompt lookup remains
+        // transactional and cannot use speculative one-token lookahead.
+        .disable_pipelined_decode = prompt_lookup_prepare,
+        .e2b_f16_mirror_admission = e2b_f16_mirror_admission,
+    };
+    const bounded_ple_prefill_decode_handoff_required =
+        bounded_ple_prepare_required and
+        mirror_prepare_required and
+        try generation.boundedPleF16MirrorPhaseRequested(whole_model_backend_kind, gpt_config);
     if (build_options.enable_metal and
         gpt_config.family == .gemma and
         model.session.backend().usesGpuHostedSession() and
-        gemmaPrefillPrewarmEnabled())
+        (gemmaPrefillPrewarmEnabled() or
+            prompt_lookup_prepare or
+            request_prepare_required))
     {
         const prewarm_started_at = std.Io.Timestamp.now(io, .awake);
-        const prewarm_ok = runtime_model.prepare(allocator, .{
-            .kv_tokens_hint = prefill_chunk_size,
-        }) catch |err| blk: {
-            std.log.warn("Gemma4 Metal runtime prewarm failed for {s}: {s}", .{ opts.model_dir, @errorName(err) });
-            break :blk false;
-        };
+        const prewarm_ok = if (request_prepare_required)
+            try runtime_model.prepare(allocator, prepare_request)
+        else
+            runtime_model.prepare(allocator, prepare_request) catch |err| blk: {
+                std.log.warn("Gemma4 Metal runtime prewarm failed for {s}: {s}", .{ opts.model_dir, @errorName(err) });
+                break :blk false;
+            };
         warmed_runtime_at = std.Io.Timestamp.now(io, .awake);
         runtime_prewarm_ms = durationMillis(prewarm_started_at, warmed_runtime_at);
         if (!prewarm_ok) {
+            if (request_prepare_required) return error.RequiredCompiledRuntimePrepareDeclined;
             std.log.warn("Gemma4 Metal runtime prewarm declined for {s}", .{opts.model_dir});
         }
         if (opts.print_timing or opts.json_timing_path != null) {
             runtime_model.resetDebugTimingStats();
         }
     }
-    const runtime_caps = runtime_model.capabilities();
-
     var all_token_ids = std.ArrayListUnmanaged(i64).empty;
     defer all_token_ids.deinit(allocator);
     try all_token_ids.appendSlice(allocator, prompt_ids);
@@ -6741,7 +6918,8 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const diagnostic_host_logits = dump_generate_logits_path != null or teacher_force_token_ids != null;
     if (dump_generate_logits_path != null) {
         std.debug.print("generate_logits_suppress_token_ids:", .{});
-        for (gpt_config.suppressTokenIds()) |token_id| std.debug.print(" {d}", .{token_id});
+        for (if (request_suppress_token_ids.len > 0) request_suppress_token_ids else gpt_config.suppressTokenIds()) |token_id|
+            std.debug.print(" {d}", .{token_id});
         std.debug.print("\n", .{});
     }
     const use_runtime_token_decode = runtimeTokenDecodeEnabled() and !diagnostic_host_logits;
@@ -6749,6 +6927,47 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const use_sample_decode = use_runtime_token_decode and runtime_caps.supports_sample_decode and !use_greedy_decode;
     const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
     const allow_swa_ring = kv_capacity_policy == .split_swa_ring;
+    const prompt_lookup_enabled = livePromptLookupEligible(
+        prompt_lookup_requested,
+        runtime_caps.supports_greedy_verify_transaction,
+        use_greedy_decode,
+        diagnostic_host_logits,
+        teacher_force_token_ids != null,
+        config.grammar != null or config.token_observer != null,
+        allow_swa_ring,
+    ) and !config.fixed_length_mask_eos and wholeModelPromptLookupStructuralEligible(
+        prompt_lookup_requested,
+        true,
+        gpt_config,
+        config,
+        diagnostic_host_logits,
+        teacher_force_token_ids != null,
+    );
+    var prompt_lookup_stats = generation.SpeculativeDecodeStats{
+        .speculation_policy_decision = if (prompt_lookup_enabled) .active else .disabled_unavailable,
+        .prompt_lookup_requested = prompt_lookup_requested,
+        .prompt_lookup_enabled = prompt_lookup_enabled,
+    };
+    var prompt_lookup_proposer: ?*prompt_lookup.Proposer = null;
+    defer if (prompt_lookup_proposer) |proposer| {
+        allocator.destroy(proposer);
+    };
+    if (prompt_lookup_enabled) {
+        const proposer = try allocator.create(prompt_lookup.Proposer);
+        errdefer allocator.destroy(proposer);
+        proposer.* = try prompt_lookup.Proposer.init(.{ .max_draft = 1 });
+        prompt_lookup_proposer = proposer;
+    }
+    var eos_token_ids_buf: [gpt_mod.max_extra_eos_token_ids + 1]i32 = @splat(-1);
+    var eos_token_ids_len: usize = 0;
+    if (gpt_config.eos_token_id >= 0) {
+        eos_token_ids_buf[eos_token_ids_len] = gpt_config.eos_token_id;
+        eos_token_ids_len += 1;
+    }
+    for (gpt_config.extra_eos_token_ids[0..gpt_config.extra_eos_token_ids_len]) |eos_token_id| {
+        eos_token_ids_buf[eos_token_ids_len] = eos_token_id;
+        eos_token_ids_len += 1;
+    }
     const graph_stats_before_generate = graph_mod.executor_stats.snapshot();
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
     var output = blk: {
@@ -6768,6 +6987,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 .allow_swa_ring = allow_swa_ring,
                 .force_host_logits = forcePrefillHostLogits(),
                 .prefer_greedy_token = prefer_prefill_greedy_token and chunk_end == prompt_ids.len,
+                .suppress_token_ids = if (chunk_end == prompt_ids.len) request_suppress_token_ids else &.{},
             }) catch |err| {
                 debugGenerateSetup("live whole-model prefill unavailable err={s}", .{@errorName(err)});
                 if (liveWholeModelDeclineError(err)) return false;
@@ -6779,13 +6999,59 @@ fn tryRunLiveWholeModelExecutorGenerate(
     };
     const finished_prefill_at = std.Io.Timestamp.now(io, .awake);
     defer output.deinit(allocator);
+    if (bounded_ple_prefill_decode_handoff_required and
+        !try runtime_model.finishPrefillForDecode(prepare_request))
+    {
+        return error.RequiredCompiledRuntimePrepareDeclined;
+    }
 
     var generated: usize = 0;
     var first_token_at: ?std.Io.Timestamp = null;
     while (generated < max_tokens) {
+        if (prompt_lookup_proposer) |proposer| prompt_lookup_round: {
+            // The first generated token comes from prefill. Every later round
+            // has exactly one logical pending token which q_len=2 verification
+            // materializes together with the proposed continuation.
+            if (generated == 0) break :prompt_lookup_round;
+            const remaining = max_tokens - generated;
+            var proposal_buf: [1]i64 = undefined;
+            const proposal = try proposer.propose(all_token_ids.items, remaining, &proposal_buf);
+            if (proposal.tokens.len == 0) break :prompt_lookup_round;
+            const verified = try runtime_model.verifyGreedyTransaction(allocator, .{
+                .pending_token_id = all_token_ids.items[all_token_ids.items.len - 1],
+                .proposal_token_id = proposal.tokens[0],
+                .position = all_token_ids.items.len - 1,
+                .suppress_token_ids = gpt_config.suppressTokenIds(),
+                .eos_token_ids = eos_token_ids_buf[0..eos_token_ids_len],
+                .ignore_eos = config.ignore_eos,
+                .accept_bonus = remaining > 1,
+            });
+            proposer.noteVerification(1, verified.matched_proposals, 2);
+            prompt_lookup_stats.rounds += 1;
+            prompt_lookup_stats.drafted_tokens += 1;
+            prompt_lookup_stats.matched_draft_tokens += verified.matched_proposals;
+            prompt_lookup_stats.accepted_tokens += verified.accepted_count;
+            prompt_lookup_stats.correction_tokens += @intFromBool(verified.correction_added);
+            prompt_lookup_stats.bonus_tokens += @intFromBool(verified.bonus_added);
+            prompt_lookup_stats.prompt_lookup = proposer.counters;
+            for (verified.accepted()) |accepted_token| {
+                if (generated >= max_tokens) return error.InvalidSpeculativeState;
+                try generated_token_ids.append(allocator, @intCast(accepted_token));
+                try all_token_ids.append(allocator, accepted_token);
+                generated += 1;
+            }
+            if (verified.hit_eos) {
+                finish_reason = "stop";
+                break;
+            }
+            if (generated >= max_tokens) break;
+            // Correction/bonus remains pending. A matched proposal is already
+            // materialized, so this continue prevents any q_len=1 replay.
+            continue;
+        }
         const sampled_token_i32: i32 = if (generated == 0) blk: {
             if (use_greedy_decode) {
-                break :blk @intCast(try output.greedyToken(allocator, gpt_config.vocab_size));
+                break :blk @intCast(try output.greedyTokenSuppress(allocator, gpt_config.vocab_size, request_suppress_token_ids));
             }
             const output_logits = try output.hostLogits(allocator);
             traceGenerateTopLogits("prefill", generated, output_logits);
@@ -6801,6 +7067,8 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 .token_id = all_token_ids.items[all_token_ids.items.len - 1],
                 .position = all_token_ids.items.len - 1,
                 .attention_mode = .paged_decode,
+                .suppress_token_ids = request_suppress_token_ids,
+                .allow_pipeline_rearm = generationBudgetAllowsPipelineRearm(generated, max_tokens),
             });
             break :blk @intCast(greedy.token_id);
         } else if (use_sample_decode) blk: {
@@ -6851,6 +7119,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         output.deinit(allocator);
         output = next_output;
     }
+    if (prompt_lookup_proposer) |proposer| prompt_lookup_stats.prompt_lookup = proposer.counters;
 
     const result_token_ids = try allocator.dupe(i32, generated_token_ids.items);
     defer allocator.free(result_token_ids);
@@ -7173,6 +7442,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
             .tokens_used = result_token_ids.len,
             .finish_reason = finish_reason,
             .timing_ms = live_timing,
+            .speculative = if (prompt_lookup_requested) prompt_lookup_stats else null,
             .allocator = allocator,
         };
         const metal_stats: ?ops.BackendDebugTimingSnapshot = if (comptime build_options.enable_metal) blk: {
@@ -7258,6 +7528,7 @@ fn serverGenerateRequest(allocator: std.mem.Allocator, opts: Options, messages: 
         .top_p = opts.top_p,
         .top_k = opts.top_k,
         .ignore_eos = if (opts.ignore_eos) true else null,
+        .fixed_length_mask_eos = if (opts.fixed_length_mask_eos) true else null,
         .repetition_penalty = opts.repetition_penalty,
         .stream = if (opts.stream) true else null,
         .stream_options = if (opts.stream) .{ .include_usage = true } else null,
@@ -7972,6 +8243,8 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.raw_decode_bench = true;
         } else if (std.mem.eql(u8, arg, "--ignore-eos")) {
             opts.ignore_eos = true;
+        } else if (std.mem.eql(u8, arg, "--fixed-length-mask-eos")) {
+            opts.fixed_length_mask_eos = true;
         } else if (std.mem.eql(u8, arg, "--cache-dtype")) {
             i += 1;
             if (i >= args.len) return error.MissingCacheDtype;
@@ -8668,7 +8941,7 @@ test "video CLI accepts one clip and rejects conflicting inputs" {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--messages-file path] [--kv-checkpoint path] [--image path]... [--audio path] [--video h264.mp4] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--context-mode exact|rolling|attention_matching] [--context-window N] [--max-kv-tokens N] [--keep-prefix-tokens N] [--keep-recent-tokens N] [--compact-part MESSAGE:PART]... [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--messages-file path] [--kv-checkpoint path] [--image path]... [--audio path] [--video h264.mp4] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--context-mode exact|rolling|attention_matching] [--context-window N] [--max-kv-tokens N] [--keep-prefix-tokens N] [--keep-recent-tokens N] [--compact-part MESSAGE:PART]... [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--fixed-length-mask-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -8980,6 +9253,7 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_1 = 3;
     snapshot.provider.metal_runtime_q6_k_high_row_mm_matrix_dispatches = 7;
     snapshot.provider.metal_runtime_lm_head_q4_q6_refine_dispatches = 7;
+    snapshot.provider.metal_runtime_lm_head_q6_full_argmax_dispatches = 11;
     snapshot.provider.metal_runtime_lm_head_q4_resident_sampling_rejections = 2;
 
     const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
@@ -8996,6 +9270,7 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     try std.testing.expectEqual(@as(i64, 7), k_quant.get("q6_high_row_mm_matrix").?.integer);
     const refine = parsed.value.object.get("lm_head_q4_q6_refine").?.object;
     try std.testing.expectEqual(@as(i64, 7), refine.get("dispatches").?.integer);
+    try std.testing.expectEqual(@as(i64, 11), refine.get("full_q6_argmax_dispatches").?.integer);
     try std.testing.expectEqual(@as(i64, 2), refine.get("resident_sampling_rejections").?.integer);
 
     const plan = parsed.value.object.get("quant_kernel_plan").?.object;
@@ -9577,7 +9852,7 @@ test "server generate rejects unsupported server options" {
     }));
 }
 
-test "server generate forwards only explicit ignore eos" {
+test "server generate forwards only explicit EOS controls" {
     const messages = [_]api.ChatMessage{.{
         .role = .user,
         .content = .{ .string = "hello" },
@@ -9591,17 +9866,20 @@ test "server generate forwards only explicit ignore eos" {
     const default_body = try serializeServerGenerateRequest(std.testing.allocator, defaults);
     defer std.testing.allocator.free(default_body);
     try std.testing.expect(std.mem.indexOf(u8, default_body, "\"ignore_eos\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, default_body, "\"fixed_length_mask_eos\"") == null);
 
     const controlled = try serverGenerateRequest(std.testing.allocator, .{
         .model_dir = "gemma-e2b",
         .prompt = "hello",
         .backend = .cuda,
         .ignore_eos = true,
+        .fixed_length_mask_eos = true,
     }, &messages);
     defer freeServerGenerateTargets(std.testing.allocator, controlled);
     const controlled_body = try serializeServerGenerateRequest(std.testing.allocator, controlled);
     defer std.testing.allocator.free(controlled_body);
     try std.testing.expect(std.mem.indexOf(u8, controlled_body, "\"ignore_eos\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, controlled_body, "\"fixed_length_mask_eos\":true") != null);
 }
 
 test "server generate stream requests terminal usage accounting" {
@@ -9741,6 +10019,32 @@ test "only explicit prepared A4B may route compiled whole model through live exe
     };
     try std.testing.expect(!liveWholeModelExecutorRequestedForPreparedA4b(&opts, false));
     try std.testing.expect(liveWholeModelExecutorRequestedForPreparedA4b(&opts, true));
+}
+
+test "fixed length EOS masking admits only request-mask-aware live route" {
+    try std.testing.expect(liveWholeModelExecutorSupportsGenerationConfig(.{}, &.{}, false));
+    try std.testing.expect(!liveWholeModelExecutorSupportsGenerationConfig(.{}, &.{7}, true));
+    try std.testing.expect(liveWholeModelExecutorSupportsGenerationConfig(.{
+        .ignore_eos = true,
+        .fixed_length_mask_eos = true,
+        .max_tokens = 300,
+    }, &.{ 1, 50, 106 }, true));
+    try std.testing.expect(!liveWholeModelExecutorSupportsGenerationConfig(.{
+        .ignore_eos = true,
+        .fixed_length_mask_eos = true,
+        .max_tokens = 300,
+    }, &.{ 1, 50, 106 }, false));
+    try std.testing.expect(!liveWholeModelExecutorSupportsGenerationConfig(.{
+        .ignore_eos = true,
+        .fixed_length_mask_eos = true,
+        .max_tokens = 300,
+    }, &.{}, true));
+    try std.testing.expect(!liveWholeModelExecutorSupportsGenerationConfig(.{
+        .ignore_eos = true,
+        .fixed_length_mask_eos = true,
+        .max_tokens = 300,
+        .temperature = 0.5,
+    }, &.{ 1, 50, 106 }, true));
 }
 
 test "live whole-model route uses the shared KV capacity policy" {

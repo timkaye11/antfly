@@ -339,6 +339,12 @@ pub const Estimate = struct {
     kv_tier: ResidencyTier,
     scratch_bytes: usize,
     scratch_tier: ResidencyTier,
+    /// Request-scoped backend-resident weight material not covered by the
+    /// model's resident weight lease.
+    additional_backend_weight_bytes: usize = 0,
+    /// Metadata proving the exact E4 transient-down scratch subset was
+    /// included in scratch_bytes. Never charged independently.
+    metal_e4_transient_down_scratch_bytes: usize = 0,
 };
 
 pub const EstimateError = error{
@@ -364,6 +370,8 @@ pub const RunBudget = struct {
     }
 
     pub fn reserveEstimate(self: *RunBudget, estimate: Estimate) !void {
+        try self.tryReserve(.{ .kind = .weight, .tier = .backend, .bytes = estimate.additional_backend_weight_bytes });
+        errdefer self.release(.{ .kind = .weight, .tier = .backend, .bytes = estimate.additional_backend_weight_bytes });
         try self.tryReserve(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
         errdefer self.release(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
         try self.tryReserve(.{ .kind = .scratch, .tier = estimate.scratch_tier, .bytes = estimate.scratch_bytes });
@@ -376,6 +384,7 @@ pub const RunBudget = struct {
     pub fn releaseEstimate(self: *RunBudget, estimate: Estimate) void {
         self.release(.{ .kind = .scratch, .tier = estimate.scratch_tier, .bytes = estimate.scratch_bytes });
         self.release(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
+        self.release(.{ .kind = .weight, .tier = .backend, .bytes = estimate.additional_backend_weight_bytes });
     }
 
     pub fn tryReserveWeight(self: *RunBudget, tier: ResidencyTier, bytes: usize) !Reservation {
@@ -397,6 +406,14 @@ pub const RunBudget = struct {
             .tier = tier,
             .bytes = bytes,
         };
+        try self.tryReserve(reservation);
+        return reservation;
+    }
+
+    /// Keep transient fitting work charged until its owner is destroyed,
+    /// independently of the resident KV capacity limit.
+    pub fn tryReserveScratch(self: *RunBudget, tier: ResidencyTier, bytes: usize) !Reservation {
+        const reservation = Reservation{ .kind = .scratch, .tier = tier, .bytes = bytes };
         try self.tryReserve(reservation);
         return reservation;
     }
@@ -625,7 +642,7 @@ pub const AdmissionAmounts = struct {
     }
 
     pub fn fromEstimate(estimate: Estimate) @This() {
-        var amounts: @This() = .{};
+        var amounts: @This() = .{ .backend_weight_bytes = estimate.additional_backend_weight_bytes };
         switch (estimate.kv_tier) {
             .disk => {},
             .host => amounts.host_kv_bytes = estimate.kv_bytes,
@@ -3208,9 +3225,39 @@ pub const GptGenerationBudgetComponent = struct {
     /// chunk rows would select a different executable, not a smaller workspace.
     fixed_prefill_shape: bool = false,
 
+    /// Request-owned transient backend storage not represented by model
+    /// weights, KV, or the ordinary activation estimator. It participates in
+    /// both process and per-session workspace admission.
+    additional_backend_scratch_bytes: usize = 0,
+    /// Request-owned backend weight material not prepaid by the model lease.
+    /// This is weight admission, never scratch/workspace capacity.
+    additional_backend_weight_bytes: usize = 0,
+    /// Typed subset marker already included in additional backend scratch.
+    metal_e4_transient_down_scratch_bytes: usize = 0,
+
     pub fn estimate(self: @This(), prompt_tokens: usize, max_tokens: usize, chunk: usize) !Estimate {
         var result = try estimateGptGenerationForKvPolicy(self.backend, self.kv_dtype, self.config, prompt_tokens, max_tokens, chunk, self.kv_capacity_policy);
         if (self.backend == .native and self.backend_owns_kv) result.kv_bytes = 0;
+        if (self.additional_backend_scratch_bytes != 0) {
+            if (result.scratch_tier != .backend) return error.UnsupportedContextCombination;
+            result.scratch_bytes = std.math.add(usize, result.scratch_bytes, self.additional_backend_scratch_bytes) catch
+                return error.ResourceLimitExceeded;
+        }
+        if (self.metal_e4_transient_down_scratch_bytes != 0) {
+            if (self.backend != .metal or self.metal_e4_transient_down_scratch_bytes != 62_914_560 or
+                self.metal_e4_transient_down_scratch_bytes > self.additional_backend_scratch_bytes)
+                return error.UnsupportedContextCombination;
+            result.metal_e4_transient_down_scratch_bytes = self.metal_e4_transient_down_scratch_bytes;
+        }
+        if (self.additional_backend_weight_bytes != 0) {
+            if (result.kv_tier != .backend or result.scratch_tier != .backend)
+                return error.UnsupportedContextCombination;
+            result.additional_backend_weight_bytes = std.math.add(
+                usize,
+                result.additional_backend_weight_bytes,
+                self.additional_backend_weight_bytes,
+            ) catch return error.ResourceLimitExceeded;
+        }
         if (self.packed_exact) |packed_options| {
             if (self.context_policy.mode != .exact or self.context_plan != null or self.context_request != null or
                 self.backend != .metal or self.kv_dtype != .f16) return error.UnsupportedContextCombination;
@@ -3230,12 +3277,13 @@ pub const GptGenerationBudgetComponent = struct {
                 .optimize_decode = packed_options.optimize_decode,
                 .optimize_prefill = packed_options.optimize_prefill,
             });
-            // `physical_bytes` is the exact combined packed-session contract.
-            // It is conservatively charged to backend KV for process/workspace
-            // admission. Request-owned host allocations remain independently
-            // measured by the context allocation scope; this estimate never
-            // invents a host-tier split.
-            result.kv_bytes = sizes.physical_bytes;
+            // Admit the complete packed-session lifecycle peak. Optimized
+            // decode atomically replaces prefill-sized sliding rings, so the
+            // reduced rings must coexist with their sources while copying.
+            // Request-owned host allocations remain independently measured by
+            // the context allocation scope; this estimate never invents a
+            // host-tier split.
+            result.kv_bytes = sizes.execution_peak_bytes;
             result.retained_tokens = plan.retained_row_limit;
             return result;
         }
@@ -4496,6 +4544,44 @@ test "estimate reservations can be rolled back transactionally" {
     try std.testing.expectEqual(@as(usize, 0), budget.hostTotalBytes());
 }
 
+test "estimate backend weight admission rolls back and releases transactionally" {
+    const estimate = Estimate{
+        .prompt_tokens = 1,
+        .retained_tokens = 1,
+        .kv_bytes = 20,
+        .kv_tier = .backend,
+        .scratch_bytes = 10,
+        .scratch_tier = .backend,
+        .additional_backend_weight_bytes = 40,
+    };
+    var budget = RunBudget.init(.{ .backend_limit_bytes = 70, .combined_limit_bytes = 70 });
+    try budget.reserveEstimate(estimate);
+    try std.testing.expectEqual(@as(usize, 40), budget.backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 70), budget.backendTotalBytes());
+    budget.releaseEstimate(estimate);
+    try std.testing.expectEqual(@as(usize, 0), budget.backendTotalBytes());
+
+    var denied = RunBudget.init(.{ .backend_limit_bytes = 69, .combined_limit_bytes = 69 });
+    try std.testing.expectError(error.MemoryBudgetExceeded, denied.reserveEstimate(estimate));
+    try std.testing.expectEqual(@as(usize, 0), denied.backendTotalBytes());
+}
+
+test "admission amounts maps estimate extra weight only to backend weight" {
+    const amounts = AdmissionAmounts.fromEstimate(.{
+        .prompt_tokens = 1,
+        .retained_tokens = 1,
+        .kv_bytes = 2,
+        .kv_tier = .host,
+        .scratch_bytes = 3,
+        .scratch_tier = .host,
+        .additional_backend_weight_bytes = 5,
+    });
+    try std.testing.expectEqual(@as(usize, 5), amounts.backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), amounts.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 2), amounts.host_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 3), amounts.host_scratch_bytes);
+}
+
 test "single admission larger than policy is a resource limit" {
     var controller = AdmissionController{};
     try std.testing.expectError(
@@ -4529,6 +4615,33 @@ test "run budget enforces kv and scratch separately from host total" {
     try std.testing.expectEqual(@as(usize, 60), budget.hostTotalBytes());
     budget.release(reservation);
     try std.testing.expectEqual(@as(usize, 40), budget.hostTotalBytes());
+}
+
+test "compaction fit scratch preserves resident KV capacity and releases atomically" {
+    var budget = RunBudget.init(.{
+        .host_limit_bytes = 1024,
+        .backend_limit_bytes = 1024,
+        .combined_limit_bytes = 1500,
+        .kv_limit_bytes = 400,
+        .scratch_limit_bytes = 1000,
+    });
+    const resident = try budget.tryReserveKv(.backend, 400);
+    const host_fit = try budget.tryReserveScratch(.host, 600);
+    const backend_fit = try budget.tryReserveScratch(.backend, 400);
+    try std.testing.expectEqual(@as(usize, 400), budget.kvTotalBytes());
+    try std.testing.expectEqual(@as(usize, 1000), budget.scratchTotalBytes());
+    try std.testing.expectError(error.MemoryBudgetExceeded, budget.tryReserveScratch(.host, 1));
+    try std.testing.expectEqual(DenialLimit.scratch_total, budget.last_denial.?.limit);
+    try std.testing.expectEqual(@as(usize, 600), budget.hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 800), budget.backendTotalBytes());
+    budget.release(backend_fit);
+    budget.release(host_fit);
+    try std.testing.expectEqual(@as(usize, 0), budget.scratchTotalBytes());
+    try std.testing.expectEqual(@as(usize, 400), budget.kvTotalBytes());
+    try std.testing.expectError(error.MemoryBudgetExceeded, budget.tryReserveKv(.backend, 1));
+    try std.testing.expectEqual(DenialLimit.kv_total, budget.last_denial.?.limit);
+    budget.release(resident);
+    try std.testing.expectEqual(@as(usize, 0), budget.backendTotalBytes());
 }
 
 test "run budget formats denial details" {
@@ -4712,6 +4825,105 @@ test "generation budget downshifts target and draft together" {
         2 * (try estimateGptGeneration(.metal, .f16, cfg, 200, 1, 64)).scratch_bytes,
         budget.scratchTotalBytes(),
     );
+}
+
+test "generation component reserves fixed backend scratch before chunk selection" {
+    const cfg = gpt_mod.Config{
+        .hidden_size = 8,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 8,
+        .vocab_size = 1,
+        .position_encoding = .rope,
+    };
+    const extra: usize = 4096;
+    const component = GptGenerationBudgetComponent{
+        .backend = .metal,
+        .kv_dtype = .f16,
+        .config = cfg,
+        .additional_backend_scratch_bytes = extra,
+    };
+    const minimum_base = try estimateGptGeneration(.metal, .f16, cfg, 200, 1, 32);
+    const minimum = try component.estimate(200, 1, 32);
+    try std.testing.expectEqual(minimum_base.scratch_bytes + extra, minimum.scratch_bytes);
+
+    var denied = RunBudget.init(.{ .scratch_limit_bytes = minimum.scratch_bytes - 1 });
+    try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationAtLargestChunk(&denied, &.{component}, 200, 1, 128));
+
+    var admitted = RunBudget.init(.{ .scratch_limit_bytes = minimum.scratch_bytes });
+    try std.testing.expectEqual(@as(usize, 32), try reserveGptGenerationAtLargestChunk(&admitted, &.{component}, 200, 1, 128));
+    try std.testing.expectEqual(minimum.scratch_bytes, admitted.backend_scratch_bytes);
+}
+
+test "generation component backend weight is fixed across chunk selection" {
+    const cfg = gpt_mod.Config{
+        .hidden_size = 8,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 8,
+        .vocab_size = 1,
+        .position_encoding = .rope,
+    };
+    const component = GptGenerationBudgetComponent{
+        .backend = .metal,
+        .kv_dtype = .f16,
+        .config = cfg,
+        .additional_backend_weight_bytes = 4096,
+    };
+    const minimum = try component.estimate(200, 1, 32);
+    try std.testing.expectEqual(@as(usize, 4096), minimum.additional_backend_weight_bytes);
+    const required = minimum.kv_bytes + minimum.scratch_bytes + minimum.additional_backend_weight_bytes;
+    var denied = RunBudget.init(.{ .backend_limit_bytes = required - 1, .combined_limit_bytes = required - 1 });
+    try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationAtLargestChunk(&denied, &.{component}, 200, 1, 32));
+    try std.testing.expectEqual(@as(usize, 0), denied.backendTotalBytes());
+    var admitted = RunBudget.init(.{ .backend_limit_bytes = required, .combined_limit_bytes = required });
+    try std.testing.expectEqual(@as(usize, 32), try reserveGptGenerationAtLargestChunk(&admitted, &.{component}, 200, 1, 32));
+    try std.testing.expectEqual(@as(usize, 4096), admitted.backend_weight_bytes);
+}
+
+test "persistent phase scratch participates in process and workspace denial rollback" {
+    const cfg = gpt_mod.Config{
+        .hidden_size = 8,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 8,
+        .vocab_size = 1,
+        .position_encoding = .rope,
+    };
+    const phase_scratch: usize = 53_116_928 + 62_914_560;
+    var component = GptGenerationBudgetComponent{
+        .backend = .metal,
+        .kv_dtype = .f16,
+        .config = cfg,
+        .additional_backend_scratch_bytes = phase_scratch,
+        .metal_e4_transient_down_scratch_bytes = 62_914_560,
+    };
+    const estimate = try component.estimate(32, 1, 32);
+    try std.testing.expectEqual(@as(usize, 62_914_560), estimate.metal_e4_transient_down_scratch_bytes);
+    const without_marker = try (GptGenerationBudgetComponent{
+        .backend = .metal,
+        .kv_dtype = .f16,
+        .config = cfg,
+        .additional_backend_scratch_bytes = phase_scratch,
+    }).estimate(32, 1, 32);
+    try std.testing.expectEqual(without_marker.scratch_bytes, estimate.scratch_bytes);
+    var process_denied = RunBudget.init(.{
+        .backend_limit_bytes = estimate.kv_bytes + estimate.scratch_bytes - 1,
+        .combined_limit_bytes = estimate.kv_bytes + estimate.scratch_bytes - 1,
+    });
+    try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationAtLargestChunk(&process_denied, &.{component}, 32, 1, 32));
+    try std.testing.expectEqual(@as(usize, 0), process_denied.backendTotalBytes());
+
+    component.workspace_capacity = .{
+        .backend_kv_bytes = estimate.kv_bytes,
+        .backend_scratch_bytes = estimate.scratch_bytes - 1,
+    };
+    var workspace_denied = RunBudget.init(.{});
+    try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationAtLargestChunk(&workspace_denied, &.{component}, 32, 1, 32));
+    try std.testing.expectEqual(@as(usize, 0), workspace_denied.backendTotalBytes());
 }
 
 test "cuda Gemma4 prefill rejects unsafe 2051 row physical envelope" {
@@ -5083,7 +5295,12 @@ test "packed exact generation admission uses the session physical allocation" {
     });
     const estimate = try component.estimate(prompt_tokens, max_tokens, chunk);
     try std.testing.expect(expected.physical_bytes > 0);
-    try std.testing.expectEqual(expected.physical_bytes, estimate.kv_bytes);
+    try std.testing.expect(expected.singleton_decode_staging_bytes > 0);
+    try std.testing.expectEqual(
+        expected.physical_bytes + expected.singleton_decode_staging_bytes,
+        expected.execution_peak_bytes,
+    );
+    try std.testing.expectEqual(expected.execution_peak_bytes, estimate.kv_bytes);
     try std.testing.expectEqual(plan.retained_row_limit, estimate.retained_tokens);
 
     const zero_output = try component.estimate(prompt_tokens, 0, chunk);
@@ -5098,16 +5315,16 @@ test "packed exact generation admission uses the session physical allocation" {
         .optimize_decode = true,
         .optimize_prefill = true,
     });
-    try std.testing.expectEqual(one_chunk_sizes.physical_bytes, zero_chunk.kv_bytes);
+    try std.testing.expectEqual(one_chunk_sizes.execution_peak_bytes, zero_chunk.kv_bytes);
 
     var budget = RunBudget.init(.{});
     const admitted = try reserveGptGenerationPrefill(&budget, &.{component}, prompt_tokens, max_tokens, chunk);
     try std.testing.expectEqual(@as(usize, chunk), admitted.max_chunk_rows);
-    try std.testing.expectEqual(expected.physical_bytes, budget.backend_kv_bytes);
+    try std.testing.expectEqual(expected.execution_peak_bytes, budget.backend_kv_bytes);
 
     var constrained = component;
     const smaller = try component.estimate(prompt_tokens, max_tokens, 32);
-    try std.testing.expect(smaller.kv_bytes < expected.physical_bytes);
+    try std.testing.expect(smaller.kv_bytes < expected.execution_peak_bytes);
     constrained.workspace_capacity = .{
         .backend_kv_bytes = smaller.kv_bytes,
         .backend_scratch_bytes = std.math.maxInt(usize),

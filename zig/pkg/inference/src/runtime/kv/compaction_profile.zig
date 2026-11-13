@@ -19,6 +19,7 @@
 const std = @import("std");
 const policy = @import("../context_policy.zig");
 const compaction_identity = @import("compaction_identity");
+const producer_policy = @import("attention_match_fit_policy.zig");
 
 /// Runtime selection hashes only semantic inputs. Source-tree, executable and
 /// release-report hashes remain external evidence and must not make a release
@@ -27,7 +28,31 @@ pub const semantic_identity_version: u32 = 1;
 const layout_domain = "antfly.context-compaction.layout.v1\x00";
 const implementation_domain = "antfly.context-compaction.implementation.v4\x00";
 const profile_domain = "antfly.context-compaction.profile.v3\x00";
+const producer_policy_domain = "antfly.context-compaction.producer-policy.v1\x00";
+const prepare_host_owner_capability_domain = "antfly.context-compaction.prepare-host-owner-capability.v1\x00";
 pub const FitEngine = enum(u8) { block_v1, native_whole_head_v2 };
+pub const PrepareHostOwnerCapability = enum(u8) { none, bounded_page_e4_resident_1152m_v1 };
+pub const bounded_page_e4_resident_1152m_bytes: u64 = 1_207_959_552;
+pub const ResidentAuthorityBinding = struct {
+    cohort: enum(u8) { e4_8128_v1 },
+    base_compatibility_artifact_sha256: [32]u8,
+    base_compatibility_semantic_sha256: [32]u8,
+    training_policy_sha256: [32]u8,
+    configuration_sha256: [32]u8,
+    source_freeze_sha256: [32]u8,
+    shape_authority_sha256: [32]u8,
+    policy_module_sha256: [32]u8,
+    encoding: enum(u8) { f16 },
+    logical_tokens: u32,
+    max_output_tokens: u32,
+    fit_workers: u32,
+    resume_allowed: bool,
+    compiled_max_copy_bytes: u64,
+    compiled_max_host_staging_bytes: u64,
+    compiled_codec_scope: enum(u8) { f16_only },
+    compiled_max_logical_tokens: u32,
+    compiled_layout_policy: enum(u8) { full_history_exact },
+};
 
 pub const Identity = struct {
     /// Digests of the bytes parsed by the loaded model/tokenizer/template.
@@ -94,6 +119,9 @@ pub const QueryProtocolAuthority = struct {
 pub const Profile = struct {
     identity: Identity,
     engine: FitEngine = .block_v1,
+    producer_policy: producer_policy.Policy = .legacy_fixed,
+    prepare_host_owner_capability: PrepareHostOwnerCapability = .none,
+    resident_authority: ?ResidentAuthorityBinding = null,
     /// SHA-256 of the exact frozen profile artifact reviewed by release.
     /// It is external provenance and deliberately excluded from semanticDigest.
     artifact_sha256: [32]u8 = @splat(0),
@@ -152,6 +180,32 @@ pub const Profile = struct {
                 hashInt(&hash, u8, @backingInt(study.generation_mode));
             }
         }
+        // Preserve every historical legacy profile digest byte-for-byte.
+        if (!std.meta.eql(self.producer_policy, producer_policy.Policy.legacy_fixed)) {
+            hash.update(producer_policy_domain);
+            hash.update(&self.producer_policy.digest());
+        }
+        // Default-none profiles retain their historical semantic bytes.
+        if (self.prepare_host_owner_capability != .none) {
+            hash.update(prepare_host_owner_capability_domain);
+            hashInt(&hash, u8, @backingInt(self.prepare_host_owner_capability));
+            hashInt(&hash, u64, bounded_page_e4_resident_1152m_bytes);
+            const resident = self.resident_authority orelse return @splat(0);
+            hashInt(&hash, u8, @backingInt(resident.cohort));
+            inline for (.{ resident.base_compatibility_artifact_sha256, resident.base_compatibility_semantic_sha256, resident.training_policy_sha256, resident.configuration_sha256, resident.source_freeze_sha256, resident.shape_authority_sha256, resident.policy_module_sha256 }) |field| hash.update(&field);
+            hashInt(&hash, u8, @backingInt(resident.encoding));
+            hashInt(&hash, u32, resident.logical_tokens);
+            hashInt(&hash, u32, resident.max_output_tokens);
+            hashInt(&hash, u32, resident.fit_workers);
+            hashInt(&hash, u8, @intFromBool(resident.resume_allowed));
+            hashInt(&hash, u64, resident.compiled_max_copy_bytes);
+            hashInt(&hash, u64, resident.compiled_max_host_staging_bytes);
+            hashInt(&hash, u8, @backingInt(resident.compiled_codec_scope));
+            hashInt(&hash, u32, resident.compiled_max_logical_tokens);
+            hashInt(&hash, u8, @backingInt(resident.compiled_layout_policy));
+        } else if (self.resident_authority != null) {
+            return @splat(0);
+        }
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         return digest;
@@ -193,6 +247,22 @@ pub const Profile = struct {
         if (index != self.owners.len or !lossy) return error.UnsupportedCompactionProfile;
     }
 };
+
+test "prepare host capability is semantic while none preserves legacy digest" {
+    const owners = [_]Owner{.{ .layer = 0, .retained = &.{1} }};
+    const base: Profile = .{ .identity = .{ .artifact = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4), .runtime = @splat(5) }, .owners = &owners, .max_prompt_tokens = 1, .max_output_tokens = 1, .minimum_saved_bytes = 1 };
+    var explicit_none = base;
+    explicit_none.prepare_host_owner_capability = .none;
+    try std.testing.expectEqualSlices(u8, &base.semanticDigest(), &explicit_none.semanticDigest());
+    var bounded = base;
+    bounded.prepare_host_owner_capability = .bounded_page_e4_resident_1152m_v1;
+    bounded.resident_authority = .{ .cohort = .e4_8128_v1, .base_compatibility_artifact_sha256 = @splat(11), .base_compatibility_semantic_sha256 = @splat(12), .training_policy_sha256 = @splat(6), .configuration_sha256 = @splat(7), .source_freeze_sha256 = @splat(8), .shape_authority_sha256 = @splat(9), .policy_module_sha256 = @splat(10), .encoding = .f16, .logical_tokens = 8128, .max_output_tokens = 64, .fit_workers = 1, .resume_allowed = false, .compiled_max_copy_bytes = 4 * 1024 * 1024 * 1024, .compiled_max_host_staging_bytes = 256 * 1024 * 1024, .compiled_codec_scope = .f16_only, .compiled_max_logical_tokens = 8192, .compiled_layout_policy = .full_history_exact };
+    const bounded_digest = bounded.semanticDigest();
+    try std.testing.expect(!std.mem.eql(u8, &base.semanticDigest(), &bounded_digest));
+    var tampered = bounded;
+    tampered.resident_authority.?.source_freeze_sha256[0] ^= 1;
+    try std.testing.expect(!std.mem.eql(u8, &bounded_digest, &tampered.semanticDigest()));
+}
 
 /// Exact maximum retained rows for one KV head after applying this profile to
 /// every validated eligible block. Prefixes, gaps and the final tail remain

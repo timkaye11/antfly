@@ -784,7 +784,7 @@ pub const Driver = struct {
         return self.requestBodyWithMessages(request, &.{.{ .role = "user", .content = request.prompt }});
     }
 
-    fn policy(request: Request) !@import("runtime/context_policy.zig").Policy {
+    pub fn policy(request: Request) !@import("runtime/context_policy.zig").Policy {
         var result = @import("runtime/context_policy.zig").Policy{
             .mode = if (request.variant == .attention_matching or request.coverage != null) .attention_matching else .exact,
             .max_context_tokens = request.max_context_tokens,
@@ -1051,7 +1051,7 @@ pub const Driver = struct {
             const expected: anyerror = switch (controller.kind) {
                 .oom => error.OutOfMemory,
                 .nonfinite => error.NonFiniteCompactionInput,
-                .gpu_failure => error.ContextMetalDispatchFailed,
+                .gpu_failure, .future_append_failure => error.ContextMetalDispatchFailed,
                 else => error.Cancelled,
             };
             if (err != expected) return err;

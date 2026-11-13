@@ -688,7 +688,7 @@ pub const Config = struct {
         return false;
     }
 
-    pub fn suppressTokenIds(self: Config) []const i32 {
+    pub fn suppressTokenIds(self: *const Config) []const i32 {
         return self.suppress_token_ids[0..self.suppress_token_ids_len];
     }
 
@@ -1605,7 +1605,7 @@ fn applyGgufTokenizerStopMetadata(view: gguf_metadata.View, config: *Config) voi
     // spelling. Treat either exact terminator as an additional EOS so chat
     // generation cannot continue into another templated turn.
     if (config.usesGemma4Channels()) {
-        for ([_][]const u8{ "<end_of_turn>", "<turn|>" }) |token| {
+        for ([_][]const u8{ "<end_of_turn>", "<turn|>", "<|tool_response>" }) |token| {
             if (ggufTokenStringId(view, token)) |token_id| {
                 addEosTokenId(config, token_id);
             }
@@ -3013,6 +3013,7 @@ test "parse GGUF tokenizer eos token metadata" {
         .{ .string = "<eos>" },
         .{ .string = "<end_of_turn>" },
         .{ .string = "<turn|>" },
+        .{ .string = "<|tool_response>" },
     };
     var metadata = [_]gguf_format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "gemma4" } },
@@ -3036,7 +3037,8 @@ test "parse GGUF tokenizer eos token metadata" {
     try std.testing.expect(config.isEosToken(1));
     try std.testing.expect(config.isEosToken(2));
     try std.testing.expect(config.isEosToken(3));
-    try std.testing.expectEqual(@as(u8, 2), config.extra_eos_token_ids_len);
+    try std.testing.expect(config.isEosToken(4));
+    try std.testing.expectEqual(@as(u8, 3), config.extra_eos_token_ids_len);
 }
 
 test "parse GGUF tokenizer eos token from token string fallback" {

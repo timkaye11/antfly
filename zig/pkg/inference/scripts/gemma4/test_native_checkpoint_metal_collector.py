@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import hashlib
+import io
 import json
 import signal
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -30,6 +34,23 @@ class Process:
 
     def poll(self):
         return None
+
+
+def v2_fixture():
+    wire = qualification._native_kv_v2_module()
+    payload = struct.pack("<Q", 12) + b"x" * 40
+    header = struct.pack("<8sIIQ", b"ANTFLYKV", 3, 0, len(payload)) + bytes(range(128))
+    checkpoint = header + payload + hashlib.sha256(header + payload).digest()
+    ids = [bytes(range(i, i + 32)).hex() for i in range(0, 128, 32)]
+    producer = {"schema":"antfly.native-kv-prepared-producer.v1","model":"gemma",
+      "model_artifact_sha256_hex":ids[0],"model_tokenizer_sha256_hex":ids[1],"model_template_sha256_hex":ids[2],"model_layout_sha256_hex":ids[3],
+      "profile_sha256_hex":"1"*64,"profile_semantic_sha256_hex":"2"*64,"source_sha256_hex":"3"*64,"binary_sha256_hex":"4"*64,
+      "policy_name":"resident","policy_sha256_hex":"5"*64,"admission":"bounded","chunk_rows":256,"reject_exact_active_fixed_point":True,
+      "encoding":"f16","logical_revision":7,"logical_tokens":12,"checkpoint_bytes":len(checkpoint),"outcome":"compacted"}
+    opaque = base64.b64encode(json.dumps(producer,separators=(",",":"),sort_keys=True).encode()).decode()
+    metadata=json.dumps({"prepared_metadata_base64":opaque,"schema":"antfly.native-kv-envelope.v2"},separators=(",",":"),sort_keys=True).encode()
+    prefix=struct.pack("<8sQIIIIQ",b"AFATT002",len(metadata),1,0,len(wire.CHECKPOINT_MIME),0,len(checkpoint))+metadata+wire.CHECKPOINT_MIME
+    return prefix+checkpoint+hashlib.sha256(prefix+checkpoint).digest(),opaque
 
 
 class OwnedProcess:
@@ -64,6 +85,61 @@ class Response:
 
 
 class MetalCollectorTests(unittest.TestCase):
+    def test_compiled_v2_receive_preserves_opaque_and_rejects_corruption(self):
+        frame, opaque = v2_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.afkv"
+            result = qualification._receive_compiled_checkpoint(io.BytesIO(frame), path, "gemma", "application/vnd.antfly.attachments.v2")
+            self.assertEqual(result["prepared_metadata_base64"], opaque)
+            self.assertEqual(result["envelope_version"], 2)
+            with self.assertRaisesRegex(AssertionError,"AFATT002"):
+                qualification._receive_compiled_checkpoint(io.BytesIO(frame),Path(directory)/"v1.afkv","gemma","application/vnd.antfly.attachments.v1")
+            bad = frame[:-1] + bytes([frame[-1] ^ 1])
+            with self.assertRaisesRegex(ValueError, "envelope checksum"):
+                qualification._receive_compiled_checkpoint(io.BytesIO(bad), Path(directory) / "bad.afkv", "gemma", "application/vnd.antfly.attachments.v2")
+
+    def test_compiled_v2_upload_preserves_opaque_producer(self):
+        frame, opaque = v2_fixture()
+        class Connection:
+            def __init__(self): self.headers={}; self.data=bytearray()
+            def putrequest(self,*args): pass
+            def putheader(self,key,value): self.headers[key]=value
+            def endheaders(self): pass
+            def send(self,value): self.data.extend(value)
+            def getresponse(self): return object()
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"checkpoint.afkv"
+            qualification._receive_compiled_checkpoint(io.BytesIO(frame),path,"gemma","application/vnd.antfly.attachments.v2")
+            connection=Connection();qualification._send_compiled_resume(connection,"/resume",{"model":"gemma"},path,opaque)
+            self.assertEqual(connection.data[:8],b"AFATT002")
+            self.assertEqual(connection.headers["Content-Type"],"application/vnd.antfly.attachments.v2")
+            size=struct.unpack("<Q",connection.data[8:16])[0]
+            outer=json.loads(connection.data[40:40+size]);self.assertEqual(outer["prepared_metadata_base64"],opaque)
+            self.assertEqual(hashlib.sha256(connection.data[:-32]).digest(),connection.data[-32:])
+
+    def test_compiled_prepare_advertises_v2_without_changing_legacy_headers(self):
+        compiled=qualification.prepare_transport_headers(self.args(server_kind="full-cli",compiled_prefill_prepare=True))
+        self.assertEqual(compiled["Accept"],"application/vnd.antfly.attachments.v2, application/vnd.antfly.attachments.v1")
+        self.assertNotIn("Accept",qualification.prepare_transport_headers(self.args()))
+
+    def test_compiled_prepare_executes_v2_control_flow(self):
+        frame,_=v2_fixture()
+        class Response(io.BytesIO):
+            status=200
+            def getheaders(self):return [("Content-Type","application/vnd.antfly.attachments.v2"),("X-Antfly-Inference-Backend","metal"),("X-Antfly-Inference-Pid","77")]
+        class Connection:
+            def __init__(self,*args,**kwargs):self.request_args=None;self.response=Response(frame)
+            def request(self,*args):self.request_args=args
+            def getresponse(self):return self.response
+            def close(self):pass
+        ids={name:bytes(range(i,i+32)).hex() for i,name in zip(range(0,128,32),("weights","tokenizer","template","layout"))}
+        with tempfile.TemporaryDirectory() as directory,mock.patch.object(qualification.http.client,"HTTPConnection",Connection),mock.patch.object(qualification,"metal_ledger_start",return_value=0),mock.patch.object(qualification,"metal_ledger_finish"):
+            args=self.args(server_kind="full-cli",compiled_prefill_prepare=True,encoding="f16",port=1,timeout=1,checkpoint=Path(directory)/"x.afkv",model="gemma",expected_outcome="compacted",minimum_savings=1.5)
+            record={"worker_pid":77,"ready":{"loaded_identity":ids},"requests":[],"log_path":"unused"}
+            result=qualification.prepare(args,{"model":"gemma","messages":[],"stream":True},record)
+            self.assertEqual(result["envelope_version"],2);self.assertEqual(result["identity"],ids)
+            self.assertEqual(record["requests"][0]["headers"]["content-type"],"application/vnd.antfly.attachments.v2")
+
     def args(self, **changes):
         values = {
             "backend": "metal",
@@ -71,6 +147,8 @@ class MetalCollectorTests(unittest.TestCase):
             "encoding": "f16",
             "experimental_rotated4": False,
             "qualification_minimum_savings": None,
+            "minimum_savings": 1.5,
+            "minimum_fp8_heads": 0,
         }
         values.update(changes)
         return SimpleNamespace(**values)
@@ -157,6 +235,44 @@ class MetalCollectorTests(unittest.TestCase):
         self.assertFalse(prepared["stream"])
         self.assertEqual(prepared["mode"], "eager")
         self.assertEqual(prepared["stream_options"], {"include_usage": True})
+
+    def test_full_cli_compiled_prepare_preserves_mode_and_resume_is_eager(self):
+        args = self.args(server_kind="full-cli", compiled_prefill_prepare=True)
+        qualification.validate_backend_configuration(args)
+        source = {
+            "model": qualification.METAL_TEST_MODEL,
+            "messages": [{"role": "user", "content": "compiled prefill fixture"}],
+            "stream": True,
+        }
+        prepared = qualification.prepare_request_body(args, source)
+        self.assertNotIn("mode", prepared)
+        self.assertFalse(prepared["stream"])
+        self.assertTrue(source["stream"])
+        prepared["messages"][0]["content"] = "changed"
+        self.assertEqual(source["messages"][0]["content"], "compiled prefill fixture")
+        self.assertEqual(qualification.normalize_request_body(args, source)["mode"], "eager")
+        for mode in (None, "eager", "compiled", "whole-model"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                qualification.prepare_request_body(args, {**source, "mode": mode})
+
+    def test_full_cli_compiled_prepare_rejects_incomplete_or_test_only_grants(self):
+        for changes in (
+            {"server_kind": "full-cli"},
+            {"compiled_prefill_prepare": True},
+            {"backend": "cuda", "server_kind": "full-cli", "compiled_prefill_prepare": True},
+            {"server_kind": "full-cli", "compiled_prefill_prepare": "yes"},
+            {"server_kind": "full-cli", "compiled_prefill_prepare": True, "qualification_minimum_savings": 2},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                qualification.validate_backend_configuration(self.args(**changes))
+
+    def test_full_cli_compiled_v2_scope_rejects_unproven_codec_and_thresholds(self):
+        base={"server_kind":"full-cli","compiled_prefill_prepare":True}
+        qualification.prepare_transport_headers(self.args(**base))
+        for changes in ({"encoding":"fp8"},{"encoding":"rotated4","experimental_rotated4":True},
+                        {"minimum_savings":1.5001},{"minimum_savings":True},{"minimum_fp8_heads":1}):
+            with self.subTest(changes=changes),self.assertRaises(ValueError):
+                qualification.prepare_transport_headers(self.args(**base,**changes))
 
     def test_owner_ledger_wrapper_requires_attributed_prepare_source(self):
         committed = {

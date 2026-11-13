@@ -253,6 +253,45 @@ pub const Layout = struct {
     }
 };
 
+fn hashLayoutU32(hasher: *std.crypto.hash.sha2.Sha256, value: u32) void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
+/// Canonical, padding-independent identity for the effective per-layer KV and
+/// positional layout. This is shared by compiled exporters and packed importers.
+pub fn layoutDigest(layout: Layout) ![32]u8 {
+    if (layout.len == 0 or layout.len > layout.layers.len) return error.InvalidContextLayout;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly.context-policy-layout.v1\x00");
+    hashLayoutU32(&hasher, std.math.cast(u32, layout.len) orelse return error.InvalidContextLayout);
+    for (layout.layers[0..layout.len], 0..) |layer, index| {
+        hashLayoutU32(&hasher, std.math.cast(u32, index) orelse return error.InvalidContextLayout);
+        hashLayoutU32(&hasher, layer.owner);
+        hashLayoutU32(&hasher, layer.sliding_window);
+        hashLayoutU32(&hasher, layer.kv_heads);
+        hashLayoutU32(&hasher, layer.query_heads);
+        hashLayoutU32(&hasher, layer.head_dim);
+        hashLayoutU32(&hasher, layer.rope_active_dim);
+        hashLayoutU32(&hasher, layer.rope_frequency_dim);
+        hashLayoutU32(&hasher, @bitCast(layer.rope_theta));
+    }
+    return hasher.finalResult();
+}
+
+test "context layout digest binds effective fields without struct padding" {
+    var config = gpt.Config{};
+    config.num_hidden_layers = 1;
+    config.num_attention_heads = 4;
+    config.num_key_value_heads = 2;
+    config.hidden_size = 32;
+    var layout = try Layout.init(config);
+    const original = try layoutDigest(layout);
+    layout.layers[0].head_dim += 1;
+    try std.testing.expect(!std.mem.eql(u8, &original, &(try layoutDigest(layout))));
+}
+
 test "context policy preserves model positions and reserves every output token" {
     const p = Policy{ .max_context_tokens = 4096 };
     try std.testing.expectEqual(@as(usize, 3839), try p.promptLimit(131072, null, 256, 1, 0));

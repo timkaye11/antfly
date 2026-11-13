@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
@@ -793,7 +794,7 @@ fn prepareScaledRopeForDirectAttention(
     const rope_consecutive_pairs = gpt_config.rope_layout == .consecutive_pairs;
     const rope_theta = gpt_config.layerRopeEffectiveTheta(layer);
     const position_offset = seq_len - query_sequence_len;
-    return try cb.ropeScaled(
+    if (try cb.ropeScaled(
         input,
         scale,
         query_sequence_len,
@@ -803,7 +804,34 @@ fn prepareScaledRopeForDirectAttention(
         gpt_config.rope_freq_scale,
         position_offset,
         rope_consecutive_pairs,
+    )) |scaled_rope| return scaled_rope;
+
+    // ropeScaled is an optional backend optimization. Its absence must not
+    // remove Gemma 4's sqrt(head_dim) query correction: q_for_attn is
+    // deliberately unscaled for RoPE configurations because the RoPE path
+    // owns that correction. This fallback is used by some shared-consumer
+    // prepared-prefill tensors.
+    const rope = try cb.rope(
+        input,
+        query_sequence_len,
+        head_dim,
+        rope_dim,
+        rope_theta,
+        gpt_config.rope_freq_scale,
+        position_offset,
+        rope_consecutive_pairs,
     );
+    errdefer cb.free(rope);
+    if (try cb.multiplyScalar(rope, scale)) |scaled| {
+        cb.free(rope);
+        return scaled;
+    }
+    const scale_shape = [_]i32{1};
+    const scale_tensor = try cb.fromFloat32Shape(&[_]f32{scale}, &scale_shape);
+    defer cb.free(scale_tensor);
+    const scaled = try cb.multiply(rope, scale_tensor);
+    cb.free(rope);
+    return scaled;
 }
 
 fn maybeSyncTensor(
@@ -1520,6 +1548,73 @@ fn supportsPreparedDecodeConfig(gpt_config: gpt_mod.Config) bool {
         gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config);
 }
 
+fn recentCaptureRequiresCanonicalPrefillLayer(
+    capture: ?model_runtime.RecentPrefillQueryCaptureDescriptor,
+    seq_len: usize,
+    query_sequence_len: usize,
+    donor_layer: usize,
+    consumer_layer: usize,
+) bool {
+    const descriptor = capture orelse return false;
+    if (!descriptor.accepts(@intCast(donor_layer), @intCast(consumer_layer))) return false;
+    if (query_sequence_len == 0 or query_sequence_len > seq_len) return false;
+    return seq_len == descriptor.logical_tokens;
+}
+
+fn recentCaptureRequiresPerLayerPrefill(
+    capture: ?model_runtime.RecentPrefillQueryCaptureDescriptor,
+    seq_len: usize,
+    query_sequence_len: usize,
+) bool {
+    const descriptor = capture orelse return false;
+    if (query_sequence_len == 0 or query_sequence_len > seq_len) return false;
+    return seq_len == descriptor.logical_tokens and !descriptor.supportsNativeWholeGraph();
+}
+
+test "recent query capture bypasses fused preprojection only for accepted terminal tuples" {
+    const State = struct {
+        donor: u32 = 5,
+        consumer: u32 = 5,
+
+        fn accepts(context: *anyopaque, donor: u32, consumer: u32) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return donor == self.donor and consumer == self.consumer;
+        }
+        fn lastEncodedFrame(_: *anyopaque) u64 {
+            return 0;
+        }
+        fn encode(_: *anyopaque, _: @import("../graph/recent_prefill_query_capture.zig").EncodeRequest) anyerror!void {}
+        fn complete(_: *anyopaque, _: @import("../graph/recent_prefill_query_capture.zig").Completion) anyerror!void {}
+        fn nativePlan(_: *anyopaque, _: @import("../graph/recent_prefill_query_capture.zig").NativePlanRequest) anyerror!?@import("../graph/recent_prefill_query_capture.zig").NativePlan {
+            return null;
+        }
+        fn nativeCommit(_: *anyopaque, _: @import("../graph/recent_prefill_query_capture.zig").NativePlanRequest, _: u64) anyerror!void {}
+    };
+    var state: State = .{};
+    const descriptor: model_runtime.RecentPrefillQueryCaptureDescriptor = .{
+        .context = &state,
+        .authority_epoch = 1,
+        .accepts_fn = State.accepts,
+        .last_encoded_frame_fn = State.lastEncodedFrame,
+        .encode_fn = State.encode,
+        .complete_fn = State.complete,
+    };
+    try descriptor.validate();
+
+    try std.testing.expect(!recentCaptureRequiresCanonicalPrefillLayer(null, 8128, 448, 5, 5));
+    try std.testing.expect(!recentCaptureRequiresCanonicalPrefillLayer(descriptor, 7680, 512, 5, 5));
+    try std.testing.expect(!recentCaptureRequiresCanonicalPrefillLayer(descriptor, 8128, 448, 0, 0));
+    try std.testing.expect(recentCaptureRequiresCanonicalPrefillLayer(descriptor, 8128, 448, 5, 5));
+    try std.testing.expect(!recentCaptureRequiresPerLayerPrefill(null, 8128, 448));
+    try std.testing.expect(!recentCaptureRequiresPerLayerPrefill(descriptor, 7680, 512));
+    try std.testing.expect(recentCaptureRequiresPerLayerPrefill(descriptor, 8128, 448));
+    var native = descriptor;
+    native.native_plan_fn = State.nativePlan;
+    native.native_commit_fn = State.nativeCommit;
+    try std.testing.expect(native.supportsNativeWholeGraph());
+    try std.testing.expect(!recentCaptureRequiresPerLayerPrefill(native, 8128, 448));
+}
+
 fn supportsDirectGatedRuntime(gpt_config: gpt_mod.Config, configured_layer_count: usize, decode_context: *const gpt_arch.DecodeContext) bool {
     if (disableDirectGatedFamilyRequested()) return false;
     if (!supportsConfig(gpt_config)) return false;
@@ -1606,7 +1701,8 @@ fn tryBackendOwnedGreedyTokenResult(
         capture_final_hidden,
         false,
         .full,
-        gpt_config.suppressTokenIds(),
+        .model,
+        false,
         false,
     );
 }
@@ -1633,7 +1729,8 @@ fn tryBackendOwnedGreedyTokenResultPhase(
         capture_final_hidden,
         false,
         phase,
-        gpt_config.suppressTokenIds(),
+        .model,
+        false,
         false,
     );
 }
@@ -1649,8 +1746,9 @@ fn tryBackendOwnedGreedyTokenResultPhaseHidden(
     capture_final_hidden: bool,
     capture_pre_norm_hidden: bool,
     phase: contracts.DecoderRuntimeDecodePhase,
-    suppress_token_ids: []const i32,
+    suppressions: PreparedGreedySuppressions,
     qualification_require_finite_logits: bool,
+    require_atomic_frame: bool,
 ) !?BackendOwnedGreedyTokenResult {
     return tryBackendOwnedTokenResultPhaseHidden(
         cb,
@@ -1665,10 +1763,23 @@ fn tryBackendOwnedGreedyTokenResultPhaseHidden(
         phase,
         .greedy_argmax,
         null,
-        suppress_token_ids,
+        suppressions.resolve(&gpt_config),
         qualification_require_finite_logits,
+        require_atomic_frame,
     );
 }
+
+const PreparedGreedySuppressions = union(enum) {
+    model,
+    explicit: []const i32,
+
+    fn resolve(self: @This(), gpt_config: *const gpt_mod.Config) []const i32 {
+        return switch (self) {
+            .model => gpt_config.suppress_token_ids[0..gpt_config.suppress_token_ids_len],
+            .explicit => |ids| ids,
+        };
+    }
+};
 
 fn tryBackendOwnedTokenResultPhaseHidden(
     cb: *const ops.ComputeBackend,
@@ -1685,6 +1796,7 @@ fn tryBackendOwnedTokenResultPhaseHidden(
     sampling: ?contracts.DecoderRuntimeSamplingRequest,
     suppress_token_ids: []const i32,
     qualification_require_finite_logits: bool,
+    require_atomic_frame: bool,
 ) !?BackendOwnedGreedyTokenResult {
     const trace = getenvBool("TERMITE_METAL_TRACE_DECODER_RUNTIME_DECODE");
     if (gatedFamilyCompareRequested()) {
@@ -1800,6 +1912,7 @@ fn tryBackendOwnedTokenResultPhaseHidden(
         .ple_token_embedding_weight = ple_token_embedding_weight,
         .qualification_require_finite_logits = qualification_require_finite_logits,
         .qualification_final_logit_softcap = qualificationFinalLogitSoftcap(gpt_config, qualification_require_finite_logits),
+        .require_atomic_frame = require_atomic_frame,
         .suppress_token_ids = suppress_token_ids,
         .output_hidden = if (capture_final_hidden) &output_hidden else null,
         .output_hidden_pre_norm = capture_pre_norm_hidden,
@@ -1998,7 +2111,8 @@ fn tryBackendOwnedSampledToken(
         true,
         true,
         .full,
-        gpt_config.suppressTokenIds(),
+        .model,
+        false,
         false,
     )) orelse return null;
     defer result.deinit(cb);
@@ -2179,7 +2293,8 @@ pub fn forwardResidentSampledToken(
             .final_logit_softcap = if (gpt_config.final_logit_softcapping > 0.0) gpt_config.final_logit_softcapping else 0,
             .token_history = token_history,
         },
-        gpt_config.suppressTokenIds(),
+        gpt_config.suppress_token_ids[0..gpt_config.suppress_token_ids_len],
+        false,
         false,
     )) orelse return error.ResidentSamplingFrameFailed;
     return result.token_id;
@@ -2260,14 +2375,77 @@ pub fn forwardQualificationPreparedGreedyToken(
         false,
         false,
         .full,
-        qualificationGreedySuppressTokenIds(),
+        .{ .explicit = qualificationGreedySuppressTokenIds() },
         require_output,
+        false,
     )) orelse return error.PreparedStudyRouteUnsupported;
     defer result.deinit(cb);
     if (require_output) {
         const vocab_size = std.math.cast(i64, gpt_config.vocab_size) orelse return error.InvalidStudyToken;
         if (result.token_id < 0 or result.token_id >= vocab_size) return error.InvalidStudyToken;
     }
+    return result.token_id;
+}
+
+/// Diagnostic token-parity route using the serving model suppression policy.
+/// Admission requires a cancellable atomic frame: a clean unsupported result
+/// proves that no packed-context append committed, while every failure after
+/// frame entry is propagated and can never fall back to canonical forwarding.
+pub fn forwardQualificationPreparedModelGreedyTokenAtomic(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !i64 {
+    if (!decode_context.qualification_require_context_decode_frame or
+        decode_context.context_session == null or
+        decode_context.query_sequence_len != 1 or
+        decode_context.attention_mode != .paged_decode)
+        return error.PreparedStudyRouteUnsupported;
+    timing_stats.greedy_calls += 1;
+    var result = (try tryBackendOwnedGreedyTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        false,
+        false,
+        .full,
+        .model,
+        true,
+        true,
+    )) orelse return error.PreparedStudyRouteUnsupported;
+    defer result.deinit(cb);
+    const vocab_size = std.math.cast(i64, gpt_config.vocab_size) orelse return error.InvalidStudyToken;
+    if (result.token_id < 0 or result.token_id >= vocab_size) return error.InvalidStudyToken;
+    return result.token_id;
+}
+
+pub fn forwardDiagnosticPreparedModelGreedyTokenTerminal(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !i64 {
+    if (comptime !@import("builtin").is_test) return error.PreparedStudyRouteUnsupported;
+    if (!decode_context.qualification_require_context_decode_frame or decode_context.context_session == null or
+        decode_context.query_sequence_len != 1 or decode_context.attention_mode != .paged_decode)
+        return error.PreparedStudyRouteUnsupported;
+    timing_stats.greedy_calls += 1;
+    var result = (try tryBackendOwnedGreedyTokenResultPhaseHidden(cb, allocator, gpt_config, configured_layer_count, token_id, seq_len, decode_context, false, false, .full, .model, false, false)) orelse
+        return error.PreparedStudyRouteUnsupported;
+    defer result.deinit(cb);
+    const vocab_size = std.math.cast(i64, gpt_config.vocab_size) orelse return error.InvalidStudyToken;
+    if (result.token_id < 0 or result.token_id >= vocab_size) return error.InvalidStudyToken;
     return result.token_id;
 }
 
@@ -2280,6 +2458,17 @@ test "context prepared study greedy keeps the frozen unconstrained contract" {
     try std.testing.expectEqual(@as(usize, 0), qualificationGreedySuppressTokenIds().len);
     try std.testing.expectEqual(@as(f32, 30), qualificationFinalLogitSoftcap(config, true));
     try std.testing.expectEqual(@as(f32, 0), qualificationFinalLogitSoftcap(config, false));
+}
+
+test "diagnostic atomic prepared greedy retains model suppression policy" {
+    var config = gpt_mod.Config{};
+    config.suppress_token_ids[0] = 7;
+    config.suppress_token_ids[1] = 11;
+    config.suppress_token_ids_len = 2;
+    const serving: PreparedGreedySuppressions = .model;
+    try std.testing.expectEqualSlices(i32, &.{ 7, 11 }, serving.resolve(&config));
+    const qualification = PreparedGreedySuppressions{ .explicit = qualificationGreedySuppressTokenIds() };
+    try std.testing.expectEqual(@as(usize, 0), qualification.resolve(&config).len);
 }
 
 test "context prepared study rejects an unqualified request before backend execution" {
@@ -2400,6 +2589,7 @@ pub fn prewarmPleTokenEmbedding(
         else => return err,
     };
     defer cb.free(token_w);
+    if (try cb.prepareBoundedPleEmbedding(token_w, ple_total_dim)) return true;
     const ids = [_]i64{0};
     const embedding = try cb.embeddingLookup(token_w, ids[0..], ids.len, ple_total_dim);
     defer cb.free(embedding);
@@ -2521,8 +2711,13 @@ fn forwardFinalHiddenTensorGemmaDirect(
         const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
         break :blk compute.hasInstalledAttentionMatch(storage);
     } else false;
+    const recent_capture_requires_per_layer = recentCaptureRequiresPerLayerPrefill(
+        decode_context.recent_prefill_query_capture,
+        seq_len,
+        decode_context.query_sequence_len,
+    );
     var planned_barriers_suppressed = false;
-    if (decoder_frame_active and decode_context.context_session == null and !native_storage_attention) {
+    if (decoder_frame_active and decode_context.context_session == null and !native_storage_attention and !recent_capture_requires_per_layer) {
         // Gemma direct-runtime frames encode their full producer/consumer order
         // in one backend-owned command plan. Avoid per-dispatch buffer barriers
         // on this hot path. Context attention deliberately takes the staged
@@ -2577,7 +2772,13 @@ fn forwardFinalHiddenTensorGemmaDirect(
         );
     }
 
+    if (recent_capture_requires_per_layer) std.debug.print(
+        "recent-prefill-capture bypass-whole-graph-plan seq={d} rows={d} planned={}\n",
+        .{ seq_len, decode_context.query_sequence_len, prefill_frame_planned },
+    );
+
     if (prefill_frame_planned and
+        !recent_capture_requires_per_layer and
         ple_vectors != null and
         !gatedFamilyCompareRequested() and
         gatedFamilyDumpLayer() == null)
@@ -2604,6 +2805,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             .ple_vectors = ple_vectors,
             .layers = planned_frame_layers,
             .output_hidden = &frame_hidden,
+            .recent_query_capture = decode_context.recent_prefill_query_capture,
         })) {
             const frame_execute_finished_at = monotonicNowNs();
             if (frame_execute_finished_at > frame_execute_started_at) {
@@ -2666,9 +2868,20 @@ fn forwardFinalHiddenTensorGemmaDirect(
 
     const layer_count: usize = gpt_config.num_hidden_layers;
     for (0..layer_count) |layer| {
+        var attention_match_layer_scope = false;
+        defer if (attention_match_layer_scope) if (comptime build_options.enable_metal) {
+            const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            compute.endAttentionMatchForwardLayerScope(true);
+        };
         if (comptime build_options.enable_metal) if (native_storage_attention) {
             const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
-            try compute.enterAttentionMatchForwardLayer(layer);
+            if (compute.attentionMatchExecution().resident_gated_ffn_fusion) {
+                attention_match_layer_scope = try compute.beginAttentionMatchForwardLayerScope(layer);
+                if (!attention_match_layer_scope) return error.ContextFramedExecutionUnsupported;
+            } else {
+                // V1-V6 retain their original unscoped frontier no-op path.
+                try compute.enterAttentionMatchForwardLayer(layer);
+            }
         };
         if (comptime build_options.enable_metal) if (retained_native_hidden) |compute| {
             // Request-owned layer outputs already remain live through the frame.
@@ -2729,9 +2942,22 @@ fn forwardFinalHiddenTensorGemmaDirect(
             gpt_config.hidden_size,
         );
 
+        const recent_capture_canonical_layer = phase == .prefill and recentCaptureRequiresCanonicalPrefillLayer(
+            decode_context.recent_prefill_query_capture,
+            seq_len,
+            decode_context.query_sequence_len,
+            kv_layer_index,
+            layer,
+        );
+        if (recent_capture_canonical_layer) std.debug.print(
+            "recent-prefill-capture bypass-fused-preprojection donor={d} consumer={d} seq={d} rows={d}\n",
+            .{ kv_layer_index, layer, seq_len, decode_context.query_sequence_len },
+        );
+
         if (phase == .prefill and
             decode_context.attention_mode == .paged_prefill and
             gpt_config.position_encoding == .rope and
+            !recent_capture_canonical_layer and
             !disableDirectPrefillSeedRequested() and
             !disableGatedFamilyRuntimePrefillBlockRequested(gpt_config, configured_layer_count) and
             !(gpt_config.family == .gemma and gpt_config.global_head_dim != 0) and
@@ -3411,6 +3637,29 @@ fn forwardFinalHiddenTensorGemmaDirect(
             };
             defer if (q_block != q_for_attn) cb.free(q_block);
 
+            // The prepared compiled-prefill family bypasses gpt.applyAttention,
+            // which is the canonical recent-query capture seam. q_block is the
+            // exact normalized, Gemma-scaled, post-RoPE query consumed by the
+            // fused attention block, so encode the default-off development
+            // capture here without a host read or an extra projection.
+            try gpt_arch.captureRecentPrefillQueries(
+                cb,
+                gpt_config,
+                decode_context,
+                q_block,
+                1,
+                kv_layer_index,
+                layer,
+                gpt_config.num_attention_heads,
+                head_dim,
+            );
+            if (decode_context.recent_prefill_query_capture) |capture| {
+                if (capture.accepts(@intCast(kv_layer_index), @intCast(layer))) std.debug.print(
+                    "recent-prefill-capture canonical-q-hook donor={d} consumer={d} seq={d} rows={d}\n",
+                    .{ kv_layer_index, layer, seq_len, decode_context.query_sequence_len },
+                );
+            }
+
             var block_ple_input: ?ops.CT = null;
             defer if (block_ple_input) |ple_ct| cb.free(ple_ct);
             if (cb.kind() == .metal) if (ple_vectors) |ple| {
@@ -3572,6 +3821,15 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     owns_hidden = true;
                 }
                 continue;
+            }
+            // A requested tuple may not fall through after its copy was
+            // encoded: fallback attention would attempt a second copy and the
+            // owner correctly treats that as corruption. Ordinary requests
+            // keep the existing fallback behavior because the descriptor is
+            // null.
+            if (decode_context.recent_prefill_query_capture) |capture| {
+                if (capture.accepts(@intCast(kv_layer_index), @intCast(layer)))
+                    return error.RecentPrefillQueryCaptureUnavailable;
             }
         }
 
@@ -5719,6 +5977,65 @@ pub fn prepareModelSlots(
     return prepareModelSlotsImpl(cb, allocator, gpt_config, configured_layer_count, true);
 }
 
+/// Prepare only the five immutable slots consumed by the authenticated E4
+/// resident FFN route. This deliberately excludes attention, PLE, LM head,
+/// decoder-family state, and every ordinary-KV allocation.
+pub fn prepareResidentE4FfnSlots(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: gpt_mod.Config,
+) !bool {
+    try cb.checkExecutionControl();
+    if (!gemma4_runtime.isExactE4bDenseRuntimeConfig(config) or cb.decoderRuntimeHasActiveFrame()) return false;
+    for (0..config.num_hidden_layers) |layer| {
+        try cb.checkExecutionControl();
+        var name_buf: [256]u8 = undefined;
+        const pre_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.pre_feedforward_layernorm.weight", .{layer});
+        const pre = try gpt_arch.getModelWeight(cb, config, pre_name);
+        defer cb.free(pre);
+        if (!try decoder_rms_runtime.prepareRmsNormSlot(cb, allocator, config, normSlot(layer, .ffn_pre), pre, config.hidden_size)) return false;
+        const post_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer});
+        const post = try gpt_arch.getModelWeight(cb, config, post_name);
+        defer cb.free(post);
+        if (!try decoder_rms_runtime.prepareRmsNormSlot(cb, allocator, config, normSlot(layer, .ffn_post), post, config.hidden_size)) return false;
+
+        const gate = try gpt_arch.getFFNWeight(cb, config, layer, "gate", &name_buf);
+        defer cb.free(gate);
+        if (!try prepareLinearNoBiasSlotForConfig(cb, allocator, config, linearSlot(layer, .mlp_gate), gate, config.hidden_size, config.intermediateSize(layer), false)) return false;
+        const up = try gpt_arch.getFFNWeight(cb, config, layer, "up", &name_buf);
+        defer cb.free(up);
+        if (!try prepareLinearNoBiasSlotForConfig(cb, allocator, config, linearSlot(layer, .mlp_up), up, config.hidden_size, config.intermediateSize(layer), false)) return false;
+        const down = try gpt_arch.getFFNWeight(cb, config, layer, "down", &name_buf);
+        defer cb.free(down);
+        if (!try prepareLinearNoBiasSlotForConfig(cb, allocator, config, linearSlot(layer, .mlp_down), down, config.intermediateSize(layer), config.hidden_size, false)) return false;
+    }
+    return true;
+}
+
+/// Read-only admission pass. Every FFN tensor must be stable mmap-backed Q4_0
+/// before geometry, slots, or scratch are mutated.
+pub fn validateResidentE4FfnWeights(cb: *const ops.ComputeBackend, config: gpt_mod.Config) !bool {
+    if (!gemma4_runtime.isExactE4bDenseRuntimeConfig(config)) return false;
+    for (0..config.num_hidden_layers) |layer| {
+        try cb.checkExecutionControl();
+        var name_buf: [256]u8 = undefined;
+        inline for (.{ "pre_feedforward_layernorm", "post_feedforward_layernorm" }) |kind| {
+            const name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.{s}.weight", .{ layer, kind });
+            const norm = try gpt_arch.getModelWeight(cb, config, name);
+            defer cb.free(norm);
+            if ((try cb.tensorShapeMatches(norm, &.{@as(i64, @intCast(config.hidden_size))})) != true) return false;
+        }
+        inline for (.{ "gate", "up", "down" }) |kind| {
+            const weight = try gpt_arch.getFFNWeight(cb, config, layer, kind, &name_buf);
+            defer cb.free(weight);
+            const in_dim: usize = if (std.mem.eql(u8, kind, "down")) config.intermediateSize(layer) else config.hidden_size;
+            const out_dim: usize = if (std.mem.eql(u8, kind, "down")) config.hidden_size else config.intermediateSize(layer);
+            if (!decoder_rms_runtime.isMappedQ40Weight(cb, weight, try std.math.mul(usize, in_dim, out_dim))) return false;
+        }
+    }
+    return true;
+}
+
 fn prepareModelSlotsImpl(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -6340,6 +6657,75 @@ pub fn forwardGreedyToken(
     return token;
 }
 
+/// Prepared greedy decode with a request-owned suppression list. This does not
+/// enter the dense fallback below, whose tail only sees model-global policy.
+/// Null is therefore a clean decline to the caller's canonical logits path.
+pub fn forwardGreedyTokenSuppress(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    suppress_token_ids: []const i32,
+) !?i64 {
+    if (!supportsPreparedDecodeConfig(gpt_config)) return null;
+    if (decode_context.query_sequence_len != 1) return null;
+    if (decode_context.attention_mode != .paged_decode) return null;
+    timing_stats.greedy_calls += 1;
+    var result = (try tryBackendOwnedGreedyTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        false,
+        false,
+        .full,
+        .{ .explicit = suppress_token_ids },
+        false,
+        false,
+    )) orelse return null;
+    defer result.deinit(cb);
+    return result.token_id;
+}
+
+/// Strict finite, unsuppressed, atomic greedy decode used only by the
+/// opt-in future TRAIN trajectory. A null result is a pre-submit decline.
+pub fn forwardFutureTrainGreedyTokenAtomic(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?i64 {
+    if (!backendOwnedFullLogitsSupported(gpt_config, configured_layer_count, decode_context)) return null;
+    var result = (try tryBackendOwnedGreedyTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        false,
+        false,
+        .full,
+        .{ .explicit = &.{} },
+        true,
+        true,
+    )) orelse return null;
+    defer result.deinit(cb);
+    if (result.token_id < 0 or @as(u64, @intCast(result.token_id)) >= gpt_config.vocab_size)
+        return error.NonFiniteStudyLogits;
+    return result.token_id;
+}
+
 pub fn forwardGreedyTokenPipelinedArm(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -6349,6 +6735,7 @@ pub fn forwardGreedyTokenPipelinedArm(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !bool {
+    if (cb.boundedPleQ6Active()) return false;
     if (!supportsPreparedDecodeConfig(gpt_config)) return false;
     if (decode_context.query_sequence_len != 1) return false;
     if (decode_context.attention_mode != .paged_decode) return false;
@@ -6366,6 +6753,49 @@ pub fn forwardGreedyTokenPipelinedArm(
     return result != null;
 }
 
+const PreparedPipelinedGreedyRequest = struct {
+    phase: contracts.DecoderRuntimeDecodePhase,
+    suppressions: PreparedGreedySuppressions,
+};
+
+fn preparedPipelinedGreedyRequest(phase: contracts.DecoderRuntimeDecodePhase, suppress_token_ids: []const i32) ?PreparedPipelinedGreedyRequest {
+    if (suppress_token_ids.len == 0) return null;
+    return .{ .phase = phase, .suppressions = .{ .explicit = suppress_token_ids } };
+}
+
+pub fn forwardGreedyTokenPipelinedArmSuppress(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    suppress_token_ids: []const i32,
+) !bool {
+    const request = preparedPipelinedGreedyRequest(.submit_only, suppress_token_ids) orelse return false;
+    if (cb.boundedPleQ6Active()) return false;
+    if (!supportsPreparedDecodeConfig(gpt_config)) return false;
+    if (decode_context.query_sequence_len != 1) return false;
+    if (decode_context.attention_mode != .paged_decode) return false;
+    const result = try tryBackendOwnedGreedyTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        false,
+        false,
+        request.phase,
+        request.suppressions,
+        false,
+        false,
+    );
+    return result != null;
+}
+
 pub fn forwardGreedyTokenPipelinedStep(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -6374,6 +6804,7 @@ pub fn forwardGreedyTokenPipelinedStep(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !?i64 {
+    if (cb.boundedPleQ6Active()) return null;
     if (!supportsPreparedDecodeConfig(gpt_config)) return null;
     if (decode_context.query_sequence_len != 1) return null;
     if (decode_context.attention_mode != .paged_decode) return null;
@@ -6393,6 +6824,40 @@ pub fn forwardGreedyTokenPipelinedStep(
     return result.token_id;
 }
 
+pub fn forwardGreedyTokenPipelinedStepSuppress(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    suppress_token_ids: []const i32,
+) !?i64 {
+    const request = preparedPipelinedGreedyRequest(.step, suppress_token_ids) orelse return null;
+    if (cb.boundedPleQ6Active()) return null;
+    if (!supportsPreparedDecodeConfig(gpt_config)) return null;
+    if (decode_context.query_sequence_len != 1) return null;
+    if (decode_context.attention_mode != .paged_decode) return null;
+    timing_stats.greedy_calls += 1;
+    const result = (try tryBackendOwnedGreedyTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        -1,
+        seq_len,
+        decode_context,
+        false,
+        false,
+        request.phase,
+        request.suppressions,
+        false,
+        false,
+    )) orelse return null;
+    if (result.token_id < 0) return error.InvalidModelOutput;
+    return result.token_id;
+}
+
 pub fn forwardSampledTokenPipelinedArm(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -6404,6 +6869,7 @@ pub fn forwardSampledTokenPipelinedArm(
     sampling: model_runtime.SamplingConfig,
     token_history: []const i64,
 ) !bool {
+    if (cb.boundedPleQ6Active()) return false;
     // The graph runtime performs the complete backend capability check and
     // fixed-capacity scratch reservation before entering this function. Keep
     // arm itself static so it cannot introduce a second reservation boundary.
@@ -6432,7 +6898,8 @@ pub fn forwardSampledTokenPipelinedArm(
             .final_logit_softcap = if (gpt_config.final_logit_softcapping > 0.0) gpt_config.final_logit_softcapping else 0,
             .token_history = token_history,
         },
-        gpt_config.suppressTokenIds(),
+        gpt_config.suppress_token_ids[0..gpt_config.suppress_token_ids_len],
+        false,
         false,
     );
     return result != null;
@@ -6448,6 +6915,7 @@ pub fn forwardSampledTokenPipelinedStep(
     sampling: model_runtime.SamplingConfig,
     token_history: []const i64,
 ) !?i64 {
+    if (cb.boundedPleQ6Active()) return null;
     // Arm already performed the backend capability check and full-capacity
     // reservation. Keep step admission static so it cannot resize shared
     // sampler buffers while the submitted frame is executing.
@@ -6477,6 +6945,7 @@ pub fn forwardSampledTokenPipelinedStep(
             .token_history = token_history,
         },
         gpt_config.suppressTokenIds(),
+        false,
         false,
     )) orelse return null;
     if (result.token_id < 0) return error.InvalidModelOutput;
@@ -6573,6 +7042,112 @@ pub fn forwardGreedyTokenAndFinalHidden(
     return .{
         .token_id = result.token_id,
         .final_hidden = hidden,
+    };
+}
+
+pub const BackendOwnedFullLogits = union(enum) {
+    unsupported,
+    /// Allocated by the allocator passed to `forwardBackendOwnedFullLogits`.
+    /// Ownership transfers to the caller.
+    completed: []f32,
+};
+
+fn backendOwnedFullLogitsSupported(
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) bool {
+    // Builtin-only escape hatch for numerical comparison with the historical
+    // canonical route. This is checked before prepared frame entry.
+    if (builtin.is_test and getenvBool("ANTFLY_TEST_LEGACY_FULL_LOGITS_DECODE")) return false;
+    if (gatedFamilyCompareRequested() or
+        disableActivePagedGatedBlockForDecodeRequested() or
+        referenceGatedFamilyDecodeRequested())
+        return false;
+    if (decode_context.query_sequence_len != 1 or
+        decode_context.attention_mode != .paged_decode or
+        gpt_config.num_hidden_layers > 256)
+        return false;
+    return supportsDirectGemmaRuntime(gpt_config, configured_layer_count, decode_context) and
+        (gpt_config.hasPle() or gpt_config.usesMoe());
+}
+
+/// Execute the complete prepared singleton frame, retain its fenced input to
+/// final RMSNorm, and project the canonical full-vocabulary logits. The token
+/// selected by the backend frame is deliberately ignored: future TRAIN capture
+/// applies the same host full-vocabulary greedy policy as its reference lane.
+/// A null after entry is terminal to the caller because the frame may have
+/// appended paged KV; callers must not retry the generic transformer.
+pub fn forwardBackendOwnedFullLogitsAtomic(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !BackendOwnedFullLogits {
+    // The request below requires a cancellable atomic frame. Its false result
+    // therefore proves the backend declined before any KV append committed;
+    // every post-submit failure is surfaced as an error by the backend.
+    if (!backendOwnedFullLogitsSupported(gpt_config, configured_layer_count, decode_context))
+        return .unsupported;
+
+    var result = (try tryBackendOwnedGreedyTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        true,
+        true,
+        .full,
+        .model,
+        false,
+        true,
+    )) orelse return .unsupported;
+    defer result.deinit(cb);
+    const pre_norm_hidden = result.final_hidden orelse return error.UnexpectedNull;
+    const logits = (try decoder_tail_runtime.forwardPreparedLogitsTensorFromFinalHidden(
+        cb,
+        gpt_config,
+        pre_norm_hidden,
+        .rms,
+        finalNormSlot(configured_layer_count),
+        finalLmHeadSlot(configured_layer_count),
+    )) orelse return error.ResidentFullLogitsProjectionFailed;
+    defer cb.free(logits);
+    const host = try cb.toFloat32(logits, allocator);
+    errdefer allocator.free(host);
+    gpt_arch.applyFinalLogitSoftcapInPlace(gpt_config, host);
+    return .{ .completed = host };
+}
+
+/// Compatibility wrapper for the existing diagnostic producer. Unsupported
+/// configurations remain a clean null; a committed-frame decline remains an
+/// error and can never trigger a canonical retry.
+pub fn forwardBackendOwnedFullLogits(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?[]f32 {
+    return switch (try forwardBackendOwnedFullLogitsAtomic(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+    )) {
+        .unsupported => null,
+        .completed => |host| host,
     };
 }
 
@@ -6834,6 +7409,30 @@ pub fn forwardPrefillLastPreparedTail(
     decode_context: *const gpt_arch.DecodeContext,
     prefer_greedy_token: bool,
 ) !?PrefillPreparedTail {
+    return forwardPrefillLastPreparedTailSuppress(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        input_ids,
+        seq_len,
+        decode_context,
+        prefer_greedy_token,
+        gpt_config.suppress_token_ids[0..gpt_config.suppress_token_ids_len],
+    );
+}
+
+pub fn forwardPrefillLastPreparedTailSuppress(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    input_ids: []const i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    prefer_greedy_token: bool,
+    suppress_token_ids: []const i32,
+) !?PrefillPreparedTail {
     if (!supportsConfig(gpt_config)) return null;
     if (input_ids.len == 0 or decode_context.query_sequence_len != input_ids.len) return null;
     if (decode_context.attention_mode != .paged_prefill) return null;
@@ -7028,6 +7627,10 @@ pub fn forwardPrefillLastPreparedTail(
     if (frame_finish_finished_at > frame_finish_started_at) {
         timing_stats.prefill_frame_finish_nanos += frame_finish_finished_at - frame_finish_started_at;
     }
+    const effective_suppress_token_ids = if (suppress_token_ids.len == 0)
+        gpt_config.suppress_token_ids[0..gpt_config.suppress_token_ids_len]
+    else
+        suppress_token_ids;
     var greedy_token_id: ?i64 = null;
     if (prefer_greedy_token) {
         if (try cb.decoderRuntimeApplyRmsNormLinearArgmax(&.{
@@ -7037,7 +7640,7 @@ pub fn forwardPrefillLastPreparedTail(
             .hidden_size = gpt_config.hidden_size,
             .eps = gpt_config.norm_eps,
             .out_dim = gpt_config.vocab_size,
-            .suppress_token_ids = gpt_config.suppressTokenIds(),
+            .suppress_token_ids = effective_suppress_token_ids,
         })) |token_id| {
             greedy_token_id = @intCast(token_id);
         }
@@ -7899,6 +8502,41 @@ test "direct gemma runtime allows gemma4-style global head configs without share
     try std.testing.expect(supportsDirectGemmaRuntime(shared_kv, shared_kv.num_hidden_layers, &prefill_context));
 }
 
+test "backend owned full logits admits only prepared singleton decode before frame entry" {
+    const config: gpt_mod.Config = .{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .num_global_key_value_heads = 1,
+        .hidden_size = 1536,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .intermediate_size = 6144,
+        .ple_hidden_size = 256,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+        .vocab_size = 1024,
+    };
+    var context: gpt_arch.DecodeContext = .{
+        .attention_mode = .paged_decode,
+        .query_sequence_len = 1,
+        .kv_sequence_len = 8,
+        .total_sequence_len = 8,
+        .kv_position_offset = 0,
+    };
+    try std.testing.expect(backendOwnedFullLogitsSupported(config, config.num_hidden_layers, &context));
+    context.query_sequence_len = 2;
+    try std.testing.expect(!backendOwnedFullLogitsSupported(config, config.num_hidden_layers, &context));
+    context.query_sequence_len = 1;
+    context.attention_mode = .paged_prefill;
+    try std.testing.expect(!backendOwnedFullLogitsSupported(config, config.num_hidden_layers, &context));
+    context.attention_mode = .paged_decode;
+    var no_backend_owned_frame = config;
+    no_backend_owned_frame.ple_hidden_size = 0;
+    try std.testing.expect(!backendOwnedFullLogitsSupported(no_backend_owned_frame, no_backend_owned_frame.num_hidden_layers, &context));
+}
+
 test "gemma4 shared kv layers do not own decode runtime kv weights" {
     const config: gpt_mod.Config = .{
         .family = .gemma,
@@ -7958,6 +8596,43 @@ test "context gemma4 direct query correction preserves rope scaling exactly once
         defer if (ordinary_query != input) cb.free(ordinary_query);
         try std.testing.expect(input == ordinary_query);
     }
+}
+
+test "context gemma4 prepared prefill keeps query correction when fused scaled rope is unavailable" {
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    var table = native.vtable_impl;
+    table.ropeScaled = null;
+    const cb = ops.ComputeBackend{ .ptr = &compute, .vtable = &table };
+
+    const dim: usize = 512;
+    const scale = @sqrt(@as(f32, @floatFromInt(dim)));
+    var values: [dim]f32 = undefined;
+    @memset(&values, 1.0);
+    const input = try cb.fromFloat32Shape(&values, &.{ 1, dim });
+    defer cb.free(input);
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .global_head_dim = 512,
+        .position_encoding = .rope,
+    };
+    const corrected = (try prepareScaledRopeForDirectAttention(
+        &cb,
+        config,
+        input,
+        scale,
+        1,
+        1,
+        dim,
+        0,
+    )).?;
+    defer cb.free(corrected);
+    const data = try cb.toFloat32(corrected, a);
+    defer a.free(data);
+    for (data) |value| try std.testing.expectApproxEqAbs(scale, value, 1e-5);
 }
 
 test "context gemma4 prepared prefill releases hidden when PLE weight lookup is denied" {
@@ -8062,6 +8737,56 @@ test "context gated frame completion propagates device failure and never resubmi
     }
 }
 
+test "prepared greedy suppression selection preserves exact request override" {
+    const Test = struct {
+        noinline fn resolveModel(config: *const gpt_mod.Config) []const i32 {
+            return (PreparedGreedySuppressions{ .model = {} }).resolve(config);
+        }
+        noinline fn clobberStack() void {
+            var bytes: [4096]u8 = undefined;
+            @memset(&bytes, 0xa5);
+            std.mem.doNotOptimizeAway(&bytes);
+        }
+    };
+    var config: gpt_mod.Config = .{};
+    config.suppress_token_ids[0] = 7;
+    config.suppress_token_ids[1] = 11;
+    config.suppress_token_ids_len = 2;
+    const request_ids = [_]i32{ 1, 50, 106, 212 };
+
+    const model_ids = Test.resolveModel(&config);
+    Test.clobberStack();
+    try std.testing.expectEqualSlices(i32, &.{ 7, 11 }, model_ids);
+    try std.testing.expectEqualSlices(
+        i32,
+        &request_ids,
+        (PreparedGreedySuppressions{ .explicit = &request_ids }).resolve(&config),
+    );
+}
+
+test "pipelined greedy arm and step builders preserve exact request override" {
+    var config: gpt_mod.Config = .{};
+    config.suppress_token_ids[0] = 3;
+    config.suppress_token_ids[1] = 7;
+    config.suppress_token_ids_len = 2;
+    const request_ids = [_]i32{ 1, 11, 50, 106 };
+
+    try std.testing.expect(preparedPipelinedGreedyRequest(.submit_only, &.{}) == null);
+    const arm = preparedPipelinedGreedyRequest(.submit_only, &request_ids) orelse return error.TestUnexpectedResult;
+    const step = preparedPipelinedGreedyRequest(.step, &request_ids) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(contracts.DecoderRuntimeDecodePhase.submit_only, arm.phase);
+    try std.testing.expectEqual(contracts.DecoderRuntimeDecodePhase.step, step.phase);
+    try std.testing.expectEqualSlices(i32, &request_ids, arm.suppressions.resolve(&config));
+    try std.testing.expectEqualSlices(i32, &request_ids, step.suppressions.resolve(&config));
+    try std.testing.expect(!std.mem.eql(i32, config.suppressTokenIds(), arm.suppressions.resolve(&config)));
+    try std.testing.expect(!std.mem.eql(i32, config.suppressTokenIds(), step.suppressions.resolve(&config)));
+
+    var cb: ops.ComputeBackend = undefined;
+    var dc: gpt_arch.DecodeContext = undefined;
+    try std.testing.expect(!(try forwardGreedyTokenPipelinedArmSuppress(&cb, std.testing.allocator, config, 1, 0, 1, &dc, &.{})));
+    try std.testing.expect((try forwardGreedyTokenPipelinedStepSuppress(&cb, std.testing.allocator, config, 1, 1, &dc, &.{})) == null);
+}
+
 test "attention_match Metal borrowed decoder frame includes tail and propagates caller submission failure" {
     const Probe = struct {
         tail_encoded: bool = false,
@@ -8102,4 +8827,11 @@ test "attention_match Metal borrowed decoder frame includes tail and propagates 
         try std.testing.expectEqual(@as(usize, 1), probe.submits);
         try std.testing.expectEqual(@as(usize, 0), probe.cancels);
     }
+}
+
+test "normal prepared packed diagnostic declines missing context before backend" {
+    var cb: ops.ComputeBackend = undefined;
+    const config = gpt_mod.Config{ .vocab_size = 4 };
+    const dc = gpt_arch.DecodeContext{ .attention_mode = .paged_decode, .qualification_require_context_decode_frame = true, .total_sequence_len = 2, .query_sequence_len = 1, .kv_sequence_len = 2 };
+    try std.testing.expectError(error.PreparedStudyRouteUnsupported, forwardDiagnosticPreparedModelGreedyTokenTerminal(&cb, std.testing.allocator, config, 1, 0, 2, &dc));
 }

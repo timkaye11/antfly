@@ -20,7 +20,7 @@ const std = @import("std");
 const profiles = @import("../runtime/kv/compaction_profile.zig");
 const protocol = @import("context_query_protocol.zig");
 
-pub const Kind = enum { fit, gate };
+pub const Kind = enum { fit, gate, fit_training_v1 };
 pub const response_tokens: u32 = 256;
 pub const generation_contract =
     "{\"schema_version\":2,\"mode\":\"greedy_fixed_length_ignore_eos\",\"response_tokens\":256," ++
@@ -31,6 +31,7 @@ pub fn template(kind: Kind) []const u8 {
     return switch (kind) {
         .fit => "Review the supplied reference in its original order. Reproduce its important facts, exact names, dates, numbers, identifiers, relationships, and concrete examples. Cover details throughout the reference rather than only its beginning. Preserve explicit conditions and limits. Do not invent information.",
         .gate => "Using only the supplied reference, make a factual study guide. Describe its main subjects and the supporting evidence from different sections. Include exact terminology, quantities, named entities, exceptions, and procedural steps where present. State when requested details are absent. Do not invent information.",
+        .fit_training_v1 => "Review the supplied reference in its original order. Reproduce its important facts, exact names, dates, numbers, identifiers, relationships, and concrete examples. Cover details throughout the reference rather than only its beginning. Preserve explicit conditions and limits. Do not invent information. Build a comprehensive training study that spans the entire reference. Organize the response into multiple clearly labeled sections. For every section, restate the relevant claims, evidence, actors, quantities, dependencies, exceptions, and chronological or procedural relationships. Include concrete examples and cross-reference related facts from distant parts of the reference. Distinguish explicit statements from reasonable organization, but never add outside facts. End with a compact verification checklist covering names, dates, identifiers, numerical limits, preconditions, failure cases, and unresolved or absent details.",
     };
 }
 
@@ -62,4 +63,19 @@ test "context compiled studies bind templates response length and generation mod
     var changed = fit;
     changed.response_tokens += 1;
     try std.testing.expectError(error.CompactionQueryProtocolMismatch, validate(.fit, changed));
+}
+
+test "versioned self-study training template is independent without changing fit or gate" {
+    const fit = template(.fit);
+    const gate = template(.gate);
+    const training = authority(.fit_training_v1);
+    try validate(.fit_training_v1, training);
+    var fit_digest: [32]u8 = undefined;
+    var gate_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(fit, &fit_digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(gate, &gate_digest, .{});
+    try std.testing.expectEqualStrings("0f7d1569026265c22c87e6e9a8e2293e0c9ec90889975b950559ad993599e4e5", &std.fmt.bytesToHex(fit_digest, .lower));
+    try std.testing.expectEqualStrings("38f435a1713b162c6aac096b58a9be7bf3688d534e3da436b0cccf027ecfe1c3", &std.fmt.bytesToHex(gate_digest, .lower));
+    try std.testing.expect(!std.mem.eql(u8, &training.template_sha256, &authority(.fit).template_sha256));
+    try std.testing.expectEqualSlices(u8, &training.generation_contract_sha256, &authority(.fit).generation_contract_sha256);
 }

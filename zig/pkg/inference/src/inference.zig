@@ -72,6 +72,9 @@ test "generation cooperative declarations compile" {
     if (build_options.enable_cuda) _ = @import("ops/cuda/cuda_compute.zig");
 }
 
+pub const context_native_kv_operator_candidate = @import("context_native_kv_operator_candidate.zig");
+pub const context_qualified_private_startup = @import("context_qualified_private_startup.zig");
+pub const native_kv_verify_v2 = @import("cli/native_kv_verify_v2.zig");
 pub const executor_microbatch = @import("server/executor_microbatch.zig");
 pub const tensor_microbatch = @import("server/tensor_microbatch.zig");
 pub const cache = @import("cache/cache.zig");

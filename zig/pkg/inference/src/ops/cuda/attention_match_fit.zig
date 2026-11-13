@@ -345,8 +345,11 @@ pub const Fitter = struct {
         return 0;
     }
 
-    fn select(raw: ?*anyopaque, allocator: std.mem.Allocator, probabilities: []const f64, importance: []const f64, q: usize, n: usize, indices: []usize, weights: []f64, cfg: solver.Config) !usize {
+    fn select(raw: ?*anyopaque, allocator: std.mem.Allocator, probabilities: []const f64, importance: []const f64, q: usize, n: usize, mandatory: []const usize, indices: []usize, weights: []f64, cfg: solver.Config) !usize {
         const self = from(raw);
+        // The experiment is Metal-only. Preserve the qualified CUDA selector
+        // byte-for-byte for the default empty policy and fail closed otherwise.
+        if (mandatory.len != 0) return error.CompactionFitRejected;
         try self.enter(cfg.control);
         if (self.cooperative_enabled and self.cooperative_blocks > 0) {
             return self.selectCooperative(probabilities, importance, q, n, indices, weights, cfg) catch |err| switch (err) {

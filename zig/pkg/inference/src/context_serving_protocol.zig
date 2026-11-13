@@ -70,6 +70,7 @@ pub const Command = struct {
     settings_sha256: ?[]const u8 = null,
     variant_settings_sha256: ?[]const u8 = null,
     fault: ?[]const u8 = null,
+    future_append_index: ?u32 = null,
     case_id: ?[]const u8 = null,
     document_sha256: ?[]const u8 = null,
     question_sha256: ?[]const u8 = null,
@@ -333,11 +334,18 @@ pub const Session = struct {
                 !std.mem.eql(u8, fault, "cancel_replay") and
                 !std.mem.eql(u8, fault, "cancel_fit") and
                 !std.mem.eql(u8, fault, "cancel_publish") and
+                !std.mem.eql(u8, fault, "cancel_future_append") and
                 !std.mem.eql(u8, fault, "oom") and
                 !std.mem.eql(u8, fault, "nonfinite") and
                 !std.mem.eql(u8, fault, "gpu_failure") and
+                !std.mem.eql(u8, fault, "future_append_failure") and
                 !std.mem.eql(u8, fault, "reload"))
                 return error.UnsupportedFaultQualification;
+            const future_fault = std.mem.eql(u8, fault, "cancel_future_append") or std.mem.eql(u8, fault, "future_append_failure");
+            if (future_fault) {
+                const index = command.future_append_index orelse return error.InvalidServingDriverCommand;
+                if (index == 0 or index > 256) return error.InvalidServingDriverCommand;
+            } else if (command.future_append_index != null) return error.InvalidServingDriverCommand;
         }
         if (command.route.? == .serial_mixed_batch) {
             if ((command.command != .measure and command.command != .next) or
@@ -1011,12 +1019,16 @@ pub const Session = struct {
             .cancel_fit
         else if (std.mem.eql(u8, command.fault.?, "cancel_publish"))
             .cancel_publish
+        else if (std.mem.eql(u8, command.fault.?, "cancel_future_append"))
+            .cancel_future_append
         else if (std.mem.eql(u8, command.fault.?, "oom"))
             .oom
         else if (std.mem.eql(u8, command.fault.?, "nonfinite"))
             .nonfinite
         else if (std.mem.eql(u8, command.fault.?, "gpu_failure"))
             .gpu_failure
+        else if (std.mem.eql(u8, command.fault.?, "future_append_failure"))
+            .future_append_failure
         else if (std.mem.eql(u8, command.fault.?, "reload"))
             .cancel_publish // Reload branches before a controller is created.
         else
@@ -1045,7 +1057,11 @@ pub const Session = struct {
         try expectHex(command.prompt_sha256.?, exact.observation.rendered_prompt_sha256);
         if (std.mem.eql(u8, command.fault.?, "reload"))
             return self.executeReloadFault(command, request, &exact, started, writer);
-        var controller = fault_injection.Controller{ .kind = kind };
+        const future_index = command.future_append_index orelse 0;
+        const future_kind = kind == .cancel_future_append or kind == .future_append_failure;
+        if (future_kind != (future_index != 0) or future_index > 256)
+            return error.UnsupportedFaultQualification;
+        var controller = fault_injection.Controller{ .kind = kind, .future_append_index = future_index };
         var fault_request = request;
         fault_request.variant = .attention_matching;
         const failed = try self.driver.executeNativeFault(fault_request, &controller);
@@ -1074,7 +1090,7 @@ pub const Session = struct {
             error.OutOfMemory
         else if (kind == .nonfinite)
             error.NonFiniteCompactionInput
-        else if (kind == .gpu_failure)
+        else if (kind == .gpu_failure or kind == .future_append_failure)
             error.ContextMetalDispatchFailed
         else
             error.Cancelled;
@@ -1185,10 +1201,12 @@ pub const Session = struct {
                 .stage = @tagName(failed.injection.stage orelse return error.ContextFaultIsolationFailed),
                 .mechanism = switch (kind) {
                     .cancel_prefill, .cancel_replay, .cancel_fit => "cooperative_checkpoint_after_partial_work",
+                    .cancel_future_append => "future_append_checkpoint_after_configured_work",
                     .cancel_publish => "transaction_boundary_cancellation",
                     .oom => "request_local_allocator_failure",
                     .nonfinite => "device_fitter_nonfinite_status",
                     .gpu_failure => "simulated_gpu_completion_error",
+                    .future_append_failure => "simulated_future_append_completion_error",
                 },
                 .completed_units = failed.injection.completed_units,
                 .total_units = failed.injection.total_units,

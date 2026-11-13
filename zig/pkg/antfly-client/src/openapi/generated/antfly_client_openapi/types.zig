@@ -32510,6 +32510,14 @@ pub const InferenceGenerateChunk = struct {
     /// Authoritative token accounting. When `stream_options.include_usage` is true, streaming responses emit this only on the final chunk, after the finish chunk and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
     usage: OpenApiOptionalNullable(InferenceGenerateUsage) = .absent,
     speculation: OpenApiOptionalNullable(InferenceGenerateSpeculationStatus) = .absent,
+    /// Qualification-only unfiltered generated token IDs on terminal usage chunks.
+    generated_token_ids: ?[]const i32 = null,
+    /// Exact deduplicated request-local suppression union applied during token selection.
+    applied_suppress_token_ids: ?[]const i32 = null,
+    /// EOS token IDs used by the request-scoped fixed-length mask.
+    eos_token_ids: ?[]const i32 = null,
+    /// True when request-scoped EOS suppression was active.
+    fixed_length_mask_eos: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -32521,6 +32529,10 @@ pub const InferenceGenerateChunk = struct {
         .{ "context", "context", true },
         .{ "usage", "usage", false },
         .{ "speculation", "speculation", false },
+        .{ "generated_token_ids", "generated_token_ids", true },
+        .{ "applied_suppress_token_ids", "applied_suppress_token_ids", true },
+        .{ "eos_token_ids", "eos_token_ids", true },
+        .{ "fixed_length_mask_eos", "fixed_length_mask_eos", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -32568,6 +32580,22 @@ pub const InferenceGenerateChunk = struct {
                 try jw.objectField("speculation");
                 try jw.write(value);
             },
+        }
+        if (self.generated_token_ids) |value| {
+            try jw.objectField("generated_token_ids");
+            try jw.write(value);
+        }
+        if (self.applied_suppress_token_ids) |value| {
+            try jw.objectField("applied_suppress_token_ids");
+            try jw.write(value);
+        }
+        if (self.eos_token_ids) |value| {
+            try jw.objectField("eos_token_ids");
+            try jw.write(value);
+        }
+        if (self.fixed_length_mask_eos) |value| {
+            try jw.objectField("fixed_length_mask_eos");
+            try jw.write(value);
         }
         try jw.endObject();
     }
@@ -32874,6 +32902,8 @@ pub const InferenceGenerateRequest = struct {
     chat_template_kwargs: ?InferenceGenerateChatTemplateKwargs = null,
     /// inference-native benchmarking and controlled-generation extension. When true, generation does not stop on the model's end-of-sequence token and continues until another stop condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
     ignore_eos: ?bool = null,
+    /// Qualification-only fixed-length greedy policy. When true, every primary and additional end-of-sequence token is suppressed from request-local token selection until `max_tokens` is reached. Requires `ignore_eos=true`, deterministic greedy sampling, and no speculative decoding. HTTP serving also requires the operator qualification opt-in `ANTFLY_INFERENCE_JSON_TOKEN_IDS=1`. Omitted or false preserves the existing `ignore_eos` behavior.
+    fixed_length_mask_eos: ?bool = null,
     /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
     tools: ?[]const InferenceTool = null,
     /// Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
@@ -32929,6 +32959,7 @@ pub const InferenceGenerateRequest = struct {
         .{ "stream_options", "stream_options", true },
         .{ "chat_template_kwargs", "chat_template_kwargs", true },
         .{ "ignore_eos", "ignore_eos", true },
+        .{ "fixed_length_mask_eos", "fixed_length_mask_eos", true },
         .{ "tools", "tools", true },
         .{ "min_p", "min_p", true },
         .{ "repetition_penalty", "repetition_penalty", true },
@@ -33005,6 +33036,10 @@ pub const InferenceGenerateRequest = struct {
         }
         if (self.ignore_eos) |value| {
             try jw.objectField("ignore_eos");
+            try jw.write(value);
+        }
+        if (self.fixed_length_mask_eos) |value| {
+            try jw.objectField("fixed_length_mask_eos");
             try jw.write(value);
         }
         if (self.tools) |value| {

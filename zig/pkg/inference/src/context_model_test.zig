@@ -38,6 +38,90 @@ const packed_session_mod = @import("backends/packed_context_session.zig");
 const stored_installed_invocation = @import("backends/context_stored_installed_invocation.zig");
 const stored_installed_caller = @import("context_stored_installed_caller.zig");
 const native_profile = @import("context_native_profile.zig");
+const candidate_authority = @import("context_native_kv_operator_candidate.zig");
+const metal_runtime = @import("backends/metal_runtime.zig");
+
+fn requiredDigestEnvironment(name: [*:0]const u8) ![32]u8 {
+    const value = std.c.getenv(name) orelse return error.MissingReplayCaptureInput;
+    const text = std.mem.span(value);
+    if (text.len != 64) return error.InvalidReplayCaptureInput;
+    var digest: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, text) catch return error.InvalidReplayCaptureInput;
+    if (std.mem.allEqual(u8, &digest, 0)) return error.InvalidReplayCaptureInput;
+    return digest;
+}
+
+test "context Metal captures genuine raw E2 formal owner inventory without fitting" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const enabled = std.c.getenv("ANTFLY_E2_FORMAL_OWNER_CAPTURE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.SkipZigTest;
+    const model_path = std.c.getenv("ANTFLY_CONTEXT_MODEL_DIR") orelse return error.MissingReplayCaptureInput;
+    const tokens_path = std.c.getenv("ANTFLY_E2_FORMAL_TOKEN_IDS_JSON") orelse return error.MissingReplayCaptureInput;
+    const output_path = std.c.getenv("ANTFLY_E2_FORMAL_OWNER_OUTPUT") orelse return error.MissingReplayCaptureInput;
+    const token_sha = try requiredDigestEnvironment("ANTFLY_E2_FORMAL_TOKEN_IDS_SHA256");
+    const candidate_receipt_path = std.c.getenv("ANTFLY_E2_FORMAL_CONTEXT_CANDIDATE_RECEIPT") orelse return error.MissingReplayCaptureInput;
+    const a = std.testing.allocator;
+    const provenance = try candidate_authority.contextTestCaptureAuthority(a, std.testing.io, std.mem.span(candidate_receipt_path));
+    const hardware_sha = (try metal_runtime.nativeCheckpointDestination()).fingerprint();
+    const token_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, std.mem.span(tokens_path), a, .limited(4 * 1024 * 1024));
+    defer a.free(token_bytes);
+    const parsed = try std.json.parseFromSlice([]i64, a, token_bytes, .{});
+    defer parsed.deinit();
+    const prompt = parsed.value;
+    if (prompt.len != 7_936 and prompt.len != 32_512) return error.InvalidReplayCaptureLength;
+    var prompt_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (prompt) |token| {
+        var frame: [8]u8 = undefined;
+        std.mem.writeInt(i64, &frame, token, .little);
+        prompt_hash.update(&frame);
+    }
+    var actual_prompt_sha: [32]u8 = undefined;
+    prompt_hash.final(&actual_prompt_sha);
+    if (!std.mem.eql(u8, &actual_prompt_sha, &token_sha)) return error.InvalidReplayCaptureInput;
+
+    var backend_manager = backends.SessionManager.initWithIo(a, std.testing.io);
+    backend_manager.preferred_backends = &.{.metal};
+    backend_manager.required_backend = .metal;
+    var manager = manager_mod.ModelManager.init(a, backend_manager);
+    defer manager.deinit();
+    const model = try manager.loadFromDir(std.mem.span(model_path));
+    const config = factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration;
+    const layout = try policy.Layout.init(config);
+    const checkpoint_identity = try model.nativeKvIdentity(.f16, null);
+    var budget = memory.RunBudget.init(.{ .host_limit_bytes = 8 * 1024 * 1024 * 1024, .backend_limit_bytes = 8 * 1024 * 1024 * 1024, .combined_limit_bytes = 10 * 1024 * 1024 * 1024 });
+    var cb = try factory.getComputeBackendWithBudget(model.session, a, &budget);
+    defer cb.deinit();
+    var owner = try kv.host_allocation_tracker.RequestAllocationOwner.initSwitchablePrepare();
+    defer _ = owner.release();
+    _ = try owner.tracker.activateBoundedPrepare(kv.host_allocation_tracker.bounded_prepare_e4_physical_bytes);
+    const request_allocator = owner.allocator();
+    var kv_manager = kv.manager.KvManager.init(request_allocator);
+    defer kv_manager.deinit();
+    const pool_config = generation.attentionMatchCheckpointPoolConfig(.metal, .f16, config);
+    const pool_id = try kv_manager.addPool(pool_config);
+    var storage = try kv.storage_runtime.KvStorageRuntime.initTracked(request_allocator, pool_config, owner.tracker);
+    defer storage.deinit();
+    try cb.provisionKvDeviceWriteHook(&storage);
+    var state = generation.NativeDecodeState.initPaged(request_allocator, &kv_manager, pool_id, null);
+    defer state.deinit();
+    state.kv_storage = &storage;
+    state.configureForGptConfig(config);
+    state.allow_swa_ring = false;
+    var pipeline = generation.NativeGenerationPipeline{ .allocator = request_allocator, .io = std.testing.io, .cb = cb, .session = model.session, .load_generation = model.load_generation, .gpt_config = config, .kv_dtype = .f16, .tokenizer = model.getTokenizer(), .chat_template = model.chat_tmpl, .add_bos_token = model.manifest.add_bos_token, .bos_token = model.manifest.bos_token, .decode_state = &state, .attention_match_identity = checkpoint_identity, .graph_cache = &model.native_generation_graph_cache, .compiled_partition_backend = .metal, .compiled_attachment_target = .whole_model };
+    const chunk_rows: u32 = 512;
+    const components = [_]memory.GptGenerationBudgetComponent{.{ .backend = .metal, .kv_dtype = .f16, .config = config }};
+    const prefill_admission = try memory.reserveGptGenerationPrefill(&budget, &components, prompt.len, 1, chunk_rows);
+    if (prefill_admission.max_chunk_rows != chunk_rows) return error.CompactionWorkspaceLimit;
+    var prefill_plan = try @import("runtime/scheduler/native_generate.zig").PrefillChunkPlan.init(request_allocator, prompt.len, prefill_admission.max_chunk_rows, prefill_admission.max_scratch_bytes, .sole_idle, .fixed_ceiling);
+    defer prefill_plan.deinit(request_allocator);
+    const artifact = try pipeline.diagnoseE2FormalOwnerInventory(prompt, &state, .{ .prefill_chunk_size = chunk_rows, .prefill_chunk_plan = prefill_plan, .max_tokens = 1, .ignore_eos = true }, chunk_rows, layout, .{ .checkpoint_identity = checkpoint_identity, .binary_sha256 = provenance.parent.binary_sha256, .context_binary_sha256 = provenance.context_binary_sha256, .hardware_profile_sha256 = hardware_sha, .source_freeze_sha256 = provenance.parent.source_freeze_sha256 orelse return error.InvalidContextReleaseBuildReceipt, .prompt_tokens_sha256 = token_sha, .prompt_tokens = @intCast(prompt.len) });
+    const output = std.mem.span(output_path);
+    const dirname = std.fs.path.dirname(output) orelse ".";
+    const basename = std.fs.path.basename(output);
+    var output_dir = try std.Io.Dir.cwd().openDir(std.testing.io, dirname, .{ .follow_symlinks = false });
+    defer output_dir.close(std.testing.io);
+    try @import("runtime/kv/attention_match_e2_formal_owner_inventory.zig").writeCapturedArtifact(a, std.testing.io, output_dir, basename, artifact);
+}
 
 test "context Metal installed Gemma artifact chunked logits parity" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;

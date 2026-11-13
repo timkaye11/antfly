@@ -7231,6 +7231,7 @@ pub fn installedAttentionMatchActivity(self: *CudaCompute, storage: *kv_storage_
 /// Clone a fitted owner for isolated reference-query forwards. The dense
 /// clone contract remains exact-only; callers explicitly select this adapter.
 pub fn cloneInstalledAttentionMatch(self: *CudaCompute, destination_storage: *kv_storage_runtime.KvStorageRuntime, source_storage: *kv_storage_runtime.KvStorageRuntime, request: kv_storage_runtime.device_clone.Request) !?kv_storage_runtime.device_clone.Result {
+    if (request.logical_block_policy != .identity_only) return error.UnsupportedDeviceKvCloneLayout;
     try request.check();
     const source = try attentionMatchStorage(self, source_storage);
     const binding = source.match_binding orelse return null;
@@ -7881,6 +7882,7 @@ const CudaKvDeviceStorage = struct {
         request: kv_storage_runtime.device_clone.Request,
     ) !kv_storage_runtime.device_clone.Result {
         const destination: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        if (request.logical_block_policy != .identity_only) return error.UnsupportedDeviceKvCloneLayout;
         if (source_hook.vtable != &hook_vtable or source_hook.ctx == ctx) return error.InvalidDeviceKvClone;
         const match_source: *CudaKvDeviceStorage = @ptrCast(@alignCast(source_hook.ctx));
         if (destination.match_binding != null or match_source.match_binding != null) return error.UnsupportedAttentionMatchRoute;

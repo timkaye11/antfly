@@ -1,5 +1,6 @@
 """Portable checkpoint streaming, publication, and cancellation contracts."""
 
+import base64
 import hashlib
 import io
 import json
@@ -16,10 +17,12 @@ from antfly.native_kv import (
     CHECKPOINT_MIME,
     CHUNK_BYTES,
     CONTENT_TYPE,
+    CONTENT_TYPE_V2,
     MAX_CHECKPOINT_BYTES,
     ChunkReader,
     checkpoint_upload,
     receive_checkpoint,
+    _validate_v2_metadata,
 )
 
 
@@ -56,6 +59,73 @@ def fixture(payload_size=40, outcome="compacted", version=2, encoding="f32"):
     return frame + encoded + CHECKPOINT_MIME + checkpoint, checkpoint, metadata
 
 
+def fixture_v2(payload_size=40, outcome="compacted", quality_evidence_core=None):
+    _, checkpoint, _ = fixture(payload_size)
+    identity = [bytes(range(start, start + 32)).hex() for start in range(0, 128, 32)]
+    producer_value = {
+            "schema": "antfly.native-kv-prepared-producer.v1",
+            "model": "gemma",
+            "model_artifact_sha256_hex": identity[0],
+            "model_tokenizer_sha256_hex": identity[1],
+            "model_template_sha256_hex": identity[2],
+            "model_layout_sha256_hex": identity[3],
+            "profile_sha256_hex": "1" * 64,
+            "profile_semantic_sha256_hex": "2" * 64,
+            "source_sha256_hex": "3" * 64,
+            "binary_sha256_hex": "4" * 64,
+            "policy_name": "cumulative256_exact_cycle_v1",
+            "policy_sha256_hex": "5" * 64,
+            "admission": "cumulative_ladder_4_3_2",
+            "chunk_rows": 256,
+            "reject_exact_active_fixed_point": True,
+            "encoding": "f32",
+            "logical_revision": 7,
+            "logical_tokens": 12,
+            "checkpoint_bytes": len(checkpoint),
+            "outcome": outcome,
+        }
+    if quality_evidence_core is not None:
+        producer_value["quality_evidence_core_sha256_hex"] = quality_evidence_core
+    producer = json.dumps(
+        producer_value,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    prepared = base64.b64encode(producer).decode("ascii")
+    outer = {
+        "prepared_metadata_base64": prepared,
+        "schema": "antfly.native-kv-envelope.v2",
+    }
+    encoded = json.dumps(outer, separators=(",", ":"), sort_keys=True).encode()
+    header = struct.pack("<8sQIIIIQ", b"AFATT002", len(encoded), 1, 0, len(CHECKPOINT_MIME), 0, len(checkpoint))
+    authenticated = header + encoded + CHECKPOINT_MIME + checkpoint
+    return authenticated + hashlib.sha256(authenticated).digest(), checkpoint, outer, producer
+
+
+def test_v2_producer_accepts_only_authenticated_optional_quality_core():
+    for quality in (None, "a" * 64):
+        _, _, outer, _ = fixture_v2(quality_evidence_core=quality)
+        _, _, producer = _validate_v2_metadata(json.dumps(outer).encode())
+        assert producer.get("quality_evidence_core_sha256_hex") == quality
+    for invalid in (None, "", "0" * 64, "A" * 64, "g" * 64, "a" * 63):
+        _, _, outer, producer = fixture_v2()
+        value = json.loads(producer)
+        value["quality_evidence_core_sha256_hex"] = invalid
+        outer["prepared_metadata_base64"] = base64.b64encode(json.dumps(value).encode()).decode()
+        with pytest.raises(ValueError, match="quality evidence digest"):
+            _validate_v2_metadata(json.dumps(outer).encode())
+    _, _, outer, producer = fixture_v2()
+    value = json.loads(producer)
+    value["unknown_optional"] = "a" * 64
+    outer["prepared_metadata_base64"] = base64.b64encode(json.dumps(value).encode()).decode()
+    with pytest.raises(ValueError, match="producer fields"):
+        _validate_v2_metadata(json.dumps(outer).encode())
+    duplicate = producer[:-1] + b',"model":"duplicate"}'
+    outer["prepared_metadata_base64"] = base64.b64encode(duplicate).decode()
+    with pytest.raises(ValueError, match="duplicate checkpoint metadata field"):
+        _validate_v2_metadata(json.dumps(outer).encode())
+
+
 class Stream(httpx.SyncByteStream):
     def __init__(self, data, *, fail=False):
         self.data = data
@@ -90,7 +160,7 @@ def test_export_streams_and_publishes_verified_checkpoint(tmp_path, outcome):
 
     def handle(request):
         assert request.headers["Authorization"] == "Bearer secret"
-        assert request.headers["Accept"] == CONTENT_TYPE
+        assert [value.strip() for value in request.headers["Accept"].split(",")] == [CONTENT_TYPE_V2, CONTENT_TYPE]
         assert json.loads(request.read())["stream"] is False
         assert destination.read_bytes() == b"previous"
         return httpx.Response(200, headers={"Content-Type": CONTENT_TYPE}, stream=stream)
@@ -123,6 +193,175 @@ def test_every_truncation_and_bad_integrity_preserve_existing_file(tmp_path):
         assert destination.read_bytes() == b"previous"
     with pytest.raises(ValueError, match="trailing"):
         receive_checkpoint(io.BytesIO(frame + b"extra"), destination, "gemma")
+
+
+def test_afatt002_footer_is_verified_before_publish_and_opaque_producer_is_forwarded(tmp_path):
+    frame, checkpoint, outer, producer = fixture_v2(CHUNK_BYTES + 7)
+    destination = tmp_path / "saved-v2.kv"
+    destination.write_bytes(b"previous")
+    saved = receive_checkpoint(io.BytesIO(frame), destination, "gemma")
+    assert destination.read_bytes() == checkpoint
+    assert saved.envelope_version == 2
+    assert saved.prepared_metadata_base64 == outer["prepared_metadata_base64"]
+    assert saved.producer_outcome == "compacted"
+    assert base64.b64decode(saved.prepared_metadata_base64) == producer
+
+    request = {"model": "gemma", "messages": [{"role": "user", "content": "next"}]}
+    with destination.open("rb") as source:
+        length, chunks = checkpoint_upload(source, request, saved.prepared_metadata_base64)
+        wire = b"".join(chunks)
+    assert len(wire) == length
+    assert wire[:8] == b"AFATT002"
+    metadata_len = struct.unpack_from("<Q", wire, 8)[0]
+    upload_outer = json.loads(wire[40 : 40 + metadata_len])
+    assert upload_outer["prepared_metadata_base64"] == outer["prepared_metadata_base64"]
+    assert json.loads(upload_outer["request_json"]) == request
+    assert wire[-32:] == hashlib.sha256(wire[:-32]).digest()
+
+    for cut in (1, 31, 32, len(frame) - 1):
+        destination.write_bytes(b"previous")
+        with pytest.raises(ValueError):
+            receive_checkpoint(io.BytesIO(frame[:-cut]), destination, "gemma")
+        assert destination.read_bytes() == b"previous"
+    corrupt = bytearray(frame)
+    corrupt[-1] ^= 1
+    with pytest.raises(ValueError, match="envelope checksum"):
+        receive_checkpoint(io.BytesIO(corrupt), destination, "gemma")
+    assert destination.read_bytes() == b"previous"
+
+    for offset in (41, len(frame) - 33):
+        corrupt = bytearray(frame)
+        corrupt[offset] ^= 1
+        with pytest.raises(ValueError):
+            receive_checkpoint(io.BytesIO(corrupt), destination, "gemma")
+        assert destination.read_bytes() == b"previous"
+
+
+def test_public_client_negotiates_v2_and_resume_preserves_opaque_producer(tmp_path):
+    frame, checkpoint, outer, _ = fixture_v2(CHUNK_BYTES + 7)
+    destination = tmp_path / "client-v2.kv"
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path.endswith("/checkpoint"):
+            assert [value.strip() for value in request.headers["Accept"].split(",")] == [
+                CONTENT_TYPE_V2,
+                CONTENT_TYPE,
+            ]
+            return httpx.Response(200, headers={"Content-Type": CONTENT_TYPE_V2}, stream=Stream(frame))
+        assert request.url.path.endswith("/resume")
+        assert request.headers["Content-Type"] == CONTENT_TYPE_V2
+        wire = request.read()
+        assert wire[:8] == b"AFATT002"
+        metadata_len = struct.unpack_from("<Q", wire, 8)[0]
+        upload_outer = json.loads(wire[40 : 40 + metadata_len])
+        assert upload_outer["prepared_metadata_base64"] == outer["prepared_metadata_base64"]
+        assert json.loads(upload_outer["request_json"])["model"] == "gemma"
+        assert wire[-32:] == hashlib.sha256(wire[:-32]).digest()
+        return httpx.Response(200, headers={"Content-Type": "application/json"}, json={})
+
+    client = client_with_transport(handler)
+    request = InferenceGenerateRequest(model="gemma", messages=[])
+    saved = client.prepare_native_kv_checkpoint(request, destination)
+    assert destination.read_bytes() == checkpoint
+    assert saved.prepared_metadata_base64 == outer["prepared_metadata_base64"]
+    with client._native_kv_resume_response(request, saved, stream=False):
+        pass
+    assert len(requests) == 2
+
+
+def test_afatt002_preserves_unchanged_outcome(tmp_path):
+    frame, _, _, _ = fixture_v2(outcome="unchanged_insufficient_savings")
+    saved = receive_checkpoint(io.BytesIO(frame), tmp_path / "unchanged.kv", "gemma")
+    assert saved.producer_outcome == "unchanged_insufficient_savings"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("model", "other"),
+        ("logical_tokens", 11),
+        ("checkpoint_bytes", 1),
+        ("encoding", "f16"),
+        ("model_layout_sha256_hex", "0" * 64),
+    ],
+)
+def test_afatt002_rejects_producer_checkpoint_mismatch(tmp_path, field, value):
+    frame, checkpoint, outer, _ = fixture_v2()
+    producer = json.loads(base64.b64decode(outer["prepared_metadata_base64"]))
+    producer[field] = value
+    outer["prepared_metadata_base64"] = base64.b64encode(
+        json.dumps(producer, separators=(",", ":"), sort_keys=True).encode()
+    ).decode()
+    encoded = json.dumps(outer, separators=(",", ":"), sort_keys=True).encode()
+    header = struct.pack("<8sQIIIIQ", b"AFATT002", len(encoded), 1, 0, len(CHECKPOINT_MIME), 0, len(checkpoint))
+    authenticated = header + encoded + CHECKPOINT_MIME + checkpoint
+    wire = authenticated + hashlib.sha256(authenticated).digest()
+    with pytest.raises(ValueError, match="disagrees"):
+        receive_checkpoint(io.BytesIO(wire), tmp_path / "mismatch.kv", "gemma", content_type=CONTENT_TYPE_V2)
+
+
+def test_afatt002_upload_rechecks_model_and_checkpoint(tmp_path):
+    frame, _, _, _ = fixture_v2()
+    saved = receive_checkpoint(io.BytesIO(frame), tmp_path / "saved.kv", "gemma", content_type=CONTENT_TYPE_V2)
+    with saved.path.open("rb") as source, pytest.raises(ValueError, match="disagrees"):
+        checkpoint_upload(source, {"model": "other"}, saved.prepared_metadata_base64)
+
+
+def test_afatt001_remains_unchanged_and_afatt002_rejects_noncanonical_or_object_request(tmp_path):
+    legacy, _, _ = fixture()
+    assert receive_checkpoint(io.BytesIO(legacy), tmp_path / "legacy.kv", "gemma").envelope_version == 1
+    frame, _, outer, _ = fixture_v2()
+    metadata_len = struct.unpack_from("<Q", frame, 8)[0]
+    metadata = json.loads(frame[40 : 40 + metadata_len])
+    metadata["request_json"] = {"model": "gemma"}
+    encoded = json.dumps(metadata, separators=(",", ":"), sort_keys=True).encode()
+    bad_header = struct.pack(
+        "<8sQIIIIQ",
+        b"AFATT002",
+        len(encoded),
+        1,
+        0,
+        len(CHECKPOINT_MIME),
+        0,
+        len(frame) - 40 - metadata_len - len(CHECKPOINT_MIME) - 32,
+    )
+    with pytest.raises(ValueError, match="JSON string"):
+        receive_checkpoint(io.BytesIO(bad_header + encoded + frame[40 + metadata_len :]), tmp_path / "bad.kv", "gemma")
+
+    raw = base64.b64decode(outer["prepared_metadata_base64"])
+    metadata = dict(outer, prepared_metadata_base64=base64.b64encode(raw).decode().rstrip("="))
+    encoded = json.dumps(metadata, separators=(",", ":"), sort_keys=True).encode()
+    bad_header = struct.pack(
+        "<8sQIIIIQ",
+        b"AFATT002",
+        len(encoded),
+        1,
+        0,
+        len(CHECKPOINT_MIME),
+        0,
+        len(frame) - 40 - metadata_len - len(CHECKPOINT_MIME) - 32,
+    )
+    with pytest.raises(ValueError, match="producer metadata"):
+        receive_checkpoint(
+            io.BytesIO(bad_header + encoded + frame[40 + metadata_len :]), tmp_path / "bad-base64.kv", "gemma"
+        )
+
+    with pytest.raises(ValueError, match="media type"):
+        receive_checkpoint(io.BytesIO(frame), tmp_path / "bad-media.kv", "gemma", content_type=CONTENT_TYPE)
+    with pytest.raises(ValueError, match="media type"):
+        receive_checkpoint(io.BytesIO(legacy), tmp_path / "bad-legacy-media.kv", "gemma", content_type=CONTENT_TYPE_V2)
+
+
+def test_cross_sdk_afatt002_fixture_is_exact(tmp_path):
+    fixture_path = Path(__file__).parents[4] / "specs" / "testdata" / "native_kv_afatt002_v1.json"
+    shared = json.loads(fixture_path.read_text())
+    wire = bytes.fromhex(shared["wire_hex"])
+    assert hashlib.sha256(wire).hexdigest() == shared["wire_sha256"]
+    saved = receive_checkpoint(io.BytesIO(wire), tmp_path / "shared.kv", "gemma", content_type=shared["content_type"])
+    assert saved.prepared_metadata_base64 == shared["prepared_metadata_base64"]
+    assert saved.producer_outcome == "compacted"
 
 
 def test_failed_export_closes_response_and_keeps_previous_checkpoint(tmp_path):

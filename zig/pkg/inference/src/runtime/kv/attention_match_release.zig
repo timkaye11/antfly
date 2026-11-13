@@ -17,13 +17,14 @@ pub const Execution = struct {
     retain_hidden: bool = false,
     matrix_stage: bool = false,
     coalesced_stage: bool = false,
+    resident_gated_ffn_fusion: bool = false,
     ple_tail: bool = false,
     resource_barriers: bool = false,
     concurrent_frame: bool = false,
 
     pub fn validate(self: Execution) !void {
         if ((!self.forward_frame and (self.precomputed_tail or self.retain_hidden or self.matrix_stage or
-            self.coalesced_stage or self.ple_tail or self.resource_barriers or self.concurrent_frame)) or
+            self.coalesced_stage or self.resident_gated_ffn_fusion or self.ple_tail or self.resource_barriers or self.concurrent_frame)) or
             (self.ple_tail and !self.precomputed_tail) or (self.concurrent_frame and !self.resource_barriers))
             return error.UnqualifiedCompactionArtifact;
     }
@@ -39,10 +40,30 @@ pub const Execution = struct {
     pub fn fingerprint(self: Execution) [32]u8 {
         var hash = Sha256.init(.{});
         hash.update("antfly.native-whole-head.execution.v2\n");
-        inline for (@typeInfo(Execution).@"struct".field_names) |field| hash.update(&.{@intFromBool(@field(self, field))});
+        inline for (@typeInfo(Execution).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "resident_gated_ffn_fusion"))
+                hash.update(&.{@intFromBool(@field(self, field))});
+        }
+        if (self.resident_gated_ffn_fusion) {
+            hash.update("antfly.native-whole-head.execution.resident-gated-ffn-fusion.v1\n");
+            hash.update(&.{1});
+        }
         return hash.finalResult();
     }
 };
+
+test "resident gated FFN execution changes only the opted-in fingerprint" {
+    const legacy: Execution = .{ .forward_frame = true, .precomputed_tail = true };
+    var fused = legacy;
+    fused.resident_gated_ffn_fusion = true;
+    const legacy_hash = legacy.fingerprint();
+    var old = Sha256.init(.{});
+    old.update("antfly.native-whole-head.execution.v2\n");
+    inline for (.{ legacy.forward_frame, legacy.precomputed_tail, legacy.retain_hidden, legacy.matrix_stage, legacy.coalesced_stage, legacy.ple_tail, legacy.resource_barriers, legacy.concurrent_frame }) |field| old.update(&.{@intFromBool(field)});
+    try std.testing.expectEqual(old.finalResult(), legacy_hash);
+    const fused_hash = fused.fingerprint();
+    try std.testing.expect(!std.mem.eql(u8, &legacy_hash, &fused_hash));
+}
 
 pub const execution_environment_names = [_][*:0]const u8{
     "ANTFLY_METAL_ATTENTION_MATCH_FORWARD_FRAME",
@@ -50,6 +71,7 @@ pub const execution_environment_names = [_][*:0]const u8{
     "ANTFLY_METAL_ATTENTION_MATCH_RETAIN_HIDDEN",
     "ANTFLY_METAL_ATTENTION_MATCH_MATRIX_STAGE",
     "ANTFLY_METAL_ATTENTION_MATCH_COALESCED_STAGE",
+    "ANTFLY_METAL_ATTENTION_MATCH_GATED_FFN_FUSION",
     "ANTFLY_METAL_ATTENTION_MATCH_PLE_TAIL",
     "ANTFLY_METAL_ATTENTION_MATCH_RESOURCE_BARRIERS",
     "ANTFLY_METAL_ATTENTION_MATCH_CONCURRENT_FRAME",

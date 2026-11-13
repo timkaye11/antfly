@@ -6,6 +6,7 @@
 const std = @import("std");
 const checkpoint = @import("attention_match_checkpoint.zig");
 const allocations = @import("host_allocation_tracker.zig");
+const fit_policy = @import("attention_match_fit_policy.zig");
 
 pub const contexts = [_]usize{ 8192, 32768 };
 pub const steps_per_batch = 64;
@@ -13,13 +14,26 @@ pub const formal_seconds = 4 * 60 * 60;
 
 pub const Request = struct {
     encoding: checkpoint.Encoding,
+    producer_policy: fit_policy.Policy = .legacy_fixed,
     duration_seconds: u32 = formal_seconds,
+    exact_source_rows: ?u32 = null,
 
     pub fn validate(self: Request) !void {
+        try self.producer_policy.validate(self.encoding, true);
         if (self.encoding == .f32 or self.duration_seconds == 0 or self.duration_seconds > formal_seconds)
             return error.InvalidNativeSoakRequest;
+        if (self.exact_source_rows) |rows| switch (rows) {
+            7936, 8128, 32512 => {},
+            else => return error.InvalidNativeSoakRequest,
+        };
     }
 };
+
+test "context exact source rows accept only authenticated E2 diagnostic geometries" {
+    try (Request{ .encoding = .f16, .exact_source_rows = 7936 }).validate();
+    try (Request{ .encoding = .f16, .exact_source_rows = 32512 }).validate();
+    try std.testing.expectError(error.InvalidNativeSoakRequest, (Request{ .encoding = .f16, .exact_source_rows = 7935 }).validate());
+}
 
 pub const Activity = struct {
     owner_id: u64,
@@ -62,6 +76,8 @@ pub const Report = struct {
     collection_complete: bool = false,
     production_ready: bool = false,
     release_authority: bool = false,
+    producer_policy: fit_policy.Policy = .legacy_fixed,
+    producer_policy_sha256: [32]u8 = @splat(0),
     diagnostic_only: bool,
     load_generation: u64,
     batches: usize,
@@ -77,6 +93,12 @@ pub const Report = struct {
     runtime_kv_bytes_before: u64,
     runtime_kv_bytes_after: u64,
     release: [2]allocations.RequestAllocationOwner.ReleaseReceipt,
+
+    pub fn validateProducerPolicy(self: Report, request: Request) !void {
+        if (!std.meta.eql(self.producer_policy, request.producer_policy) or
+            !std.meta.eql(self.producer_policy_sha256, request.producer_policy.digest()))
+            return error.InvalidNativeSoakProgress;
+    }
 };
 
 test "attention_match Metal persistent soak requires real activity on both unchanged owners" {

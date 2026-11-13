@@ -39,6 +39,8 @@ import struct
 import stat as stat_mod
 import zipfile
 
+from context_release_limits import MAX_ARCHIVE_BYTES, MAX_SOURCE_FILES, MAX_UNCOMPRESSED_BYTES
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from benchmark_resources import DiskSpaceGuard, group_rss_mib, memory_free_percent, swapout_bytes
 
@@ -387,9 +389,9 @@ FULL_RELEASE_SOURCE_NOTE = (
     "Complete Git-visible Zig tree inputs are archived; deleted binds tracked removals; Git-ignored caches and outputs are excluded; gitlinks bind clean or uninitialized submodules."
 )
 FULL_RELEASE_ARCHIVE_MANIFEST = "FULL-RELEASE-SOURCE.json"
-FULL_RELEASE_MAX_SOURCE_FILES = 8192
-FULL_RELEASE_MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
-FULL_RELEASE_MAX_UNCOMPRESSED_BYTES = 768 * 1024 * 1024
+FULL_RELEASE_MAX_SOURCE_FILES = MAX_SOURCE_FILES
+FULL_RELEASE_MAX_ARCHIVE_BYTES = MAX_ARCHIVE_BYTES
+FULL_RELEASE_MAX_UNCOMPRESSED_BYTES = MAX_UNCOMPRESSED_BYTES
 FULL_RELEASE_COMMAND = [
     "/usr/bin/env", "ANTFLY_ZIG_MAX_RSS=8589934592", "python3", "tools/run_bounded_zig_build.py",
     "build", "inference-test-context", "--verbose", "-j1", "-Dmetal=true", "-Dcuda=false", "-Donnx=false",
@@ -1549,6 +1551,63 @@ def _raw_driver_contract(raw, root, expected_identity, expected_provenance, leng
     return result
 
 
+FULL_TTFT_PHASES = {
+    "exact": {"request_dispatch", "exact_prefill", "first_token"},
+    "packed_exact": {"request_dispatch", "packed_exact_prefill", "first_token"},
+    "attention_matching": {"request_dispatch", "source_prefill", "query_collection",
+                           "fit_validation", "export", "upload", "install", "first_token"},
+}
+FULL_TTFT_OPTIONAL_PHASES = {"future_generation", "snapshot", "suffix_prefill", "compiled_handoff",
+                             "export_prepare", "client_checkpoint_receive"}
+
+
+def full_ttft_attempt_contract(value, variant):
+    """Authenticate one fresh end-to-end attempt, not a checkpoint restore timer."""
+    authority = value.get("full_ttft_authority")
+    require(type(authority) is dict and set(authority) == {
+                "schema", "clock", "timing_scope", "outer_start_ns",
+                "first_public_content_ns", "first_public_content_kind", "phases",
+                "fresh_owner_id", "fresh_artifact_id", "restore_ttft_ms"},
+            "missing full-TTFT timing authority")
+    require(authority["schema"] == "antfly.attention-matching-full-ttft-attempt.v1" and
+            authority["clock"] == "posix_CLOCK_MONOTONIC" and
+            authority["timing_scope"] == "full_request_pipeline_to_first_public_content" and
+            authority["first_public_content_kind"] == "nonempty_public_delta",
+            "invalid full-TTFT timing authority")
+    start, finish = authority["outer_start_ns"], authority["first_public_content_ns"]
+    require(type(start) is int and type(finish) is int and 0 <= start < finish,
+            "invalid full-TTFT outer interval")
+    phases = authority["phases"]
+    require(type(phases) is list and phases, "missing full-TTFT phase closure")
+    allowed = FULL_TTFT_PHASES[variant] | FULL_TTFT_OPTIONAL_PHASES
+    names, cursor = [], start
+    for phase in phases:
+        require(type(phase) is dict and set(phase) == {"name", "start_ns", "end_ns", "authority"} and
+                phase.get("name") in allowed and type(phase.get("start_ns")) is int and
+                type(phase.get("end_ns")) is int and phase["start_ns"] == cursor and
+                phase["start_ns"] < phase["end_ns"] <= finish and
+                phase.get("authority") in ("client_monotonic_boundary", "server_monotonic_event"),
+                "invalid or noncontiguous full-TTFT phase closure")
+        names.append(phase["name"])
+        cursor = phase["end_ns"]
+    require(cursor == finish and len(names) == len(set(names)) and
+            FULL_TTFT_PHASES[variant].issubset(names),
+            "incomplete full-TTFT phase closure")
+    measured_ms = (finish - start) / 1e6
+    require(abs(number(value.get("ttft_ms"), variant + " full TTFT", .000001) - measured_ms) <= 1e-6,
+            "full-TTFT value differs from authoritative outer clock")
+    owner, artifact = authority["fresh_owner_id"], authority["fresh_artifact_id"]
+    require(isinstance(owner, str) and owner and isinstance(artifact, str) and artifact,
+            "missing fresh full-TTFT owner or artifact")
+    restore = authority["restore_ttft_ms"]
+    if variant in ("exact", "packed_exact"):
+        require(restore is None, "ordinary exact full-TTFT attempt has restore-only timing")
+    else:
+        require(type(restore) in (int, float) and math.isfinite(restore) and 0 < restore <= measured_ms,
+                "invalid secondary restore TTFT")
+    return owner, artifact
+
+
 def performance_contract(perf, expected_identity, expected_provenance, qualified_context_tokens):
     require(perf.get("schema_version") == 2 and perf.get("semantic_identity") == expected_identity and
             perf.get("provenance") == expected_provenance, "stale or mismatched performance")
@@ -1588,6 +1647,7 @@ def performance_contract(perf, expected_identity, expected_provenance, qualified
             "performance warmups overlap measured prompts")
     rows_by_cell = {key: [] for key in cell_contracts}
     warmups_by_cell = {key: [] for key in cell_contracts}
+    full_ttft_owners, full_ttft_artifacts = set(), set()
     for row in all_rows:
         require(isinstance(row.get("prompt_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", row["prompt_sha256"]), "invalid performance prompt identity")
         require(type(row.get("prompt_tokens")) is int and type(row.get("output_tokens")) is int,
@@ -1616,6 +1676,11 @@ def performance_contract(perf, expected_identity, expected_provenance, qualified
             number(value.get("decode_tokens_per_second"), label + " decode throughput", .000001)
             number(value.get("committed_context_bytes"), label + " committed context bytes", 1)
             require(value.get("swapout_growth_bytes") == 0, label + " run paged")
+            owner, artifact = full_ttft_attempt_contract(value, variant)
+            require(owner not in full_ttft_owners and artifact not in full_ttft_artifacts,
+                    "full-TTFT attempt reused an owner or artifact")
+            full_ttft_owners.add(owner)
+            full_ttft_artifacts.add(artifact)
         require(exact.get("output_sha256") == packed.get("output_sha256") and
                 isinstance(exact.get("output_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", exact["output_sha256"]),
                 "exact and packed-exact outputs differ")
@@ -1634,8 +1699,9 @@ def performance_contract(perf, expected_identity, expected_provenance, qualified
     exact_decode_ratio = lambda sample: percentile([x["packed_exact"]["decode_tokens_per_second"] /
                                                      x["exact"]["decode_tokens_per_second"]
                                                      for x in sample], .50)
-    ttft_ratio = lambda sample: percentile([x["attention_matching"]["ttft_ms"] / x["exact"]["ttft_ms"]
-                                            for x in sample], .95)
+    ttft_ratio = lambda sample: percentile([
+        x["attention_matching"]["ttft_ms"] / min(x["exact"]["ttft_ms"], x["packed_exact"]["ttft_ms"])
+        for x in sample], .95)
     decode_ratio = lambda sample: percentile([x["attention_matching"]["decode_tokens_per_second"] /
                                               x["exact"]["decode_tokens_per_second"]
                                               for x in sample], .50)
@@ -2150,12 +2216,31 @@ def _finish_v2_audit(models):
             "incomplete_gates": incomplete, "models": models}
 
 
-def audit_v2(manifest, directory):
+def full_inclusive_entries_contract(value):
+    require(type(value) is dict and set(value) == {"schema", "models"} and
+            value["schema"] == "antfly.release-full-ingestion-performance-manifest.v1" and
+            type(value["models"]) is list and value["models"], "invalid full-inclusive manifest")
+    entries = {}
+    for item in value["models"]:
+        require(type(item) is dict and set(item) == {"model", "semantic_identity", "provenance", "cells", "authorities", "entries"},
+                "invalid full-inclusive model entry")
+        require(item["model"] not in entries, "duplicate full-inclusive model")
+        entries[item["model"]] = item
+    return entries
+
+
+def audit_v2(manifest, directory, full_inclusive_manifest=None):
     models = manifest.get("models", [])
     require(1 <= len(models) <= 2, "release manifest must contain one or two artifact candidates")
     require(len({x.get("model") for x in models}) == len(models) and
             all(x.get("model") in {"gemma4-e2b", "gemma4-e4b"} for x in models), "invalid or duplicate artifact candidate")
     result, artifact_ids, all_eval, all_calibration = [], set(), set(), set()
+    inclusive_by_model = {} if full_inclusive_manifest is None else full_inclusive_entries_contract(full_inclusive_manifest)
+    inclusive_owner_ids, inclusive_artifact_ids = set(), set()
+    if full_inclusive_manifest is not None:
+        require(set(inclusive_by_model) == {model.get("model") for model in models} and
+                sum(len(item["cells"]) for item in inclusive_by_model.values()) == 12,
+                "full-inclusive manifest must contain all twelve cells exactly once")
     root = Path(directory).resolve()
     for model in models:
         identity, origin = model.get("semantic_identity"), model.get("provenance")
@@ -2348,9 +2433,23 @@ def audit_v2(manifest, directory):
         if raw_soak is None:
             incomplete.append("v2_raw_soak_collector")
         incomplete.extend(numerical_incomplete_gates(raw_numerical))
+        inclusive = inclusive_by_model.get(model["model"])
+        inclusive_result = None
+        if inclusive is None:
+            incomplete.append("full_ingestion_performance_12_cells")
+        else:
+            require(inclusive["semantic_identity"] == identity and inclusive["provenance"] == origin and
+                    all(type(cell) is dict and cell.get("model") == model["model"] for cell in inclusive["cells"]),
+                    "full-inclusive release binding mismatch")
+            import inclusive_release_gate
+            inclusive_result = inclusive_release_gate.validate(
+                {"canonical_restore_validated": True}, lambda value: value["canonical_restore_validated"],
+                inclusive["entries"], inclusive["cells"], identity, origin, inclusive["authorities"],
+                len(inclusive["cells"]), inclusive_owner_ids, inclusive_artifact_ids)
         result.append({"model": model["model"], "semantic_identity": identity, "provenance": origin,
                        "qualified_context_tokens": sorted(lengths), "quality_cases": len(cases),
                        "performance_bounds": bounds, "provenance_files": verified_files,
+                       "full_ingestion_performance": inclusive_result,
                        "diagnostic_checks": ["campaign_file_digest_consistency", "exact_context_observation_recalculation",
                                              "paired_performance_statistics", "paired_quality_statistics"],
                        "raw_numerical": raw_numerical,
@@ -2464,9 +2563,9 @@ def audit_v1(manifest, directory):
             "reason": "Schema 1 evidence is retained for diagnostics and cannot qualify a release.", "models": result}
 
 
-def audit(manifest, directory):
+def audit(manifest, directory, full_inclusive_manifest=None):
     if manifest.get("schema_version") == 2:
-        return audit_v2(manifest, directory)
+        return audit_v2(manifest, directory, full_inclusive_manifest)
     if manifest.get("schema_version") == 1:
         return audit_v1(manifest, directory)
     raise ValueError("unsupported release manifest")
@@ -3514,6 +3613,8 @@ def main():
     check = commands.add_parser("audit")
     check.add_argument("manifest", type=Path)
     check.add_argument("--output", type=Path, required=True)
+    check.add_argument("--full-inclusive-manifest", type=Path)
+    check.add_argument("--full-inclusive-manifest-sha256")
     run = commands.add_parser("soak")
     run.add_argument("--driver", type=Path, required=True, help="JSON argv array, no shell")
     run.add_argument("--identity", type=Path, required=True)
@@ -3587,7 +3688,17 @@ def main():
     coverage.add_argument("--max-rss-mib", type=float, default=8192)
     args = parser.parse_args()
     if args.command == "audit":
-        result = audit(read_json(args.manifest), args.manifest.parent)
+        require((args.full_inclusive_manifest is None) == (args.full_inclusive_manifest_sha256 is None),
+                "full-inclusive manifest path and SHA-256 must be supplied together")
+        inclusive = None
+        if args.full_inclusive_manifest is not None:
+            require(args.full_inclusive_manifest.is_absolute() and args.full_inclusive_manifest.is_file() and
+                    not args.full_inclusive_manifest.is_symlink() and
+                    re.fullmatch(r"[0-9a-f]{64}", args.full_inclusive_manifest_sha256) and
+                    sha(args.full_inclusive_manifest) == args.full_inclusive_manifest_sha256,
+                    "full-inclusive manifest pin")
+            inclusive = read_json(args.full_inclusive_manifest)
+        result = audit(read_json(args.manifest), args.manifest.parent, inclusive)
         result["manifest_sha256"] = sha(args.manifest)
         result["auditor_sha256"] = sha(__file__)
         write_json(args.output, result)

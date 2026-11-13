@@ -867,6 +867,29 @@ test "manager retain paths do not leak block refs on allocation failure" {
     try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(1).?.refcount);
 }
 
+test "manager block freelist recycles released pages in nonidentity logical order" {
+    const allocator = std.testing.allocator;
+    var manager = KvManager.init(allocator);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+    });
+    const first = try manager.attachSequence(pool_id);
+    try manager.appendTokens(first, 6);
+    try std.testing.expectEqualSlices(block.KvBlockId, &.{ 0, 1, 2 }, manager.blockTable(first).?.blocks.items);
+    try manager.releaseSequence(first);
+
+    const recycled = try manager.attachSequence(pool_id);
+    try manager.appendTokens(recycled, 6);
+    // releaseRef appends 0,1,2; acquire pops the freelist, so logical pages
+    // are validly owned but map to physical IDs in reverse order.
+    try std.testing.expectEqualSlices(block.KvBlockId, &.{ 2, 1, 0 }, manager.blockTable(recycled).?.blocks.items);
+}
+
 test "manager reuses released sequence slots" {
     const allocator = std.testing.allocator;
     var manager = KvManager.init(allocator);

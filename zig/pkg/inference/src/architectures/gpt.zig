@@ -26,6 +26,7 @@
 // - Gated FFN with SiLU (LLaMA, Mistral) vs plain FFN with GELU (GPT-2)
 
 const std = @import("std");
+const recent_prefill_query_capture = @import("../graph/recent_prefill_query_capture.zig");
 const is_freestanding = @import("builtin").os.tag == .freestanding;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -500,6 +501,74 @@ fn maybePrepareMetalQwen3VlDecoderOverrides(
     return buildMetalQwen3VlDecoderOverrides(config, configured_layer_count);
 }
 
+fn metalGemmaResidentFfnOverrides(
+    cb: *const ComputeBackend,
+    config: Config,
+    overrides: Layer0DecoderOverrides,
+) Layer0DecoderOverrides {
+    if (cb.kind() != .metal or !cb.residentGatedFfnFusionCandidate() or
+        !gemma4_runtime.isExactE4bDenseRuntimeConfig(config) or
+        config.num_hidden_layers > decoder_override_layer_capacity)
+        return overrides;
+    for (0..config.num_hidden_layers) |layer| {
+        // Never replace an explicit caller-owned FFN namespace.
+        if (overrides.ffn_norm_slots[layer] != null or overrides.mlp_gate_slots[layer] != null or
+            overrides.mlp_up_slots[layer] != null or overrides.mlp_sub_norm_slots[layer] != null or
+            overrides.mlp_down_slots[layer] != null)
+            return overrides;
+        // Production weights-only preparation installs norms before the three
+        // linears for every layer. Requiring all 42 linear triples is therefore
+        // an atomic ready marker: a partial preparation cannot activate any
+        // override cohort.
+        if (!cb.decoderRuntimeLinearSlotPrepared(decoder_gated_runtime.linearSlot(layer, .mlp_gate), config.hidden_size, config.intermediateSize(layer)) or
+            !cb.decoderRuntimeLinearSlotPrepared(decoder_gated_runtime.linearSlot(layer, .mlp_up), config.hidden_size, config.intermediateSize(layer)) or
+            !cb.decoderRuntimeLinearSlotPrepared(decoder_gated_runtime.linearSlot(layer, .mlp_down), config.intermediateSize(layer), config.hidden_size))
+            return overrides;
+    }
+    return buildMetalGemmaResidentFfnOverrides(config, overrides);
+}
+
+fn buildMetalGemmaResidentFfnOverrides(config: Config, overrides: Layer0DecoderOverrides) Layer0DecoderOverrides {
+    var result = overrides;
+    for (0..config.num_hidden_layers) |layer| {
+        result.ffn_norm_slots[layer] = decoder_gated_runtime.normSlot(layer, .ffn_pre);
+        result.mlp_gate_slots[layer] = decoder_gated_runtime.linearSlot(layer, .mlp_gate);
+        result.mlp_up_slots[layer] = decoder_gated_runtime.linearSlot(layer, .mlp_up);
+        result.mlp_sub_norm_slots[layer] = decoder_gated_runtime.normSlot(layer, .ffn_post);
+        result.mlp_down_slots[layer] = decoder_gated_runtime.linearSlot(layer, .mlp_down);
+    }
+    return result;
+}
+
+test "context Metal Gemma resident FFN overrides use stable weighted slot namespace only" {
+    const config: Config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .vocab_size = 262144,
+        .ple_hidden_size = 256,
+        .num_kv_shared_layers = 18,
+        .intermediate_size = 10240,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+    };
+    try std.testing.expect(gemma4_runtime.isExactE4bDenseRuntimeConfig(config));
+    const got = buildMetalGemmaResidentFfnOverrides(config, .{});
+    inline for (.{ 0, 17, 41 }) |layer| {
+        try std.testing.expectEqual(@as(?usize, decoder_gated_runtime.normSlot(layer, .ffn_pre)), got.ffn_norm_slots[layer]);
+        try std.testing.expectEqual(@as(?usize, decoder_gated_runtime.linearSlot(layer, .mlp_gate)), got.mlp_gate_slots[layer]);
+        try std.testing.expectEqual(@as(?usize, decoder_gated_runtime.linearSlot(layer, .mlp_up)), got.mlp_up_slots[layer]);
+        try std.testing.expectEqual(@as(?usize, decoder_gated_runtime.normSlot(layer, .ffn_post)), got.mlp_sub_norm_slots[layer]);
+        try std.testing.expectEqual(@as(?usize, decoder_gated_runtime.linearSlot(layer, .mlp_down)), got.mlp_down_slots[layer]);
+        try std.testing.expectEqual(@as(?usize, null), got.attn_q_slots[layer]);
+        try std.testing.expectEqual(@as(?usize, null), got.attn_out_proj_linear_slots[layer]);
+    }
+}
+
 pub const GreedyDeviceTokenResult = struct {
     token_id: usize,
     token_tensor: ?CT = null,
@@ -646,6 +715,9 @@ pub const DecodeContext = struct {
     /// Qualification/selection-only capture of actual post-RoPE queries.
     /// Implementations retain at most `horizon` rows per donor consumer.
     selection_query_capture: ?SelectionQueryCapture = null,
+    /// Borrowed compiled-prefill-only GPU capture descriptor. Generic GPT
+    /// execution does not consume this seam.
+    recent_prefill_query_capture: ?recent_prefill_query_capture.Descriptor = null,
     input_ids: ?[]const i64 = null,
     /// Qwen3-VL query positions in axis-major temporal/height/width order.
     /// The slice covers exactly the current query tokens, not the resident KV
@@ -3359,7 +3431,7 @@ fn forwardFinalHiddenWithSharedKvOutput(
         decode_context,
         trace_sink,
     );
-    const effective_overrides = try maybePrepareMetalQwen3VlDecoderOverrides(
+    const qwen_overrides = try maybePrepareMetalQwen3VlDecoderOverrides(
         cb,
         allocator,
         config,
@@ -3368,6 +3440,9 @@ fn forwardFinalHiddenWithSharedKvOutput(
         decode_context,
         trace_sink,
     );
+    // These attention overrides may own tensors. FFN slot identifiers are
+    // selected after the relevant Metal frame has opened below.
+    var effective_overrides = qwen_overrides;
     var layer0_attn_norm_pending = effective_overrides.attn_norm;
     var layer0_fused_qkv_pending = effective_overrides.fused_qkv;
     var layer0_q_pending = effective_overrides.q;
@@ -3483,6 +3558,9 @@ fn forwardFinalHiddenWithSharedKvOutput(
             }
         }
     }
+    // Resident FFN admission requires the authenticated active frame. GPT can
+    // own that frame itself, so select its FFN slots after frame acquisition.
+    effective_overrides = metalGemmaResidentFfnOverrides(cb, config, effective_overrides);
     const prefill_stream_layers: usize = if (comptime build_options.enable_metal) blk: {
         const layers = metal_compute_mod.MetalCompute.lightOnPrefillStreamLayers(cb);
         break :blk if (lightOnPrefillSplitEligible(config, batch, query_seq_len, decode_context != null and decode_context.?.attention_mode == .paged_prefill, owns_qwen3vl_forward_frame, layers) and trace_sink == null and
@@ -3585,6 +3663,20 @@ fn forwardFinalHiddenWithSharedKvOutput(
         }
         const num_kv_heads = config.effectiveKVHeadsForLayer(layer);
         const head_dim = config.effectiveHeadDimForLayer(layer);
+        var attention_match_layer_scope = false;
+        defer if (attention_match_layer_scope) {
+            if (comptime build_options.enable_metal) {
+                const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+                compute.endAttentionMatchForwardLayerScope(true);
+            }
+        };
+        if (comptime build_options.enable_metal) if (owns_attention_match_forward_frame) {
+            const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            if (compute.attentionMatchExecution().resident_gated_ffn_fusion) {
+                attention_match_layer_scope = try compute.beginAttentionMatchForwardLayerScope(layer);
+                if (!attention_match_layer_scope) return error.ContextFramedExecutionUnsupported;
+            }
+        };
         const block_hidden = try decoderBlock(
             cb,
             allocator,
@@ -3605,6 +3697,11 @@ fn forwardFinalHiddenWithSharedKvOutput(
             layer0_v_pending,
             trace_sink,
         );
+        if (comptime build_options.enable_metal) if (attention_match_layer_scope) {
+            const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            compute.endAttentionMatchForwardLayerScope(true);
+            attention_match_layer_scope = false;
+        };
         var new_hidden = block_hidden;
         var owns_new_hidden = new_hidden != hidden;
         errdefer if (owns_new_hidden) cb.free(new_hidden);
@@ -6394,7 +6491,15 @@ fn finishGemmaDenseNoPleFfnTail(
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_norm", layer, ffn_normed, hidden_size);
 
     const ffn_started_at = monotonicNowNs();
-    if (!disableDecoderRuntimeActivationDebug() and mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null and mlp_sub_norm_slot != null) {
+    const exact_e4 = gemma4_runtime.isExactE4bDenseRuntimeConfig(config);
+    const resident_ffn = gemmaResidentFfnRequestPolicy(
+        mlp_sub_norm_slot,
+        if (exact_e4) gemma4_runtime.normSlot(layer, .ffn_post) else null,
+        cb.residentGatedFfnFusionCandidate(),
+        exact_e4,
+        total,
+    );
+    if (!disableDecoderRuntimeActivationDebug() and mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null and resident_ffn.post_down_norm_slot != null) {
         const ffn_output_scale = if (config.hasPle() or branchGemma4LayerOutputScaleDebug())
             null
         else
@@ -6406,12 +6511,13 @@ fn finishGemmaDenseNoPleFfnTail(
             .down_linear_slot = mlp_down_slot.?,
             .input = ffn_normed,
             .residual = sa_out,
-            .post_down_rms_norm_slot = mlp_sub_norm_slot,
+            .post_down_rms_norm_slot = resident_ffn.post_down_norm_slot,
             .output_scale = ffn_output_scale,
             .hidden_size = hidden_size,
             .intermediate_size = config.intermediateSize(layer),
             .eps = config.norm_eps,
             .activation = decoderRuntimeActivationKind(config.activation),
+            .resident_e4_prefill_m64 = resident_ffn.resident_e4_prefill_m64,
         })) |ffn_residual| {
             debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-residual", ffn_residual, hidden_size);
@@ -7693,10 +7799,25 @@ fn decoderBlockImpl(
             var layer_result_output_scaled = false;
             const ffn_residual = residual_blk: {
                 const ffn_started_at = monotonicNowNs();
+                // The E4 eager block's semantic post-FFN norm is
+                // post_feedforward_layernorm, prepared before inference at
+                // gemma4_runtime.normSlot(layer, .ffn_post). The generic
+                // mlp_sub_norm override names a different optional weight and
+                // is null for this model. Never authorize the fused residual
+                // helper with a null post norm: that would skip required math.
+                const exact_e4 = gemma4_runtime.isExactE4bDenseRuntimeConfig(config);
+                const resident_ffn = gemmaResidentFfnRequestPolicy(
+                    mlp_sub_norm_slot,
+                    if (exact_e4) gemma4_runtime.normSlot(layer, .ffn_post) else null,
+                    cb.residentGatedFfnFusionCandidate(),
+                    exact_e4,
+                    total,
+                );
                 if (allowGemmaRmsNormAddResidualFusion(trace_sink) and
                     !disableDecoderRuntimeActivationDebug() and
                     (config.hasPle() or !branchGemma4LayerOutputScaleDebug()) and
-                    mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null)
+                    mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null and
+                    resident_ffn.post_down_norm_slot != null)
                 {
                     if (try cb.runGatedFfnResidual(&.{
                         .gate_linear_slot = mlp_gate_slot.?,
@@ -7704,11 +7825,12 @@ fn decoderBlockImpl(
                         .down_linear_slot = mlp_down_slot.?,
                         .input = ffn_normed,
                         .residual = sa_out,
-                        .post_down_rms_norm_slot = mlp_sub_norm_slot,
+                        .post_down_rms_norm_slot = resident_ffn.post_down_norm_slot,
                         .hidden_size = hidden_size,
                         .intermediate_size = config.intermediateSize(layer),
                         .eps = config.norm_eps,
                         .activation = decoderRuntimeActivationKind(config.activation),
+                        .resident_e4_prefill_m64 = resident_ffn.resident_e4_prefill_m64,
                     })) |fused| {
                         debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
                         break :residual_blk fused;
@@ -10394,6 +10516,93 @@ fn captureSelectionQueries(
     try capture.captureFn(capture.ctx, donor_layer, consumer_layer, first_position, num_heads, head_dim, values);
 }
 
+pub fn captureRecentPrefillQueries(
+    cb: *const ComputeBackend,
+    config: Config,
+    decode_context: ?*const DecodeContext,
+    q_rope: CT,
+    batch: usize,
+    donor_layer: usize,
+    consumer_layer: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !void {
+    const dc = decode_context orelse return;
+    const descriptor = dc.recent_prefill_query_capture orelse return;
+    try descriptor.validate();
+    if (donor_layer > std.math.maxInt(u32) or consumer_layer > std.math.maxInt(u32))
+        return error.InvalidRecentPrefillQueryCaptureDescriptor;
+    const donor: u32 = @intCast(donor_layer);
+    const consumer: u32 = @intCast(consumer_layer);
+    if (!descriptor.accepts(donor, consumer)) return;
+    if (config.layerUsesSlidingAttention(consumer_layer))
+        return error.InvalidRecentPrefillQueryConsumer;
+    if (batch != 1 or dc.isMixedBatch() or dc.packed_query_lengths != null or dc.mrope_positions != null)
+        return error.UnsupportedRecentPrefillQueryPositions;
+    if (dc.query_sequence_len == 0 or dc.total_sequence_len < dc.query_sequence_len)
+        return error.InvalidRecentPrefillQueryPosition;
+    if (dc.total_sequence_len > descriptor.logical_tokens)
+        return error.InvalidRecentPrefillQueryPosition;
+
+    const first = dc.total_sequence_len - dc.query_sequence_len;
+    if (!try recentPrefillCaptureChunkContainsHorizon(descriptor, first, dc.total_sequence_len)) return;
+    std.debug.print(
+        "recent-prefill-capture post-rope-q-hook donor={d} consumer={d} first={d} rows={d}\n",
+        .{ donor, consumer, first, dc.query_sequence_len },
+    );
+    if (dc.query_sequence_len > std.math.maxInt(u16) or num_heads > std.math.maxInt(u16) or head_dim > std.math.maxInt(u16))
+        return error.InvalidRecentPrefillQueryShape;
+    if (!try cb.encodeRecentPrefillQueryCapture(
+        descriptor,
+        q_rope,
+        consumer,
+        donor,
+        @intCast(first),
+        @intCast(dc.query_sequence_len),
+        @intCast(num_heads),
+        @intCast(head_dim),
+    )) return error.RecentPrefillQueryCaptureUnavailable;
+}
+
+fn recentPrefillCaptureChunkContainsHorizon(
+    descriptor: recent_prefill_query_capture.Descriptor,
+    first: usize,
+    end: usize,
+) !bool {
+    if (first > end or end > descriptor.logical_tokens)
+        return error.InvalidRecentPrefillQueryPosition;
+    const capture_first = descriptor.logical_tokens - @as(u32, descriptor.horizon);
+    if (end <= capture_first) return false;
+    if (first > capture_first or end != descriptor.logical_tokens)
+        return error.UnsupportedRecentPrefillQueryChunking;
+    return true;
+}
+
+test "recent prefill capture skips early chunks and rejects split final horizon" {
+    const Callbacks = struct {
+        fn accepts(_: *anyopaque, _: u32, _: u32) bool {
+            return true;
+        }
+        fn lastEncodedFrame(_: *anyopaque) u64 {
+            return 0;
+        }
+        fn encode(_: *anyopaque, _: recent_prefill_query_capture.EncodeRequest) anyerror!void {}
+        fn complete(_: *anyopaque, _: recent_prefill_query_capture.Completion) anyerror!void {}
+    };
+    const descriptor = recent_prefill_query_capture.Descriptor{
+        .context = @ptrFromInt(16),
+        .authority_epoch = 1,
+        .accepts_fn = Callbacks.accepts,
+        .last_encoded_frame_fn = Callbacks.lastEncodedFrame,
+        .encode_fn = Callbacks.encode,
+        .complete_fn = Callbacks.complete,
+    };
+    try std.testing.expect(!try recentPrefillCaptureChunkContainsHorizon(descriptor, 7680, 8064));
+    try std.testing.expect(try recentPrefillCaptureChunkContainsHorizon(descriptor, 7616, 8128));
+    try std.testing.expectError(error.UnsupportedRecentPrefillQueryChunking, recentPrefillCaptureChunkContainsHorizon(descriptor, 8000, 8100));
+    try std.testing.expectError(error.UnsupportedRecentPrefillQueryChunking, recentPrefillCaptureChunkContainsHorizon(descriptor, 8096, 8128));
+}
+
 fn selectionQueryCaptureRequested(
     decode_context: ?*const DecodeContext,
     sliding_attention: bool,
@@ -10628,6 +10837,15 @@ fn applyAttentionWithSink(
     // Mixed batch: per-item RoPE with different position offsets.
     const is_mixed = if (decode_context) |dc| dc.isMixedBatch() else false;
 
+    if (decode_context) |dc| if (dc.recent_prefill_query_capture) |descriptor| {
+        if (kv_layer_index > std.math.maxInt(u32) or layer > std.math.maxInt(u32))
+            return error.InvalidRecentPrefillQueryCaptureDescriptor;
+        if (descriptor.accepts(@intCast(kv_layer_index), @intCast(layer)) and
+            (config.position_encoding != .rope or is_mixed or batch != 1 or
+                config.isQwen3Vl() or (config.isQwen35() and dc.mrope_positions != null)))
+            return error.UnsupportedRecentPrefillQueryPositions;
+    };
+
     if (config.position_encoding == .rope) {
         if (config.isQwen3Vl() or (config.isQwen35() and decode_context != null and decode_context.?.mrope_positions != null)) {
             if (!config.hasQwen3VlArchitectureContract() and !config.hasQwen35VisionArchitectureContract()) return error.InvalidQwen3VlArchitectureContract;
@@ -10761,6 +10979,7 @@ fn applyAttentionWithSink(
         try maybeDebugLayerTensorLastRow(cb, std.heap.page_allocator, layer, "k_rope", K_rope, num_kv_heads * head_dim);
         try maybeDebugLayerTensor(cb, std.heap.page_allocator, layer, "q_rope", Q_rope);
         try maybeDebugLayerTensor(cb, std.heap.page_allocator, layer, "k_rope", K_rope);
+        try captureRecentPrefillQueries(cb, config, decode_context, Q_rope, batch, kv_layer_index, layer, num_heads, head_dim);
         if (!config.layerUsesSlidingAttention(layer))
             try captureSelectionQueries(cb, decode_context, Q_rope, kv_layer_index, layer, num_heads, head_dim);
         if (!sink_metadata.hasMetadata() and attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
@@ -13964,6 +14183,45 @@ pub fn decoderRuntimeActivationKind(activation: ActivationType) ops.DecoderRunti
         .relu => .relu,
         .relu_squared => .relu_squared,
     };
+}
+
+const GemmaResidentFfnRequestPolicy = struct {
+    post_down_norm_slot: ?usize,
+    resident_e4_prefill_m64: bool,
+};
+
+fn gemmaResidentFfnRequestPolicy(explicit_norm_slot: ?usize, prepared_e4_ffn_post_slot: ?usize, candidate: bool, exact_e4: bool, rows: usize) GemmaResidentFfnRequestPolicy {
+    return .{
+        // Legacy/V6 callers keep their explicit semantic slot. Only the
+        // authenticated exact-E4 resident route may substitute the prepared
+        // post_feedforward_layernorm slot when the generic override is absent.
+        .post_down_norm_slot = explicit_norm_slot orelse if (candidate and exact_e4) prepared_e4_ffn_post_slot else null,
+        // M64 is a multi-row source-prefill request. Row one must leave this
+        // false so the existing exact Q4 direct kernel remains reachable.
+        .resident_e4_prefill_m64 = candidate and exact_e4 and rows > 1,
+    };
+}
+
+test "context Gemma resident FFN request policy preserves explicit norm and scopes E4 M64" {
+    const explicit_v6 = gemmaResidentFfnRequestPolicy(7, null, false, true, 1);
+    try std.testing.expectEqual(@as(?usize, 7), explicit_v6.post_down_norm_slot);
+    try std.testing.expect(!explicit_v6.resident_e4_prefill_m64);
+
+    const row1 = gemmaResidentFfnRequestPolicy(null, 11, true, true, 1);
+    try std.testing.expectEqual(@as(?usize, 11), row1.post_down_norm_slot);
+    try std.testing.expect(!row1.resident_e4_prefill_m64);
+    inline for (.{ 448, 511, 512 }) |rows| {
+        const multi = gemmaResidentFfnRequestPolicy(null, 11, true, true, rows);
+        try std.testing.expectEqual(@as(?usize, 11), multi.post_down_norm_slot);
+        try std.testing.expect(multi.resident_e4_prefill_m64);
+    }
+
+    const e2 = gemmaResidentFfnRequestPolicy(null, 11, true, false, 512);
+    try std.testing.expectEqual(@as(?usize, null), e2.post_down_norm_slot);
+    try std.testing.expect(!e2.resident_e4_prefill_m64);
+    const no_candidate = gemmaResidentFfnRequestPolicy(null, 11, false, true, 512);
+    try std.testing.expectEqual(@as(?usize, null), no_candidate.post_down_norm_slot);
+    try std.testing.expect(!no_candidate.resident_e4_prefill_m64);
 }
 
 fn applyReluSquared(cb: *const ComputeBackend, input: CT) !CT {

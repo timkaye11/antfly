@@ -29,6 +29,37 @@ import attention_matching_calibrate as am
 import metal_attention_matching_qualify as metal
 import numpy as np
 import release_attention_matching as release
+
+
+def full_ttft(variant, identity, ttft_ms):
+    names = sorted(release.FULL_TTFT_PHASES[variant])
+    start, total = 1_000_000_000, int(ttft_ms * 1e6)
+    phases, cursor = [], start
+    for index, name in enumerate(names):
+        end = start + total if index + 1 == len(names) else start + total * (index + 1) // len(names)
+        phases.append({"name": name, "start_ns": cursor, "end_ns": end,
+                       "authority": "client_monotonic_boundary"})
+        cursor = end
+    return {"schema": "antfly.attention-matching-full-ttft-attempt.v1", "clock": "posix_CLOCK_MONOTONIC",
+            "timing_scope": "full_request_pipeline_to_first_public_content",
+            "outer_start_ns": start, "first_public_content_ns": start + total,
+            "first_public_content_kind": "nonempty_public_delta", "phases": phases,
+            "fresh_owner_id": "owner-" + identity, "fresh_artifact_id": "artifact-" + identity,
+            "restore_ttft_ms": min(1.0, ttft_ms) if variant == "attention_matching" else None}
+
+
+def set_full_ttft_ms(row, ttft_ms):
+    """Mutate the synthetic value and its authoritative clock together."""
+    row["ttft_ms"] = ttft_ms
+    authority = row["full_ttft_authority"]
+    start, total = authority["outer_start_ns"], int(ttft_ms * 1e6)
+    cursor = start
+    for index, phase in enumerate(authority["phases"]):
+        end = start + total if index + 1 == len(authority["phases"]) else \
+            start + total * (index + 1) // len(authority["phases"])
+        phase["start_ns"], phase["end_ns"] = cursor, end
+        cursor = end
+    authority["first_public_content_ns"] = start + total
 import release_build_fixture
 import test_attention_matching_calibrate as calibration_fixtures
 
@@ -180,6 +211,9 @@ class RawEvidenceTests(unittest.TestCase):
             variants["attention_matching"].update(ttft_ms=120.0, decode_tokens_per_second=95.0,
                                                    committed_context_bytes=7000, published=True,
                                                    exact_fallback=False)
+            for variant, value in variants.items():
+                value["full_ttft_authority"] = full_ttft(
+                    variant, f"{prefix}-{index}-{variant}", value["ttft_ms"])
             return {"pair_id": f"{prefix}-{index}",
                     "prompt_sha256": self.digest(f"prompt-{prefix}-{index}"),
                     "settings_sha256": self.digest("shared-generation-settings"),
@@ -427,8 +461,8 @@ class RawEvidenceTests(unittest.TestCase):
 
         perf = self.evidence("performance")
         for row in perf["samples"]:
-            row["packed_exact"]["ttft_ms"] = 104.9
-            row["attention_matching"]["ttft_ms"] = 129.9
+            set_full_ttft_ms(row["packed_exact"], 104.9)
+            set_full_ttft_ms(row["attention_matching"], 129.9)
         with self.assertRaisesRegex(ValueError, "attention-matching TTFT regression"):
             release.performance_contract(perf, *args)
 

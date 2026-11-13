@@ -28,6 +28,21 @@ const replay = @import("model_replay_context.zig");
 const attention = @import("context_kernels.zig");
 const fitter = @import("context_compaction.zig");
 const native_fitter = @import("context_attention_match.zig");
+
+fn committedOwnerAppendCount(global: []const bool, sliding: []const bool) u64 {
+    var count: u64 = 0;
+    for (global) |appended| {
+        if (appended) count += 1;
+    }
+    for (sliding) |appended| {
+        if (appended) count += 1;
+    }
+    return count;
+}
+
+test "packed committed owner append accounting excludes shared consumers" {
+    try std.testing.expectEqual(@as(u64, 3), committedOwnerAppendCount(&.{ true, false, true }, &.{ false, true }));
+}
 const shared = @import("metal_generated_kernels.zig");
 const mr = @import("metal_runtime.zig");
 const execution = @import("../execution_control.zig");
@@ -52,6 +67,58 @@ pub const OwnerReleaseReceipt = struct {
     physical_available: bool = false,
     post_release_live_bytes: u64 = 0,
 };
+pub const ExactKvOwnerComparison = struct {
+    layer: u32 = 0,
+    rows: u32 = 0,
+    heads: u32 = 0,
+    head_dim: u32 = 0,
+    global: bool = false,
+    key_mismatches: u64 = 0,
+    value_mismatches: u64 = 0,
+    key_max_absolute_delta: f64 = 0,
+    value_max_absolute_delta: f64 = 0,
+    key_rmse: f64 = 0,
+    value_rmse: f64 = 0,
+};
+pub const CompiledExactKvComparison = struct {
+    owners: [24]ExactKvOwnerComparison,
+    compared_owners: u32,
+    compared_heads: u32,
+    compared_rows: u64,
+    compared_values_per_kind: u64,
+    total_key_mismatches: u64,
+    total_value_mismatches: u64,
+    all_f16_identical: bool,
+};
+
+fn importedPhysicalRow(global: bool, position: u64, source_start: u64, row: usize, capacity: usize) !usize {
+    if (capacity == 0 or position != source_start + row) return error.InvalidExactKvComparisonSource;
+    return if (global) row else @intCast(position % capacity);
+}
+
+fn uniqueCheckpointDonorIndex(donors: []const @import("../runtime/kv/attention_match_checkpoint.zig").Donor, layer: usize) !usize {
+    var found: ?usize = null;
+    const target = std.math.cast(u32, layer) orelse return error.InvalidExactKvComparisonSource;
+    for (donors, 0..) |donor, index| if (donor.layer == target) {
+        if (found != null) return error.InvalidExactKvComparisonSource;
+        found = index;
+    };
+    return found orelse error.InvalidExactKvComparisonSource;
+}
+
+test "compiled AFKV comparison validates global and wrapped sliding row maps" {
+    try std.testing.expectEqual(@as(usize, 7), try importedPhysicalRow(true, 7, 0, 7, 8128));
+    try std.testing.expectEqual(@as(usize, 1984), try importedPhysicalRow(false, 6080, 6080, 0, 2048));
+    try std.testing.expectEqual(@as(usize, 0), try importedPhysicalRow(false, 6144, 6080, 64, 2048));
+    try std.testing.expectError(error.InvalidExactKvComparisonSource, importedPhysicalRow(false, 6081, 6080, 0, 2048));
+}
+
+test "compiled AFKV comparison requires one checkpoint donor per owner layer" {
+    const Donor = @import("../runtime/kv/attention_match_checkpoint.zig").Donor;
+    try std.testing.expectEqual(@as(usize, 1), try uniqueCheckpointDonorIndex(&.{ Donor{ .layer = 3 }, Donor{ .layer = 7 } }, 7));
+    try std.testing.expectError(error.InvalidExactKvComparisonSource, uniqueCheckpointDonorIndex(&.{Donor{ .layer = 3 }}, 7));
+    try std.testing.expectError(error.InvalidExactKvComparisonSource, uniqueCheckpointDonorIndex(&.{ Donor{ .layer = 7 }, Donor{ .layer = 7 } }, 7));
+}
 pub const CommittedContextStorageDiagnostic = struct {
     diagnostic_only: bool = true,
     /// Compatibility alias for total_owner_count.
@@ -66,6 +133,119 @@ fn fingerprintU32(hash: *std.crypto.hash.sha2.Sha256, value: u32) void {
     var bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &bytes, value, .little);
     hash.update(&bytes);
+}
+
+const FakeCompiledImport = struct {
+    const Mode = enum { success, provider_error, unfenced, short, short_bytes, cancel_after };
+    mode: Mode = .success,
+    calls: usize = 0,
+    source_mutations: usize = 0,
+    reported_host_staging_bytes: ?usize = null,
+    stop: *std.atomic.Value(bool),
+    fn write(_: *anyopaque, _: @import("../runtime/kv/storage_runtime.zig").KvSuffixWrite, _: @import("../runtime/kv/storage_runtime.zig").DeviceKvRef, _: @import("../runtime/kv/storage_runtime.zig").DeviceKvRef) anyerror!void {
+        return error.Unsupported;
+    }
+    fn deinit(_: *anyopaque, _: std.mem.Allocator) void {}
+    fn exportRanges(raw: *anyopaque, authority: @import("../runtime/kv/storage_runtime.zig").ExactLayerRangeSourceAuthority, ranges: []const @import("../runtime/kv/storage_runtime.zig").ExactLayerRangeExport, max_bytes: usize, check_ctx: ?*anyopaque, check_fn: ?*const fn (?*anyopaque) anyerror!void) anyerror!@import("../runtime/kv/storage_runtime.zig").ExactLayerRangeExportResult {
+        const self: *FakeCompiledImport = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        try authority.validate();
+        try std.testing.expectEqual(@as(usize, 42), ranges.len);
+        for (ranges, 0..) |range, layer| {
+            try std.testing.expectEqual(@as(u32, @intCast(layer)), range.layer_index);
+            if (layer % 2 == 0) {
+                try std.testing.expectEqual(.head_major, range.destination_layout);
+                try std.testing.expectEqual(@as(usize, 0), range.source_start);
+            } else {
+                try std.testing.expectEqual(.token_major_ring, range.destination_layout);
+                try std.testing.expectEqual(@as(usize, 4), range.source_start);
+                try std.testing.expectEqual(@as(usize, 4), range.rows);
+            }
+        }
+        if (check_fn) |f| try f(check_ctx);
+        if (self.mode == .provider_error) return error.OutOfMemory;
+        if (self.mode == .cancel_after) self.stop.store(true, .release);
+        const copied_bytes = try (@import("../runtime/kv/storage_runtime.zig").ExactLayerRangeExportRequest{
+            .source_sequence = authority.source_sequence,
+            .expected_written_tokens = authority.logical_tokens,
+            .ranges = ranges,
+            .max_bytes = max_bytes,
+        }).validate();
+        return .{
+            .copied_bytes = copied_bytes - @as(usize, @intFromBool(self.mode == .short_bytes)),
+            .layers = ranges.len - @as(usize, @intFromBool(self.mode == .short)),
+            .fenced = self.mode != .unfenced,
+            .peak_host_staging_bytes = self.reported_host_staging_bytes,
+        };
+    }
+    fn exporter(self: *@This()) @import("../runtime/kv/storage_runtime.zig").ExactLayerRangeExporter {
+        return .{ .ctx = self, .export_fn = exportRanges };
+    }
+    fn check(raw: ?*anyopaque) anyerror!void {
+        const stop: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
+        if (stop.load(.acquire)) return error.Cancelled;
+    }
+};
+
+fn compiledImportTestConfig(lease: *execution_pool.Lease, stop: *const std.atomic.Value(bool)) !Config {
+    var layout = policy.Layout{ .len = 42 };
+    for (layout.layers[0..layout.len], 0..) |*layer, i| layer.* = .{ .owner = @intCast(i), .sliding_window = if (i % 2 == 0) 0 else 4, .kv_heads = 1, .query_heads = 1, .head_dim = 8, .rope_active_dim = 8, .rope_frequency_dim = 8, .rope_theta = 10000 };
+    var cfg = Config{ .plan = try (policy.Policy{}).admit(16, null, 8, 1, 0), .layout = layout, .max_query_rows = 1, .physical_budget_bytes = 0, .execution_lease = lease, .cancelled = stop };
+    cfg.physical_budget_bytes = (try allocation(cfg)).physical_bytes;
+    return cfg;
+}
+
+test "compiled exact import fake hook publishes atomically and poisons failed fenced contracts" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    var pool = try execution_pool.Pool.init(981, execution_pool.admitted_backend_bytes);
+    defer pool.deinit();
+    try pool.warm(null);
+    var lease = try pool.acquire(981);
+    defer if (lease.pool != null) lease.poisonAndRelease();
+    const digest: [32]u8 = @splat(7);
+    inline for (.{ FakeCompiledImport.Mode.success, .provider_error, .unfenced, .short, .short_bytes, .cancel_after }) |mode| {
+        var stop = std.atomic.Value(bool).init(false);
+        var fake = FakeCompiledImport{ .mode = mode, .stop = &stop };
+        var session = try Session.init(std.testing.allocator, try compiledImportTestConfig(&lease, &stop));
+        const authority = @import("../runtime/kv/storage_runtime.zig").ExactLayerRangeSourceAuthority{ .model_weights_sha256 = digest, .model_identity_layout_sha256 = digest, .context_layout_sha256 = try policy.layoutDigest(session.config.layout), .token_stream_sha256 = digest, .source_revision = 3, .source_sequence = 9, .logical_tokens = 8 };
+        const request = Session.CompiledExactImportRequest{ .source = fake.exporter(), .source_authority = authority, .expected_tokens = 8, .model_sha256 = digest, .layout_sha256 = digest, .token_sha256 = digest, .max_copy_bytes = 42 * 8 * 8 * 2 * 2, .check_ctx = &stop, .check_fn = FakeCompiledImport.check };
+        if (mode == .success) {
+            const receipt = try session.importCompiledExact(request);
+            try std.testing.expect(receipt.fenced and session.logical_tokens == 8 and !session.failed);
+            // Fake exporters retain legacy unknown staging unless they opt in.
+            try std.testing.expectEqual(@as(?usize, null), receipt.peak_host_staging_bytes);
+            try std.testing.expect(session.globals[0].ready);
+            try std.testing.expectEqual(@as(u32, 8), session.globals[0].plan.spans[0].logical_count);
+            try std.testing.expectEqual(@as(u32, 4), session.sliding[0].spans[0].logical_start);
+        } else {
+            _ = session.importCompiledExact(request) catch {};
+            try std.testing.expect(session.failed);
+        }
+        try std.testing.expectEqual(@as(usize, 0), fake.source_mutations);
+        session.deinit();
+    }
+    var stop = std.atomic.Value(bool).init(false);
+    var fake = FakeCompiledImport{ .stop = &stop };
+    var session = try Session.init(std.testing.allocator, try compiledImportTestConfig(&lease, &stop));
+    defer session.deinit();
+    stop.store(true, .release);
+    _ = session.importCompiledExact(.{ .source = fake.exporter(), .source_authority = .{ .model_weights_sha256 = digest, .model_identity_layout_sha256 = digest, .context_layout_sha256 = try policy.layoutDigest(session.config.layout), .token_stream_sha256 = digest, .source_revision = 3, .source_sequence = 9, .logical_tokens = 8 }, .expected_tokens = 8, .model_sha256 = digest, .layout_sha256 = digest, .token_sha256 = digest, .max_copy_bytes = 1, .check_ctx = &stop, .check_fn = FakeCompiledImport.check }) catch {};
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    stop.store(false, .release);
+    var measured_fake = FakeCompiledImport{ .stop = &stop, .reported_host_staging_bytes = 0 };
+    var measured = try Session.init(std.testing.allocator, try compiledImportTestConfig(&lease, &stop));
+    const measured_authority = @import("../runtime/kv/storage_runtime.zig").ExactLayerRangeSourceAuthority{ .model_weights_sha256 = digest, .model_identity_layout_sha256 = digest, .context_layout_sha256 = try policy.layoutDigest(measured.config.layout), .token_stream_sha256 = digest, .source_revision = 3, .source_sequence = 9, .logical_tokens = 8 };
+    const measured_receipt = try measured.importCompiledExact(.{ .source = measured_fake.exporter(), .source_authority = measured_authority, .expected_tokens = 8, .model_sha256 = digest, .layout_sha256 = digest, .token_sha256 = digest, .max_copy_bytes = 42 * 8 * 8 * 2 * 2, .max_host_staging_bytes = 1, .check_ctx = &stop, .check_fn = FakeCompiledImport.check });
+    try std.testing.expectEqual(@as(?usize, 0), measured_receipt.peak_host_staging_bytes);
+    measured.deinit();
+
+    var over_fake = FakeCompiledImport{ .stop = &stop, .reported_host_staging_bytes = 2 };
+    var over = try Session.init(std.testing.allocator, try compiledImportTestConfig(&lease, &stop));
+    const over_authority = @import("../runtime/kv/storage_runtime.zig").ExactLayerRangeSourceAuthority{ .model_weights_sha256 = digest, .model_identity_layout_sha256 = digest, .context_layout_sha256 = try policy.layoutDigest(over.config.layout), .token_stream_sha256 = digest, .source_revision = 3, .source_sequence = 9, .logical_tokens = 8 };
+    try std.testing.expectError(error.CompiledExactImportHostStagingBudgetExceeded, over.importCompiledExact(.{ .source = over_fake.exporter(), .source_authority = over_authority, .expected_tokens = 8, .model_sha256 = digest, .layout_sha256 = digest, .token_sha256 = digest, .max_copy_bytes = 42 * 8 * 8 * 2 * 2, .max_host_staging_bytes = 1, .check_ctx = &stop, .check_fn = FakeCompiledImport.check }));
+    try std.testing.expect(over.failed);
+    over.deinit();
 }
 
 fn fingerprintU64(hash: *std.crypto.hash.sha2.Sha256, value: u64) void {
@@ -236,6 +416,11 @@ pub const Config = struct {
 };
 pub const Allocation = struct {
     physical_bytes: usize = 0,
+    /// Complete backend peak when singleton decode sealing is requested.
+    /// The reduced sliding rings coexist with the prefill rings until every
+    /// copy has completed, preserving atomic publication on failure.
+    execution_peak_bytes: usize = 0,
+    singleton_decode_staging_bytes: usize = 0,
     global_bytes: usize = 0,
     sliding_bytes: usize = 0,
     decode_scratch_bytes: usize = 0,
@@ -298,6 +483,15 @@ pub fn allocation(config: Config) !Allocation {
             const elements = @as(u64, try ringCapacity(config, i)) * l.head_dim * l.kv_heads;
             if (elements > std.math.maxInt(u32)) return error.InvalidContextLayout;
             result.sliding_bytes = try std.math.add(usize, result.sliding_bytes, 2 * try rounded(@intCast(elements * 2)));
+            if (config.optimize_decode) {
+                const singleton_elements = @as(u64, l.sliding_window) * l.head_dim * l.kv_heads;
+                if (singleton_elements > std.math.maxInt(u32)) return error.InvalidContextLayout;
+                result.singleton_decode_staging_bytes = try std.math.add(
+                    usize,
+                    result.singleton_decode_staging_bytes,
+                    2 * try rounded(@intCast(singleton_elements * @sizeOf(f16))),
+                );
+            }
             result.sliding_owners += 1;
         }
     }
@@ -313,6 +507,7 @@ pub fn allocation(config: Config) !Allocation {
     result.physical_bytes = try std.math.add(usize, result.global_bytes, result.sliding_bytes);
     result.physical_bytes = try std.math.add(usize, result.physical_bytes, result.backend_control_bytes);
     result.physical_bytes = try std.math.add(usize, result.physical_bytes, records + try rounded((result.global_owners + result.sliding_owners) * @sizeOf(replay.Origin)));
+    result.execution_peak_bytes = try std.math.add(usize, result.physical_bytes, result.singleton_decode_staging_bytes);
     return result;
 }
 const Ring = struct {
@@ -337,6 +532,33 @@ const Ring = struct {
         }
     }
 };
+const RingCopySpan = struct { source_row: u32, destination_row: u32, rows: u32 };
+fn singletonRingCopySpans(logical: u32, source_capacity: u32, window: u32, out: *[4]RingCopySpan) ![]const RingCopySpan {
+    if (window == 0 or source_capacity < window or logical < window) return error.InvalidContextLayout;
+    const start = logical - window;
+    var copied: u32 = 0;
+    var count: usize = 0;
+    while (copied < window) {
+        if (count == out.len) return error.InvalidContextLayout;
+        const source = (start + copied) % source_capacity;
+        const destination = (start + copied) % window;
+        const rows = @min(window - copied, @min(source_capacity - source, window - destination));
+        out[count] = .{ .source_row = source, .destination_row = destination, .rows = rows };
+        count += 1;
+        copied += rows;
+    }
+    return out[0..count];
+}
+fn copyRingRows(runtime: *mr.RawMetalDecodeRuntime, source: Ring, destination: Ring, row_bytes: usize, logical: u32, window: u32) !void {
+    var copy_spans: [4]RingCopySpan = undefined;
+    for (try singletonRingCopySpans(logical, source.capacity, window, &copy_spans)) |span| {
+        const source_offset = try std.math.mul(usize, span.source_row, row_bytes);
+        const destination_offset = try std.math.mul(usize, span.destination_row, row_bytes);
+        const bytes = try std.math.mul(usize, span.rows, row_bytes);
+        if (mr.termite_metal_buffer_copy_pair(runtime, source.keys.handle, source_offset, destination.keys.handle, destination_offset, bytes, source.values.handle, source_offset, destination.values.handle, destination_offset, bytes) != 0)
+            return error.MetalBufferCopyFailed;
+    }
+}
 
 pub const ExactBlockCapture = struct {
     layer: u32,
@@ -426,8 +648,12 @@ pub const Session = struct {
     split_decode_dispatches: u64 = 0,
     flash_prefill_dispatches: u64 = 0,
     framed_attention_dispatches: u64 = 0,
+    /// Physical owner K/V appends committed by successful frames. Shared donor
+    /// consumers do not increment this counter; rolled-back frames never do.
+    committed_owner_appends: u64 = 0,
     pending_frame_runtime: ?*mr.RawMetalDecodeRuntime = null,
     pending_epoch: u64 = 0,
+    pending_submission_epoch: u64 = 0,
     pending_start: u32 = 0,
     pending_rows: u32 = 0,
     pending_global_appended: [256]bool = @splat(false),
@@ -438,6 +664,205 @@ pub const Session = struct {
     pending_ring_lens: [256]u32 = @splat(0),
     pending_split_dispatches: u64 = 0,
     pending_flash_dispatches: u64 = 0,
+    singleton_decode_sealed: bool = false,
+    singleton_decode_seal_evidence: SingletonDecodeSealEvidence = .{},
+
+    pub const SingletonDecodeSealEvidence = struct {
+        requested: bool = false,
+        executed: bool = false,
+        reduced: bool = false,
+        capacity_rows_before: u64 = 0,
+        capacity_rows_after: u64 = 0,
+        physical_kv_bytes_before: u64 = 0,
+        physical_kv_bytes_after: u64 = 0,
+    };
+
+    pub fn singletonDecodeSealEvidence(self: *const Session) SingletonDecodeSealEvidence {
+        return self.singleton_decode_seal_evidence;
+    }
+
+    pub const CompiledExactImportRequest = struct {
+        source: @import("../runtime/kv/storage_runtime.zig").ExactLayerRangeExporter,
+        source_authority: @import("../runtime/kv/storage_runtime.zig").ExactLayerRangeSourceAuthority,
+        expected_tokens: u32,
+        expected_position_offset: usize = 0,
+        model_sha256: [32]u8,
+        layout_sha256: [32]u8,
+        token_sha256: [32]u8,
+        max_copy_bytes: usize,
+        max_host_staging_bytes: usize = std.math.maxInt(usize),
+        check_ctx: ?*anyopaque = null,
+        check_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+        fn check(self: @This()) !void {
+            if (self.check_fn) |f| try f(self.check_ctx);
+            try self.source_authority.validate();
+            if (self.source_authority.logical_tokens != self.expected_tokens or
+                !std.mem.eql(u8, &self.source_authority.model_weights_sha256, &self.model_sha256) or
+                !std.mem.eql(u8, &self.source_authority.model_identity_layout_sha256, &self.layout_sha256) or
+                !std.mem.eql(u8, &self.source_authority.token_stream_sha256, &self.token_sha256) or
+                std.mem.allEqual(u8, &self.model_sha256, 0)) return error.InvalidCompiledExactImportAuthority;
+            if (self.max_copy_bytes == 0 or self.max_host_staging_bytes == 0)
+                return error.InvalidCompiledExactImportAuthority;
+        }
+    };
+    pub const CompiledExactImportReceipt = struct { copied_bytes: usize, peak_host_staging_bytes: ?usize, owners: usize, logical_tokens: u32, source_unchanged: bool, fenced: bool };
+
+    pub fn importCompiledExact(self: *Session, request: CompiledExactImportRequest) !CompiledExactImportReceipt {
+        const sr = @import("../runtime/kv/storage_runtime.zig");
+        if (!self.mutex.tryLock()) return error.ContextTransactionBusy;
+        defer self.mutex.unlock();
+        try request.check();
+        const destination_layout_sha256 = try policy.layoutDigest(self.config.layout);
+        if (!std.mem.eql(u8, &request.source_authority.context_layout_sha256, &destination_layout_sha256))
+            return error.InvalidCompiledExactImportLayout;
+        try self.check();
+        if (self.config.layout.len != 42 or request.expected_tokens == 0 or request.expected_tokens > self.config.plan.logical_token_limit or self.logical_tokens != 0 or self.next_layer != 0 or self.pending_frame_runtime != null or self.publication.pending or self.publication.readers != 0 or self.frozen or self.failed) return error.InvalidCompiledExactImportState;
+        var ranges: [256]sr.ExactLayerRangeExport = undefined;
+        var count: usize = 0;
+        for (self.config.layout.layers[0..self.config.layout.len], 0..) |shape, layer| {
+            if (shape.owner != layer) continue;
+            if (count == ranges.len) return error.InvalidContextLayout;
+            if (shape.sliding_window == 0) {
+                const g = &self.globals[self.owner_indices[layer]];
+                if (g.ready or !g.ingesting_empty or g.plan.heads.len != shape.kv_heads) return error.InvalidCompiledExactImportState;
+                const capacity = g.plan.heads[0].capacity_rows;
+                for (g.plan.heads) |head| if (head.capacity_rows != capacity) return error.InvalidContextLayout;
+                if (capacity < request.expected_tokens) return error.ContextRetainedBudgetExceeded;
+                const kr = g.keys.ref();
+                const vr = g.values.ref();
+                ranges[count] = .{ .layer_index = @intCast(layer), .source_start = 0, .rows = request.expected_tokens, .num_kv_heads = shape.kv_heads, .head_dim = shape.head_dim, .destination_layout = .head_major, .destination_head_capacity_rows = capacity, .destination_k = .{ .handle = kr.handle, .byte_offset = kr.offset, .byte_len = kr.bytes }, .destination_v = .{ .handle = vr.handle, .byte_offset = vr.offset, .byte_len = vr.bytes } };
+            } else {
+                const ring = &self.sliding[self.owner_indices[layer]];
+                const retained: u32 = @min(request.expected_tokens, shape.sliding_window);
+                if (retained > ring.capacity) return error.ContextRetainedBudgetExceeded;
+                const kr = ring.keys.ref();
+                const vr = ring.values.ref();
+                ranges[count] = .{ .layer_index = @intCast(layer), .source_start = request.expected_tokens - retained, .rows = retained, .num_kv_heads = shape.kv_heads, .head_dim = shape.head_dim, .destination_layout = .token_major_ring, .destination_ring_capacity_rows = ring.capacity, .destination_k = .{ .handle = kr.handle, .byte_offset = kr.offset, .byte_len = kr.bytes }, .destination_v = .{ .handle = vr.handle, .byte_offset = vr.offset, .byte_len = vr.bytes } };
+            }
+            count += 1;
+        }
+        if (count == 0) return error.InvalidContextLayout;
+        errdefer self.failed = true;
+        const expected_copied_bytes = try (sr.ExactLayerRangeExportRequest{
+            .source_sequence = request.source_authority.source_sequence,
+            .expected_written_tokens = request.source_authority.logical_tokens,
+            .expected_position_offset = request.expected_position_offset,
+            .ranges = ranges[0..count],
+            .max_bytes = request.max_copy_bytes,
+            .check_ctx = request.check_ctx,
+            .check_fn = request.check_fn,
+        }).validate();
+        const result = try request.source.exportRanges(request.source_authority, ranges[0..count], request.max_copy_bytes, request.check_ctx, request.check_fn);
+        if (!result.fenced or result.layers != count or result.copied_bytes != expected_copied_bytes)
+            return error.InvalidCompiledExactImportReceipt;
+        try request.check();
+        for (self.config.layout.layers[0..self.config.layout.len], 0..) |shape, layer| if (shape.owner == layer) {
+            if (shape.sliding_window == 0) {
+                const g = &self.globals[self.owner_indices[layer]];
+                for (g.plan.heads) |head| {
+                    const span = &g.plan.spans[head.span_start];
+                    span.physical_start = 0;
+                    span.row_count = request.expected_tokens;
+                    span.logical_start = 0;
+                    span.logical_count = request.expected_tokens;
+                }
+                @memset(g.filled, true);
+                g.plan.descriptor.logical_tokens = request.expected_tokens;
+                g.ready = true;
+                g.ingesting_empty = false;
+            } else self.sliding[self.owner_indices[layer]].describe(request.expected_tokens, @min(request.expected_tokens, shape.sliding_window));
+        };
+        self.logical_tokens = request.expected_tokens;
+        self.metrics.logical_tokens = request.expected_tokens;
+        self.metrics.epoch = self.publication.epoch;
+        self.refreshRetainedRows();
+        if (result.peak_host_staging_bytes) |observed| if (observed > request.max_host_staging_bytes)
+            return error.CompiledExactImportHostStagingBudgetExceeded;
+        return .{ .copied_bytes = result.copied_bytes, .peak_host_staging_bytes = result.peak_host_staging_bytes, .owners = count, .logical_tokens = request.expected_tokens, .source_unchanged = true, .fenced = true };
+    }
+
+    /// Builtin-only post-import proof that the fresh compiled exact K/V bytes
+    /// equal the decoded saved AFKV source for every retained owner/head/row.
+    pub fn compareImportedExactCheckpoint(self: *Session, source: @import("../runtime/kv/attention_match_checkpoint.zig").State) !CompiledExactKvComparison {
+        if (comptime !@import("builtin").is_test) return error.UnsupportedExactKvComparison;
+        if (self.logical_tokens != source.logical_length or self.logical_tokens != 8128 or self.config.layout.len != source.layer_donors.len or self.config.layout.len != 42)
+            return error.InvalidExactKvComparisonSource;
+        var out: CompiledExactKvComparison = .{ .owners = @splat(.{}), .compared_owners = 0, .compared_heads = 0, .compared_rows = 0, .compared_values_per_kind = 0, .total_key_mismatches = 0, .total_value_mismatches = 0, .all_f16_identical = false };
+        for (self.config.layout.layers[0..self.config.layout.len], 0..) |shape, layer| {
+            if (shape.owner != layer) continue;
+            try self.checkExactKvComparisonCancellation();
+            if (out.compared_owners == out.owners.len) return error.InvalidExactKvComparisonSource;
+            const donor = source.donors[try uniqueCheckpointDonorIndex(source.donors, layer)];
+            const head_count: usize = @intCast(shape.kv_heads);
+            const head_dim: usize = @intCast(shape.head_dim);
+            if (donor.heads.len != head_count or donor.window != shape.sliding_window or head_dim == 0) return error.InvalidExactKvComparisonSource;
+            const global = shape.sliding_window == 0;
+            const rows: usize = if (global) source.logical_length else @min(source.logical_length, @as(usize, shape.sliding_window));
+            const source_start = source.logical_length - rows;
+            const capacity: usize = if (global) @intCast(self.globals[self.owner_indices[layer]].plan.heads[0].capacity_rows) else @intCast(self.sliding[self.owner_indices[layer]].capacity);
+            const key_bytes = if (global) self.globals[self.owner_indices[layer]].keys.bytes else self.sliding[self.owner_indices[layer]].keys.bytes;
+            const value_bytes = if (global) self.globals[self.owner_indices[layer]].values.bytes else self.sliding[self.owner_indices[layer]].values.bytes;
+            const key_words = std.mem.bytesAsSlice(u16, @as([]align(2) u8, @alignCast(key_bytes)));
+            const value_words = std.mem.bytesAsSlice(u16, @as([]align(2) u8, @alignCast(value_bytes)));
+            var summary: ExactKvOwnerComparison = .{ .layer = @intCast(layer), .rows = @intCast(rows), .heads = @intCast(shape.kv_heads), .head_dim = @intCast(shape.head_dim), .global = global };
+            var key_square_sum: f64 = 0;
+            var value_square_sum: f64 = 0;
+            for (donor.heads, 0..) |head, head_index| {
+                try self.checkExactKvComparisonCancellation();
+                if (head.dim != shape.head_dim or head.positions.len != rows or head.keys.len != rows * head_dim or head.values.len != rows * head_dim or head.compressed.spans.len != 0)
+                    return error.InvalidExactKvComparisonSource;
+                for (0..rows) |row| {
+                    if (row % 256 == 0) try self.checkExactKvComparisonCancellation();
+                    const expected_position = source_start + row;
+                    if (head.positions[row] != expected_position or head.coverage_ends[row] != expected_position + 1) return error.InvalidExactKvComparisonSource;
+                    const physical_row = try importedPhysicalRow(global, head.positions[row], source_start, row, capacity);
+                    for (0..head_dim) |column| {
+                        const stored = row * head_dim + column;
+                        const physical = if (global)
+                            (head_index * capacity + physical_row) * head_dim + column
+                        else
+                            (physical_row * head_count + head_index) * head_dim + column;
+                        if (physical >= key_words.len or physical >= value_words.len) return error.InvalidExactKvComparisonSource;
+                        const expected_key: f16 = @floatCast(head.keys[stored]);
+                        const expected_value: f16 = @floatCast(head.values[stored]);
+                        const actual_key: f16 = @bitCast(key_words[physical]);
+                        const actual_value: f16 = @bitCast(value_words[physical]);
+                        if (!std.math.isFinite(head.keys[stored]) or !std.math.isFinite(head.values[stored]) or
+                            !std.math.isFinite(@as(f32, @floatCast(actual_key))) or !std.math.isFinite(@as(f32, @floatCast(actual_value))))
+                            return error.NonFiniteExactKvComparison;
+                        const expected_key_bits: u16 = @bitCast(expected_key);
+                        const expected_value_bits: u16 = @bitCast(expected_value);
+                        summary.key_mismatches += @intFromBool(expected_key_bits != key_words[physical]);
+                        summary.value_mismatches += @intFromBool(expected_value_bits != value_words[physical]);
+                        const key_delta = @as(f64, @floatCast(actual_key)) - @as(f64, @floatCast(expected_key));
+                        const value_delta = @as(f64, @floatCast(actual_value)) - @as(f64, @floatCast(expected_value));
+                        summary.key_max_absolute_delta = @max(summary.key_max_absolute_delta, @abs(key_delta));
+                        summary.value_max_absolute_delta = @max(summary.value_max_absolute_delta, @abs(value_delta));
+                        key_square_sum += key_delta * key_delta;
+                        value_square_sum += value_delta * value_delta;
+                    }
+                }
+            }
+            const values = rows * head_count * head_dim;
+            summary.key_rmse = @sqrt(key_square_sum / @as(f64, @floatFromInt(values)));
+            summary.value_rmse = @sqrt(value_square_sum / @as(f64, @floatFromInt(values)));
+            out.owners[@intCast(out.compared_owners)] = summary;
+            out.compared_owners += 1;
+            out.compared_heads += @intCast(shape.kv_heads);
+            out.compared_rows += @intCast(rows);
+            out.compared_values_per_kind += @intCast(values);
+            out.total_key_mismatches += summary.key_mismatches;
+            out.total_value_mismatches += summary.value_mismatches;
+        }
+        if (out.compared_owners != out.owners.len or out.compared_heads == 0 or out.compared_values_per_kind == 0) return error.InvalidExactKvComparisonSource;
+        out.all_f16_identical = out.total_key_mismatches == 0 and out.total_value_mismatches == 0;
+        return out;
+    }
+
+    fn checkExactKvComparisonCancellation(self: *Session) !void {
+        if (self.config.execution_control) |control| try control.check();
+        if (self.config.cancelled) |cancelled| if (cancelled.load(.acquire)) return error.Cancelled;
+    }
 
     pub fn init(_: std.mem.Allocator, config: Config) !Session {
         const sizes = try allocation(config);
@@ -514,6 +939,101 @@ pub const Session = struct {
         self.metrics.live_bytes = sizes.physical_bytes;
         self.metrics.peak_bytes = sizes.physical_bytes;
         return self;
+    }
+    /// Irreversibly retire the prefill-sized sliding causal union before the
+    /// first singleton decode. Publication changes only after every replacement
+    /// ring is allocated and copied; all earlier failures leave source rings and
+    /// the admitted multirow contract untouched.
+    const SingletonSealControl = struct {
+        context: ?*anyopaque = null,
+        after_copy_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+        fn afterCopy(self: @This()) !void {
+            if (self.after_copy_fn) |callback| try callback(self.context);
+        }
+    };
+    pub fn sealForSingletonDecode(self: *Session) !void {
+        return self.sealForSingletonDecodeControlled(.{});
+    }
+    fn sealForSingletonDecodeControlled(self: *Session, seal_control: SingletonSealControl) !void {
+        if (!self.mutex.tryLock()) return error.ContextTransactionBusy;
+        defer self.mutex.unlock();
+        try self.check();
+        self.singleton_decode_seal_evidence.requested = true;
+        if (self.singleton_decode_sealed) return;
+        if (self.logical_tokens == 0 or self.next_layer != 0 or self.pending_frame_runtime != null or self.publication.pending or self.publication.readers != 0 or self.frozen or self.failed)
+            return error.InvalidContextTransaction;
+        const lease = self.config.execution_lease orelse return error.ContextPhysicalAccountingUnavailable;
+        try lease.drainForBufferRelease();
+        try self.check();
+        const runtime = self.copier.core.runtime;
+        var new_bytes: usize = 0;
+        var old_bytes: usize = 0;
+        var old_capacity_rows: u64 = 0;
+        var new_capacity_rows: u64 = 0;
+        for (self.config.layout.layers[0..self.config.layout.len], 0..) |shape, layer| {
+            if (shape.owner != layer or shape.sliding_window == 0) continue;
+            const old = self.sliding[self.owner_indices[layer]];
+            if (old.capacity <= shape.sliding_window) return error.InvalidContextLayout;
+            const row_bytes = try std.math.mul(usize, shape.kv_heads, try std.math.mul(usize, shape.head_dim, @sizeOf(f16)));
+            const logical_bytes = try std.math.mul(usize, shape.sliding_window, row_bytes);
+            const rounded_bytes = std.mem.alignForward(usize, logical_bytes, std.heap.pageSize());
+            new_bytes = try std.math.add(usize, new_bytes, try std.math.mul(usize, rounded_bytes, 2));
+            old_bytes = try std.math.add(usize, old_bytes, old.keys.tracked_backing_bytes + old.values.tracked_backing_bytes);
+            old_capacity_rows = try std.math.add(u64, old_capacity_rows, @as(u64, old.capacity));
+            new_capacity_rows = try std.math.add(u64, new_capacity_rows, @as(u64, shape.sliding_window));
+        }
+        if (self.metrics.live_bytes > self.config.physical_budget_bytes or new_bytes > self.config.physical_budget_bytes - self.metrics.live_bytes)
+            return error.ContextStagingBudgetExceeded;
+        const replacements = try self.allocator.alloc(Ring, self.sliding.len);
+        defer self.allocator.free(replacements);
+        var initialized: usize = 0;
+        errdefer for (replacements[0..initialized]) |*ring| ring.deinit();
+        for (self.config.layout.layers[0..self.config.layout.len], 0..) |shape, layer| {
+            if (shape.owner != layer or shape.sliding_window == 0) continue;
+            const index = self.owner_indices[layer];
+            if (index != initialized) return error.InvalidContextLayout;
+            const old = self.sliding[index];
+            const row_bytes = try std.math.mul(usize, shape.kv_heads, try std.math.mul(usize, shape.head_dim, @sizeOf(f16)));
+            const logical_bytes = try std.math.mul(usize, shape.sliding_window, row_bytes);
+            var keys = try self.copier.core.buffer(logical_bytes);
+            errdefer keys.deinit();
+            var values = try self.copier.core.buffer(logical_bytes);
+            errdefer values.deinit();
+            const expected_backing = std.mem.alignForward(usize, logical_bytes, std.heap.pageSize());
+            if (keys.tracked_backing_bytes != expected_backing or values.tracked_backing_bytes != expected_backing)
+                return error.ContextPhysicalAccountingUnavailable;
+            replacements[index] = .{ .keys = keys, .values = values, .capacity = shape.sliding_window };
+            initialized += 1;
+            try copyRingRows(runtime, old, replacements[index], row_bytes, self.logical_tokens, shape.sliding_window);
+            replacements[index].describe(self.logical_tokens, shape.sliding_window);
+            try self.check();
+        }
+        try seal_control.afterCopy();
+        try lease.drainForBufferRelease();
+        try self.check();
+        var protection = if (self.config.execution_control) |control| try control.enterUninterruptible(.uninterruptible) else null;
+        defer if (protection) |*guard| guard.deinit();
+        for (self.sliding, replacements) |*old, replacement| {
+            if (old.capacity == replacement.capacity) continue;
+            var retired = old.*;
+            old.* = replacement;
+            retired.deinit();
+        }
+        self.metrics.peak_bytes = @max(self.metrics.peak_bytes, try std.math.add(usize, self.metrics.live_bytes, new_bytes));
+        self.metrics.live_bytes = try std.math.sub(usize, try std.math.add(usize, self.metrics.live_bytes, new_bytes), old_bytes);
+        self.sizes.sliding_bytes = try std.math.sub(usize, try std.math.add(usize, self.sizes.sliding_bytes, new_bytes), old_bytes);
+        self.sizes.physical_bytes = try std.math.sub(usize, try std.math.add(usize, self.sizes.physical_bytes, new_bytes), old_bytes);
+        self.config.max_query_rows = 1;
+        self.singleton_decode_sealed = true;
+        self.singleton_decode_seal_evidence = .{
+            .requested = true,
+            .executed = true,
+            .reduced = new_bytes < old_bytes and new_capacity_rows < old_capacity_rows,
+            .capacity_rows_before = old_capacity_rows,
+            .capacity_rows_after = new_capacity_rows,
+            .physical_kv_bytes_before = old_bytes,
+            .physical_kv_bytes_after = new_bytes,
+        };
     }
     /// A maintenance object must be closed first, just like a synchronous
     /// model callback must return before its request owner can be destroyed.
@@ -774,7 +1294,7 @@ pub const Session = struct {
         if (identity != self.identity) return error.StaleContextView;
         try self.check();
         if (self.frozen) return error.ContextReplayActive;
-        if (self.pending_frame_runtime != null or self.next_layer != 0 or start != self.logical_tokens or requested == 0 or start >= self.config.plan.logical_token_limit) return error.InvalidContextStep;
+        if (self.pending_frame_runtime != null or self.next_layer != 0 or start != self.logical_tokens or requested == 0 or start >= self.config.plan.logical_token_limit or (self.singleton_decode_sealed and requested != 1)) return error.InvalidContextStep;
         return @intCast(@min(self.config.plan.logical_token_limit - start, @min(requested, self.config.max_query_rows)));
     }
     fn ref(r: contract.DeviceRef) Ref {
@@ -811,6 +1331,7 @@ pub const Session = struct {
             // this frame encodes. Holding a publication reader here would
             // reject the frame's own owner-layer appends.
             self.pending_epoch = self.publication.epoch;
+            self.pending_submission_epoch = mr.frameCommandBufferCount(runtime);
             @memset(self.pending_global_appended[0..], false);
             @memset(self.pending_ring_appended[0..], false);
             self.pending_split_dispatches = 0;
@@ -818,6 +1339,7 @@ pub const Session = struct {
             if (mr.termite_metal_decode_runtime_set_context_frame_completion(runtime, self, completeFrame) != 0) {
                 self.pending_frame_runtime = null;
                 self.pending_epoch = 0;
+                self.pending_submission_epoch = 0;
                 return error.ContextFrameOwnershipMismatch;
             }
         } else if (self.pending_frame_runtime.? != runtime or self.pending_start != r.query_start or self.pending_rows != r.query_rows) {
@@ -837,6 +1359,7 @@ pub const Session = struct {
     fn runImpl(self: *Session, owner_runtime: ?*mr.RawMetalDecodeRuntime, r: contract.Attention, q: Ref, k: Ref, v: Ref, out: Ref) !void {
         if (r.consumer_layer != self.next_layer or r.consumer_layer >= self.config.layout.len or r.query_start != self.logical_tokens or
             r.query_rows == 0 or r.query_rows > self.config.max_query_rows) return error.InvalidContextStep;
+        if (self.singleton_decode_sealed and r.query_rows != 1) return error.InvalidContextStep;
         const l = self.config.layout.layers[r.consumer_layer];
         if (r.owner_layer != l.owner or r.query_heads != l.query_heads or r.kv_heads != l.kv_heads or r.head_dim != l.head_dim or
             r.sliding_window != l.sliding_window or r.skip_kv_write != (r.consumer_layer != l.owner) or
@@ -860,7 +1383,7 @@ pub const Session = struct {
                     const index = self.owner_indices[l.owner];
                     self.pending_global_ready[index] = g.ready;
                     self.pending_global_ingesting_empty[index] = g.ingesting_empty;
-                    try g.appendOnActiveRuntime(&self.copier, &self.publication, runtime, r.query_rows, k, v);
+                    try g.appendBoundedOnActiveRuntime(&self.copier, &self.publication, runtime, self.pending_submission_epoch, r.query_rows, k, v);
                     self.pending_global_appended[index] = true;
                 } else try g.append(&self.copier, &self.publication, r.query_rows, k, v);
             }
@@ -873,7 +1396,7 @@ pub const Session = struct {
                     const index = self.owner_indices[l.owner];
                     self.pending_ring_spans[index] = ring.spans;
                     self.pending_ring_lens[index] = ring.len;
-                    try self.copier.appendRingOnActiveRuntime(runtime, r.query_start, r.query_rows, ring.capacity, l.head_dim * l.kv_heads, k, v, ring.keys.ref(), ring.values.ref());
+                    try self.copier.appendRingBoundedOnActiveRuntime(runtime, self.pending_submission_epoch, r.query_start, r.query_rows, ring.capacity, l.head_dim * l.kv_heads, k, v, ring.keys.ref(), ring.values.ref());
                     self.pending_ring_appended[index] = true;
                 } else try self.copier.appendRing(r.query_start, r.query_rows, ring.capacity, l.head_dim * l.kv_heads, k, v, ring.keys.ref(), ring.values.ref());
                 ring.describe(end, ring.capacity);
@@ -948,6 +1471,7 @@ pub const Session = struct {
     fn clearPendingFrame(self: *Session) void {
         self.pending_frame_runtime = null;
         self.pending_epoch = 0;
+        self.pending_submission_epoch = 0;
         self.pending_start = 0;
         self.pending_rows = 0;
         @memset(self.pending_global_appended[0..], false);
@@ -972,6 +1496,7 @@ pub const Session = struct {
             return -4;
         }
         self.metrics.attention_status_readback_bytes +|= 4;
+        self.committed_owner_appends +|= committedOwnerAppendCount(&self.pending_global_appended, &self.pending_ring_appended);
         self.split_decode_dispatches +|= self.pending_split_dispatches;
         self.flash_prefill_dispatches +|= self.pending_flash_dispatches;
         self.framed_attention_dispatches +|= self.config.layout.len;
@@ -2787,6 +3312,181 @@ pub const Maintenance = struct {
     }
 };
 
+test "context packed singleton seal copy spans preserve no-wrap and wrap chronology" {
+    var spans: [4]RingCopySpan = undefined;
+    const no_wrap = try singletonRingCopySpans(8, 11, 4, &spans);
+    try std.testing.expectEqualSlices(RingCopySpan, &.{.{ .source_row = 4, .destination_row = 0, .rows = 4 }}, no_wrap);
+    const wrap = try singletonRingCopySpans(13, 6, 4, &spans);
+    try std.testing.expectEqualSlices(RingCopySpan, &.{
+        .{ .source_row = 3, .destination_row = 1, .rows = 3 },
+        .{ .source_row = 0, .destination_row = 0, .rows = 1 },
+    }, wrap);
+    try std.testing.expectError(error.InvalidContextLayout, singletonRingCopySpans(3, 6, 4, &spans));
+}
+const SingletonSealFixture = struct {
+    fn config(lease: *execution_pool.Lease, stop: ?*const std.atomic.Value(bool)) !Config {
+        var layout = policy.Layout{ .len = 1 };
+        layout.layers[0] = .{ .owner = 0, .sliding_window = 4, .kv_heads = 16, .query_heads = 16, .head_dim = 256, .rope_active_dim = 256, .rope_frequency_dim = 256, .rope_theta = 10000 };
+        var result = Config{ .plan = try (policy.Policy{}).admit(64, null, 6, 4, 0), .layout = layout, .max_query_rows = 3, .physical_budget_bytes = 0, .execution_lease = lease, .cancelled = stop };
+        const initial = try allocation(result);
+        result.physical_budget_bytes = try std.math.add(usize, initial.physical_bytes, 2 * std.mem.alignForward(usize, 4 * 16 * 256 * @sizeOf(f16), std.heap.pageSize()));
+        return result;
+    }
+    fn step(hook: contract.Hook, layout: policy.Layout, start: u32, rows: u32, q: Buffer, k: Buffer, v: Buffer, out: Buffer) !void {
+        for (layout.layers[0..layout.len], 0..) |shape, layer| {
+            const request = contract.Attention{
+                .consumer_layer = @intCast(layer),
+                .owner_layer = shape.owner,
+                .query_start = start,
+                .query_rows = rows,
+                .query_heads = shape.query_heads,
+                .kv_heads = shape.kv_heads,
+                .head_dim = shape.head_dim,
+                .sliding_window = shape.sliding_window,
+                .skip_kv_write = layer != shape.owner,
+                .scale = 1,
+            };
+            try hook.attention(request, device(q.ref()), device(k.ref()), device(v.ref()), device(out.ref()));
+        }
+    }
+    fn fill(live: *Session, q: Buffer, k: Buffer, v: Buffer, out: Buffer) !void {
+        const row_elements: usize = 16 * 256;
+        for (0..3) |chunk| {
+            for (k.floats(), 0..) |*value, index| value.* = @floatFromInt(chunk * 3 + index / row_elements);
+            // Feature variation is relative to each row. Using absolute
+            // index%3 would leak the 4096-element row stride into chronology.
+            for (v.floats(), 0..) |*value, index| value.* = @floatFromInt(100 + chunk * 9 + 3 * (index / row_elements) + (index % row_elements) % 3);
+            const rows: u32 = if (chunk == 2) 1 else 3;
+            try step(live.hook(), live.config.layout, @intCast(chunk * 3), rows, q, k, v, out);
+        }
+    }
+    fn ringDigest(live: *Session) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        const ring = live.sliding[0];
+        hash.update(ring.keys.bytes[0..ring.keys.logical_bytes]);
+        hash.update(ring.values.bytes[0..ring.values.logical_bytes]);
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+    fn cancelAfterCopy(context: ?*anyopaque) !void {
+        const stop: *std.atomic.Value(bool) = @ptrCast(@alignCast(context.?));
+        stop.store(true, .release);
+    }
+};
+
+test "context Metal packed singleton seal preserves W4 Q3 chronology and rolls back failures" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const generation: u64 = 267;
+    var pool = try execution_pool.Pool.init(generation, execution_pool.admitted_backend_bytes);
+    defer pool.deinit();
+    try pool.warm(null);
+    var lease = try pool.acquire(generation);
+    defer if (lease.pool != null) lease.poisonAndRelease();
+    var stop = std.atomic.Value(bool).init(false);
+    var tracker = owner_alloc.HostAllocationTracker.init(null, 0);
+    var cfg = try SingletonSealFixture.config(&lease, &stop);
+    cfg.owner_allocation_tracker = &tracker;
+    var control = try Session.init(std.testing.allocator, cfg);
+    defer control.deinit();
+    var sealed = try Session.init(std.testing.allocator, cfg);
+    defer sealed.deinit();
+    const runtime = control.copier.core.runtime;
+    var q = try Buffer.init(runtime, 3 * 16 * 256 * @sizeOf(f32));
+    defer q.deinit();
+    var k = try Buffer.init(runtime, q.logical_bytes);
+    defer k.deinit();
+    var v = try Buffer.init(runtime, q.logical_bytes);
+    defer v.deinit();
+    var out_control = try Buffer.init(runtime, q.logical_bytes);
+    defer out_control.deinit();
+    var out_sealed = try Buffer.init(runtime, q.logical_bytes);
+    defer out_sealed.deinit();
+    for (q.floats(), 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 11 + 1)) / 11;
+    try SingletonSealFixture.fill(&control, q, k, v, out_control);
+    try SingletonSealFixture.fill(&sealed, q, k, v, out_sealed);
+    try std.testing.expect(!sealed.singletonDecodeSealEvidence().requested);
+    const owner_before = try sealed.drainedOwnerSnapshot();
+    try std.testing.expect(owner_before.tracked_combined_physical_available);
+    const physical_before = owner_before.tracked_combined_live_bytes;
+    try sealed.sealForSingletonDecode();
+    const seal_evidence = sealed.singletonDecodeSealEvidence();
+    try std.testing.expect(seal_evidence.requested);
+    try std.testing.expect(seal_evidence.executed);
+    try std.testing.expect(seal_evidence.reduced);
+    try std.testing.expectEqual(@as(u64, 6), seal_evidence.capacity_rows_before);
+    try std.testing.expectEqual(@as(u64, 4), seal_evidence.capacity_rows_after);
+    try std.testing.expect(seal_evidence.physical_kv_bytes_after < seal_evidence.physical_kv_bytes_before);
+    const owner_after = try sealed.drainedOwnerSnapshot();
+    try std.testing.expect(owner_after.tracked_combined_physical_available);
+    const physical_after = owner_after.tracked_combined_live_bytes;
+    try std.testing.expect(physical_after < physical_before);
+    try std.testing.expectEqual(@as(u32, 4), sealed.sliding[0].capacity);
+    try std.testing.expectEqual(@as(u32, 1), sealed.config.max_query_rows);
+    // Logical rows 3..6 survive in their W-modulo physical slots. This source
+    // ring wraps from physical row 5 to row 0 during sealing.
+    const keys = std.mem.bytesAsSlice(f16, @as([]align(2) u8, @alignCast(sealed.sliding[0].keys.bytes[0..sealed.sliding[0].keys.logical_bytes])));
+    const values = std.mem.bytesAsSlice(f16, @as([]align(2) u8, @alignCast(sealed.sliding[0].values.bytes[0..sealed.sliding[0].values.logical_bytes])));
+    for (3..7) |logical| {
+        const physical_row = (logical % 4) * 16 * 256;
+        try std.testing.expectEqual(@as(f16, @floatFromInt(logical)), keys[physical_row]);
+        inline for (0..3) |feature| try std.testing.expectEqual(
+            @as(f16, @floatFromInt(100 + logical * 3 + feature)),
+            values[physical_row + feature],
+        );
+    }
+    @memset(k.floats(), 7);
+    for (v.floats(), 0..) |*value, index| value.* = @floatFromInt(121 + index % 3);
+    try SingletonSealFixture.step(control.hook(), cfg.layout, 7, 1, q, k, v, out_control);
+    try SingletonSealFixture.step(sealed.hook(), cfg.layout, 7, 1, q, k, v, out_sealed);
+    const control_output = out_control.floats()[0 .. 16 * 256];
+    try std.testing.expectEqualSlices(f32, control_output, out_sealed.floats()[0 .. 16 * 256]);
+    var observed_nonuniform = false;
+    for (control_output[1..]) |value| observed_nonuniform = observed_nonuniform or value != control_output[0];
+    try std.testing.expect(observed_nonuniform);
+    try std.testing.expectError(error.InvalidContextStep, sealed.hook().nextChunk(8, 2));
+
+    var cancelled = try Session.init(std.testing.allocator, cfg);
+    defer cancelled.deinit();
+    try SingletonSealFixture.fill(&cancelled, q, k, v, out_control);
+    const cancel_digest = SingletonSealFixture.ringDigest(&cancelled);
+    try std.testing.expectError(error.Cancelled, cancelled.sealForSingletonDecodeControlled(.{ .context = &stop, .after_copy_fn = SingletonSealFixture.cancelAfterCopy }));
+    try std.testing.expect(cancelled.singletonDecodeSealEvidence().requested);
+    try std.testing.expect(!cancelled.singletonDecodeSealEvidence().executed);
+    try std.testing.expectEqual(@as(u32, 6), cancelled.sliding[0].capacity);
+    try std.testing.expectEqual(@as(u32, 3), cancelled.config.max_query_rows);
+    const cancel_after = SingletonSealFixture.ringDigest(&cancelled);
+    try std.testing.expectEqualSlices(u8, &cancel_digest, &cancel_after);
+    stop.store(false, .release);
+
+    var capped = try Session.init(std.testing.allocator, cfg);
+    defer capped.deinit();
+    try SingletonSealFixture.fill(&capped, q, k, v, out_control);
+    const cap_digest = SingletonSealFixture.ringDigest(&capped);
+    capped.config.physical_budget_bytes = capped.metrics.live_bytes;
+    try std.testing.expectError(error.ContextStagingBudgetExceeded, capped.sealForSingletonDecode());
+    try std.testing.expect(capped.singletonDecodeSealEvidence().requested);
+    try std.testing.expect(!capped.singletonDecodeSealEvidence().executed);
+    try std.testing.expectEqual(@as(u32, 6), capped.sliding[0].capacity);
+    const cap_after = SingletonSealFixture.ringDigest(&capped);
+    try std.testing.expectEqualSlices(u8, &cap_digest, &cap_after);
+
+    var oom = try Session.init(std.testing.allocator, cfg);
+    defer oom.deinit();
+    try SingletonSealFixture.fill(&oom, q, k, v, out_control);
+    const oom_digest = SingletonSealFixture.ringDigest(&oom);
+    var failing = std.testing.FailingAllocator.init(oom.allocator, .{ .fail_index = 0 });
+    const original_allocator = oom.allocator;
+    oom.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, oom.sealForSingletonDecode());
+    try std.testing.expect(oom.singletonDecodeSealEvidence().requested);
+    try std.testing.expect(!oom.singletonDecodeSealEvidence().executed);
+    oom.allocator = original_allocator;
+    try std.testing.expectEqual(@as(u32, 6), oom.sliding[0].capacity);
+    try std.testing.expectEqual(@as(u32, 3), oom.config.max_query_rows);
+    const oom_after = SingletonSealFixture.ringDigest(&oom);
+    try std.testing.expectEqualSlices(u8, &oom_digest, &oom_after);
+}
 fn fixtureConfig() !Config {
     var layout = policy.Layout{ .len = 6 };
     for (layout.layers[0..6], 0..) |*l, i| l.* = .{ .owner = @intCast(i % 3), .sliding_window = if (i % 3 == 0) 16 else 0, .kv_heads = 2, .query_heads = 4, .head_dim = if (i % 3 == 0) 256 else 512, .rope_active_dim = 256, .rope_frequency_dim = 256, .rope_theta = 10000 };
@@ -2805,10 +3505,11 @@ fn fixtureStep(hook: contract.Hook, layout: policy.Layout, start: u32, rows: u32
     }
 }
 
-fn fixtureFramedStep(hook: contract.Hook, layout: policy.Layout, runtime: *mr.RawMetalDecodeRuntime, start: u32, rows: u32, q: Buffer, k: Buffer, v: Buffer, out: Buffer) !void {
+fn fixtureFramedStep(hook: contract.Hook, layout: policy.Layout, runtime: *mr.RawMetalDecodeRuntime, start: u32, rows: u32, q: Buffer, k: Buffer, v: Buffer, out: Buffer, sliding_out: Buffer, global_out: Buffer) !void {
     for (layout.layers[0..layout.len], 0..) |l, layer| {
         const r = contract.Attention{ .consumer_layer = @intCast(layer), .owner_layer = l.owner, .query_start = start, .query_rows = rows, .query_heads = l.query_heads, .kv_heads = l.kv_heads, .head_dim = l.head_dim, .sliding_window = l.sliding_window, .skip_kv_write = layer != l.owner, .scale = 1 };
-        try hook.attentionFramed(.{ .runtime = @ptrCast(runtime) }, r, device(q.ref()), device(k.ref()), device(v.ref()), device(out.ref()));
+        const destination = if (layer == 0) sliding_out else if (layer == 1) global_out else out;
+        try hook.attentionFramed(.{ .runtime = @ptrCast(runtime) }, r, device(q.ref()), device(k.ref()), device(v.ref()), device(destination.ref()));
     }
 }
 
@@ -2974,7 +3675,9 @@ test "context Metal packed lifecycle ingests replays rejects rolls back publishe
 test "context Metal packed owner frame commits once and cancellation clears callback ownership" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const config = try fixtureConfig();
+    var config = try fixtureConfig();
+    config.optimize_decode = true;
+    config.physical_budget_bytes = (try allocation(config)).physical_bytes;
 
     var live = try Session.init(a, config);
     defer live.deinit();
@@ -2987,15 +3690,37 @@ test "context Metal packed owner frame commits once and cancellation clears call
     defer v.deinit();
     var out = try Buffer.init(runtime, q.logical_bytes);
     defer out.deinit();
+    var sliding_out = try Buffer.init(runtime, q.logical_bytes);
+    defer sliding_out.deinit();
+    var global_out = try Buffer.init(runtime, q.logical_bytes);
+    defer global_out.deinit();
     @memset(q.bytes, 0);
     @memset(k.bytes, 0);
     @memset(v.floats(), 1);
 
+    try std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_begin_native_frame_policy(runtime, 1, 1));
+    defer std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_end_native_frame_policy(runtime)) catch unreachable;
     try mr.beginFrame(runtime);
     errdefer mr.cancelFrame(runtime) catch {};
-    try fixtureFramedStep(live.hook(), config.layout, runtime, 0, 1, q, k, v, out);
+    try fixtureFramedStep(live.hook(), config.layout, runtime, 0, 1, q, k, v, out, sliding_out, global_out);
     try mr.submitFrame(runtime);
     try mr.waitFrame(runtime);
+    const committed_frame = mr.runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 1), committed_frame.last_frame_compute_encoder_count);
+    try std.testing.expectEqual(@as(u64, config.layout.len), live.split_decode_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), committed_frame.last_frame_blit_encoder_count);
+    for (sliding_out.floats()[0 .. 4 * 256]) |value| try std.testing.expectApproxEqAbs(@as(f32, 1), value, 0.002);
+    for (global_out.floats()[0 .. 4 * 512]) |value| try std.testing.expectApproxEqAbs(@as(f32, 1), value, 0.002);
+    const sliding = live.sliding[live.owner_indices[0]];
+    const sliding_keys = std.mem.bytesAsSlice(f16, @as([]align(2) const u8, @alignCast(sliding.keys.bytes[0..sliding.keys.logical_bytes])));
+    const sliding_values = std.mem.bytesAsSlice(f16, @as([]align(2) const u8, @alignCast(sliding.values.bytes[0..sliding.values.logical_bytes])));
+    try std.testing.expectEqual(@as(f16, 0), sliding_keys[0]);
+    try std.testing.expectEqual(@as(f16, 1), sliding_values[0]);
+    const global = live.globals[live.owner_indices[1]];
+    const global_keys = std.mem.bytesAsSlice(f16, @as([]align(2) const u8, @alignCast(global.keys.bytes[0..global.keys.logical_bytes])));
+    const global_values = std.mem.bytesAsSlice(f16, @as([]align(2) const u8, @alignCast(global.values.bytes[0..global.values.logical_bytes])));
+    try std.testing.expectEqual(@as(f16, 0), global_keys[0]);
+    try std.testing.expectEqual(@as(f16, 1), global_values[0]);
     try std.testing.expectEqual(@as(u32, 1), live.logical_tokens);
     try std.testing.expectEqual(@as(u64, config.layout.len), live.framed_attention_dispatches);
     try std.testing.expectEqual(@as(u64, config.layout.len), live.attention.framed_dispatches);
@@ -3004,22 +3729,39 @@ test "context Metal packed owner frame commits once and cancellation clears call
 
     var cancelled = try Session.init(a, config);
     const cancelled_runtime = cancelled.copier.core.runtime;
+    try std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_begin_native_frame_policy(cancelled_runtime, 1, 1));
     try mr.beginFrame(cancelled_runtime);
+    const cancelled_ring = &cancelled.sliding[cancelled.owner_indices[0]];
+    try std.testing.expectError(error.ContextTransactionBusy, cancelled.copier.appendRingBoundedOnActiveRuntime(
+        cancelled_runtime,
+        mr.frameCommandBufferCount(cancelled_runtime) + 1,
+        0,
+        1,
+        cancelled_ring.capacity,
+        2 * 256,
+        k.ref(),
+        v.ref(),
+        cancelled_ring.keys.ref(),
+        cancelled_ring.values.ref(),
+    ));
     const l = config.layout.layers[0];
     const request = contract.Attention{ .consumer_layer = 0, .owner_layer = l.owner, .query_start = 0, .query_rows = 1, .query_heads = l.query_heads, .kv_heads = l.kv_heads, .head_dim = l.head_dim, .sliding_window = l.sliding_window, .skip_kv_write = false, .scale = 1 };
     try cancelled.hook().attentionFramed(.{ .runtime = @ptrCast(cancelled_runtime) }, request, device(q.ref()), device(k.ref()), device(v.ref()), device(out.ref()));
     try std.testing.expectError(error.SubmissionFailed, mr.cancelFrame(cancelled_runtime));
     try std.testing.expectEqual(@as(u32, 0), cancelled.logical_tokens);
     try std.testing.expect(cancelled.pending_frame_runtime == null);
+    try std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_end_native_frame_policy(cancelled_runtime));
     cancelled.deinit();
 
     var partial = try Session.init(a, config);
     const partial_runtime = partial.copier.core.runtime;
+    try std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_begin_native_frame_policy(partial_runtime, 1, 1));
     try mr.beginFrame(partial_runtime);
     try partial.hook().attentionFramed(.{ .runtime = @ptrCast(partial_runtime) }, request, device(q.ref()), device(k.ref()), device(v.ref()), device(out.ref()));
     try std.testing.expectError(error.CommandBufferFailed, mr.flushActiveFrame(partial_runtime));
     try std.testing.expectEqual(@as(u32, 0), partial.logical_tokens);
     try std.testing.expect(partial.pending_frame_runtime == null);
+    try std.testing.expectEqual(@as(c_int, 0), mr.termite_metal_decode_runtime_end_native_frame_policy(partial_runtime));
     partial.deinit();
 }
 

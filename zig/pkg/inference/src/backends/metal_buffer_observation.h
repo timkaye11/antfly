@@ -28,7 +28,64 @@ enum {
     ANTFLY_BUFFER_MEMORY_COUNT
 };
 static _Atomic uint64_t antfly_buffer_memory[ANTFLY_BUFFER_MEMORY_COUNT];
+static _Atomic uint64_t antfly_observed_device_peak;
+static _Atomic uint64_t antfly_observed_device_cap;
+static _Atomic uint64_t antfly_observed_device_owner;
+static _Atomic uint64_t antfly_observed_device_next_owner = 1;
+static _Atomic bool antfly_observed_device_exceeded;
 static char antfly_buffer_observation_key;
+
+static void antfly_observed_device_record(uint64_t current) {
+    uint64_t previous = atomic_load_explicit(&antfly_observed_device_peak, memory_order_relaxed);
+    while (previous < current && !atomic_compare_exchange_weak_explicit(
+        &antfly_observed_device_peak, &previous, current, memory_order_relaxed, memory_order_relaxed)) {}
+    const uint64_t cap = atomic_load_explicit(&antfly_observed_device_cap, memory_order_relaxed);
+    if (cap != 0 && current > cap)
+        atomic_store_explicit(&antfly_observed_device_exceeded, true, memory_order_relaxed);
+}
+
+static void antfly_observed_device_sample(id<MTLDevice> device) {
+    const uint64_t owner = atomic_load_explicit(&antfly_observed_device_owner, memory_order_acquire);
+    if (device != nil && owner != 0 && owner != UINT64_MAX)
+        antfly_observed_device_record((uint64_t)device.currentAllocatedSize);
+}
+
+static bool antfly_observed_device_scope_begin(id<MTLDevice> device, uint64_t cap, uint64_t *owner_out) {
+    if (device == nil || cap == 0 || owner_out == NULL) return false;
+    uint64_t expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(&antfly_observed_device_owner, &expected, UINT64_MAX,
+            memory_order_acq_rel, memory_order_acquire)) return false;
+    uint64_t owner = atomic_fetch_add_explicit(&antfly_observed_device_next_owner, 1, memory_order_relaxed);
+    while (owner == 0 || owner == UINT64_MAX)
+        owner = atomic_fetch_add_explicit(&antfly_observed_device_next_owner, 1, memory_order_relaxed);
+    const uint64_t current = (uint64_t)device.currentAllocatedSize;
+    atomic_store_explicit(&antfly_observed_device_cap, cap, memory_order_relaxed);
+    atomic_store_explicit(&antfly_observed_device_peak, current, memory_order_relaxed);
+    atomic_store_explicit(&antfly_observed_device_exceeded, current > cap, memory_order_release);
+    atomic_store_explicit(&antfly_observed_device_owner, owner, memory_order_release);
+    *owner_out = owner;
+    return true;
+}
+
+static bool antfly_observed_device_scope_end(uint64_t owner) {
+    if (owner == 0 || owner == UINT64_MAX) return false;
+    uint64_t expected = owner;
+    if (!atomic_compare_exchange_strong_explicit(&antfly_observed_device_owner, &expected, UINT64_MAX,
+            memory_order_acq_rel, memory_order_acquire)) return false;
+    atomic_store_explicit(&antfly_observed_device_cap, 0, memory_order_relaxed);
+    atomic_store_explicit(&antfly_observed_device_peak, 0, memory_order_relaxed);
+    atomic_store_explicit(&antfly_observed_device_exceeded, false, memory_order_release);
+    atomic_store_explicit(&antfly_observed_device_owner, 0, memory_order_release);
+    return true;
+}
+
+static uint64_t antfly_observed_device_peak_get(void) {
+    return atomic_load_explicit(&antfly_observed_device_peak, memory_order_acquire);
+}
+
+static bool antfly_observed_device_exceeded_get(void) {
+    return atomic_load_explicit(&antfly_observed_device_exceeded, memory_order_acquire);
+}
 
 static void antfly_buffer_memory_add(size_t live, size_t peak, uint64_t bytes) {
     // Live gauges cannot exceed addressable resource memory. Unlike lifetime
@@ -91,6 +148,8 @@ static id<MTLBuffer> antfly_observe_metal_buffer(id<MTLBuffer> __attribute__((ns
     // The token has no reference to its buffer. Retained views/commands keep the
     // association alive; releasing one caller handle never decrements early.
     objc_setAssociatedObject(buffer, &antfly_buffer_observation_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    antfly_observed_device_sample(buffer.device);
+    if (antfly_observed_device_exceeded_get()) return nil;
     return buffer;
 }
 
@@ -104,8 +163,27 @@ void termite_metal_buffer_memory_snapshot(uint64_t *values) {
 // no-copy mappings and concurrent destruction. Never called by production.
 int termite_metal_buffer_observation_check(void) {
     @autoreleasepool {
+        if (antfly_observe_metal_buffer(nil, ANTFLY_BUFFER_OWNED) != nil) return -8;
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (device == nil) return 1;
+        uint64_t scope_owner = 0;
+        if (!antfly_observed_device_scope_begin(device, UINT64_MAX, &scope_owner)) return -9;
+        uint64_t second_owner = 0;
+        if (antfly_observed_device_scope_begin(device, UINT64_MAX, &second_owner)) return -10;
+        antfly_observed_device_record(7);
+        antfly_observed_device_record(5);
+        if (antfly_observed_device_peak_get() < 7 || antfly_observed_device_exceeded_get()) return -11;
+        if (antfly_observed_device_scope_end(scope_owner + 1)) return -12;
+        if (!antfly_observed_device_scope_end(scope_owner)) return -13;
+        if (atomic_load_explicit(&antfly_observed_device_cap, memory_order_relaxed) != 0 ||
+            atomic_load_explicit(&antfly_observed_device_peak, memory_order_relaxed) != 0 ||
+            atomic_load_explicit(&antfly_observed_device_owner, memory_order_relaxed) != 0 ||
+            antfly_observed_device_exceeded_get()) return -14;
+        if (!antfly_observed_device_scope_begin(device, 1, &scope_owner)) return -15;
+        __attribute__((objc_precise_lifetime)) id<MTLBuffer> rejected = antfly_observe_metal_buffer(
+            [device newBufferWithLength:(size_t)getpagesize() options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        if (rejected != nil || !antfly_observed_device_exceeded_get()) return -16;
+        if (!antfly_observed_device_scope_end(scope_owner)) return -17;
         const size_t page = (size_t)getpagesize();
         void *mapped = NULL;
         if (posix_memalign(&mapped, page, page) != 0) return -1;

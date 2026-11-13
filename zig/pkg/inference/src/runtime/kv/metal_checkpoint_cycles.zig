@@ -7,6 +7,7 @@ const std = @import("std");
 const checkpoint = @import("attention_match_checkpoint.zig");
 const Control = @import("attention_match.zig").Control;
 const allocations = @import("host_allocation_tracker.zig");
+const fit_policy = @import("attention_match_fit_policy.zig");
 
 pub const max_cycles = 20;
 pub const max_aggregate_bytes = 8 * 1024 * 1024 * 1024;
@@ -14,6 +15,7 @@ pub const query_tail_tokens = 512;
 
 pub const Request = struct {
     encoding: checkpoint.Encoding = .f16,
+    fit_policy: fit_policy.Policy = .legacy_fixed,
     cycles: usize = max_cycles,
     append_tokens: usize = 512,
     answer_tokens: usize = 16,
@@ -24,6 +26,7 @@ pub const Request = struct {
     reference: []const i64 = &.{},
 
     pub fn capacity(self: Request, initial: usize) !usize {
+        try self.fit_policy.validate(self.encoding, true);
         if (self.encoding == .f32 or self.cycles == 0 or self.cycles > max_cycles or
             self.append_tokens == 0 or self.append_tokens > 2048 or self.append_tokens > initial or
             self.answer_tokens == 0 or self.answer_tokens > 32 or
@@ -99,10 +102,17 @@ pub const Report = struct {
     diagnostic_only: bool = true,
     production_ready: bool = false,
     passed: bool = false,
+    fit_policy_sha256: [32]u8 = @splat(0),
+    producer_policy: fit_policy.Policy = .legacy_fixed,
     completed: usize = 0,
     initial_tokens: usize,
     final_tokens: usize = 0,
     frozen_reference: bool,
+    device_memory_scope: []const u8 = "MTLDevice.currentAllocatedSize sampled at every observed owned/alias MTLBuffer allocation and explicit cycle phase boundaries; excludes unobserved MPS/internal-driver transient allocations",
+    device_memory_cap_bytes: u64 = 8 * 1024 * 1024 * 1024,
+    device_current_bytes: u64 = 0,
+    device_observed_peak_bytes: u64 = 0,
+    device_cap_exceeded: bool = false,
     exact_release: allocations.RequestAllocationOwner.ReleaseReceipt = .{},
     compacted_release: allocations.RequestAllocationOwner.ReleaseReceipt = .{},
     rows: [max_cycles]Row = @splat(.{}),
@@ -210,6 +220,136 @@ pub fn immutableDigest(state: checkpoint.State, descriptors: []const Descriptor,
         }
     }
     return hash.finalResult();
+}
+
+/// Compute the installed-history seal directly from an immutable streaming
+/// provider.  Only one head lease is live at a time; no complete checkpoint or
+/// complete donor is materialized on the host.  The byte sequence is exactly
+/// the host `immutableDigest` sequence, so cycle gates remain unchanged.
+pub fn immutableDigestFromProvider(metadata: checkpoint.StreamingMetadata, provider: checkpoint.StreamingHeadProvider, descriptors: []const Descriptor, control: Control) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly.installed-history.v2\n");
+    inline for (.{ "weights", "tokenizer", "template", "layout" }) |field|
+        hash.update(&@field(metadata.identity, field));
+    integer(&hash, metadata.logical_length);
+    integer(&hash, metadata.layer_donors.len);
+    hash.update(std.mem.sliceAsBytes(metadata.layer_donors));
+    for (descriptors) |old| {
+        try control.check();
+        if (old.donor >= metadata.donors.len) return error.CompactionHistoryChanged;
+        const donor = metadata.donors[old.donor];
+        if (old.head >= donor.head_count) return error.CompactionHistoryChanged;
+        var lease = try provider.open(old.donor, old.head, control);
+        defer lease.deinit();
+        const head = lease.head;
+        if (donor.layer != old.layer or head.dim != old.dim or donor.window != old.window or
+            head.positions.len < old.rows or head.compressed.spans.len < old.spans or
+            head.compressed.keys.len < old.keys or head.compressed.values.len < old.values or
+            (old.spans != 0 and head.compressed.version != old.packed_version)) return error.CompactionHistoryChanged;
+        integer(&hash, old.donor);
+        integer(&hash, old.head);
+        integer(&hash, donor.layer);
+        integer(&hash, head.dim);
+        integer(&hash, donor.window);
+        integer(&hash, old.rows);
+        hash.update(std.mem.sliceAsBytes(head.positions[0..old.rows]));
+        hash.update(std.mem.sliceAsBytes(head.coverage_ends[0..old.rows]));
+        hash.update(std.mem.sliceAsBytes(head.bias[0..old.rows]));
+        hash.update(std.mem.sliceAsBytes(head.keys[0 .. old.rows * head.dim]));
+        hash.update(std.mem.sliceAsBytes(head.values[0 .. old.rows * head.dim]));
+        for (head.compressed.spans[0..old.spans]) |span| {
+            if (span.first >= old.rows) return error.CompactionHistoryChanged;
+            integer(&hash, span.first);
+            integer(&hash, @min(@as(usize, span.rows), old.rows - span.first));
+            integer(&hash, span.offset);
+        }
+        hash.update(head.compressed.keys[0..old.keys]);
+        hash.update(head.compressed.values[0..old.values]);
+        if (old.fp8.rows != 0) {
+            if (head.fp8.first_row != old.fp8.first_row or head.fp8.rows < old.fp8.rows or
+                head.fp8.key_scale != old.fp8.key_scale or head.fp8.value_scale != old.fp8.value_scale)
+                return error.CompactionHistoryChanged;
+            integer(&hash, old.fp8.first_row);
+            integer(&hash, old.fp8.rows);
+            integer(&hash, @as(u32, @bitCast(old.fp8.key_scale)));
+            integer(&hash, @as(u32, @bitCast(old.fp8.value_scale)));
+            const start = @as(usize, old.fp8.first_row) * head.dim;
+            const end = start + @as(usize, old.fp8.rows) * head.dim;
+            for (head.keys[start..end], head.values[start..end]) |key, value| hash.update(&[_]u8{ try checkpoint.codec.encode(key, old.fp8.key_scale), try checkpoint.codec.encode(value, old.fp8.value_scale) });
+        }
+    }
+    try provider.verify_empty_fn(provider.context);
+    return hash.finalResult();
+}
+
+pub const StreamingTransport = struct {
+    encoded_bytes: usize,
+    source_bytes: usize,
+    savings_ratio: f64,
+};
+
+/// Truthful device transport accounting. `source_bytes` is the already
+/// measured source-global authority; it is never inferred from row counts.
+pub fn streamingTransport(metadata: checkpoint.StreamingMetadata, provider: checkpoint.StreamingHeadProvider, limits: checkpoint.Limits, encoding: checkpoint.Encoding, source_bytes: usize, control: Control) !StreamingTransport {
+    if (source_bytes == 0) return error.InvalidCompactionProbe;
+    const encoded = try checkpoint.encodedSizeFromProvider(metadata, provider, limits, encoding, control);
+    if (encoded == 0) return error.InvalidKvCheckpoint;
+    return .{ .encoded_bytes = encoded, .source_bytes = source_bytes, .savings_ratio = @as(f64, @floatFromInt(source_bytes)) / @as(f64, @floatFromInt(encoded)) };
+}
+
+test "context cycle streaming history seal matches host and closes leases on failure and cancellation" {
+    const Fake = struct {
+        state: checkpoint.State,
+        live: bool = false,
+        opens: usize = 0,
+        fail_open: bool = false,
+        fn open(raw: ?*anyopaque, donor: usize, head_index: usize, control: Control) !checkpoint.StreamingHeadLease {
+            try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.fail_open) return error.TestProviderFailed;
+            if (self.live) return error.InvalidKvCheckpoint;
+            self.live = true;
+            self.opens += 1;
+            return .{ .context = self, .close_fn = close, .donor = donor, .head_index = head_index, .head = self.state.donors[donor].heads[head_index] };
+        }
+        fn close(raw: ?*anyopaque, _: *checkpoint.StreamingHeadLease) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            std.debug.assert(self.live);
+            self.live = false;
+        }
+        fn empty(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.live) return error.InvalidKvCheckpoint;
+        }
+        fn provider(self: *@This()) checkpoint.StreamingHeadProvider {
+            return .{ .context = self, .open_fn = open, .verify_empty_fn = empty };
+        }
+    };
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    const state: checkpoint.State = .{
+        .identity = .{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) },
+        .logical_length = 4,
+        .tokens = &.{ 0, 0, 0, 0 },
+        .logits = &.{0},
+        .layer_donors = &.{0},
+        .donors = &.{.{ .heads = &.{.{ .dim = 1, .compacted_until = 2, .positions = &.{ 0, 1, 2, 3 }, .coverage_ends = &.{ 1, 2, 3, 4 }, .keys = &.{ 0, 1, 2, 3 }, .values = &.{ 4, 5, 6, 7 }, .bias = &.{ 0, 0, 0, 0 } }} }},
+    };
+    const metadata: checkpoint.StreamingMetadata = .{ .identity = state.identity, .logical_length = state.logical_length, .tokens = state.tokens, .logits = state.logits, .layer_donors = state.layer_donors, .donors = &.{.{ .layer = 0, .window = 0, .head_count = 1 }} };
+    var descriptors: [1]Descriptor = undefined;
+    const captured = try capture(state, 1, &descriptors, .{});
+    var fake: Fake = .{ .state = state };
+    try std.testing.expectEqual(try immutableDigest(state, captured, .{}), try immutableDigestFromProvider(metadata, fake.provider(), captured, .{}));
+    try std.testing.expect(!fake.live and fake.opens == 1);
+    fake.fail_open = true;
+    try std.testing.expectError(error.TestProviderFailed, immutableDigestFromProvider(metadata, fake.provider(), captured, .{}));
+    try std.testing.expect(!fake.live);
+    fake.fail_open = false;
+    try std.testing.expectError(error.Canceled, immutableDigestFromProvider(metadata, fake.provider(), captured, .{ .check_fn = Cancel.check }));
+    try std.testing.expect(!fake.live);
 }
 
 test "attention_match Metal cycle admission reserves continuation within logical window" {

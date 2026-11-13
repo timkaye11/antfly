@@ -10,6 +10,8 @@ const ordered = @import("context_serving_messages.zig");
 const serving = @import("context_serving_driver.zig");
 const server = @import("server/server.zig");
 const checkpoint = @import("runtime/kv/attention_match_checkpoint.zig");
+const runtime = @import("runtime/root.zig");
+const context_study_templates = @import("backends/context_study_templates.zig");
 
 pub const File = struct { path: []const u8, sha256: []const u8 };
 pub const Case = struct {
@@ -63,6 +65,17 @@ pub const Session = struct {
     model: *server.model_manager.LoadedModel,
     pipeline: *generation.NativeGenerationPipeline,
     manifest_sha256: [32]u8,
+    capture_accepted_snapshot: bool = false,
+    staged_private_policy: bool = false,
+    staged_future_training_policy: bool = false,
+    staged_resident_hybrid_policy: bool = false,
+    resident_hybrid_authority: ?generation.ResidentHybridAuthority = null,
+    route_parity_diagnostic: bool = false,
+    supplied_input: ?@import("context_supplied_checkpoint_quality.zig").Input = null,
+    supplied_root: ?std.Io.Dir = null,
+    prepared_input: ?@import("context_prepared_serving_quality.zig").Input = null,
+    prepared_root: ?std.Io.Dir = null,
+    prepared_producer: ?@import("server/native_kv_verified_sidecar.zig").ExpectedProducer = null,
 
     fn read(self: *Session, file_ref: File) ![]u8 {
         if (!validPath(file_ref.path)) return error.InvalidNativeQualityPath;
@@ -159,7 +172,7 @@ pub const Session = struct {
         var message_storage: [ordered.max_messages]generation.Message = undefined;
         var parts: [ordered.max_messages * ordered.max_parts_per_message]generation.Message.ContentPart = undefined;
         var calls: [ordered.max_total_tool_calls]generation.Message.ToolCall = undefined;
-        const native = try serving.Driver.nativeMessages(.{
+        const serving_request: serving.Request = .{
             .route = .native,
             .variant = .attention_matching,
             .model = "qualification",
@@ -170,7 +183,8 @@ pub const Session = struct {
             .keep_prefix_tokens = 512,
             .keep_recent_tokens = 512,
             .reserved_output_tokens = quality.max_output_tokens,
-        }, &message_storage, &parts, &calls);
+        };
+        const native = try serving.Driver.nativeMessages(serving_request, &message_storage, &parts, &calls);
         const prompt = try (self.model.chat_tmpl orelse return error.MissingChatTemplate).applyWithOptions(self.allocator, native, .{ .enable_thinking = false });
         defer self.allocator.free(prompt);
         const expected_prompt = try self.read(case.rendered_prompt);
@@ -185,16 +199,98 @@ pub const Session = struct {
         if (count != case.prompt_count) return error.NativeQualityInputChanged;
         for (tokens, encoded.ids[0..count]) |expected, actual|
             if (expected != actual) return error.NativeQualityInputChanged;
+        var supplied_loaded: ?@import("context_supplied_checkpoint_quality.zig").Loaded = null;
+        defer if (supplied_loaded) |*loaded| loaded.deinit();
+        if (self.supplied_input) |supplied_input| {
+            const root = self.supplied_root orelse return error.InvalidSuppliedCheckpointQualityInput;
+            supplied_loaded = try @import("context_supplied_checkpoint_quality.zig").load(self.io, self.allocator, root, supplied_input, self.pipeline.attention_match_identity orelse return error.UnsupportedKvIdentity, tokens);
+        }
+        var prepared_loaded: ?@import("context_prepared_serving_quality.zig").Loaded = null;
+        defer if (prepared_loaded) |*loaded| loaded.deinit();
+        if (self.prepared_input) |prepared_input| {
+            if (supplied_loaded != null) return error.InvalidPreparedServingQualityInput;
+            const root = self.prepared_root orelse return error.InvalidPreparedServingQualityInput;
+            const producer = self.prepared_producer orelse return error.InvalidPreparedServingQualityInput;
+            prepared_loaded = try @import("context_prepared_serving_quality.zig").load(
+                self.io,
+                self.allocator,
+                root,
+                prepared_input,
+                self.pipeline.attention_match_identity orelse return error.UnsupportedKvIdentity,
+                producer,
+                tokens,
+            );
+        }
         var gold: Gold = .{ .session = self, .case = case, .prompt = prompt, .prompt_ids = tokens };
         defer if (gold.tokens) |ids| self.allocator.free(ids);
-        var report = try self.pipeline.qualifyMetalCheckpointQuality(tokens, prompt, case.request, .{
+        const self_study_enabled = @import("builtin").is_test and std.c.getenv("ANTFLY_METAL_QUALITY_SELF_STUDY_TRAINING_DIR") != null;
+        var study_payload: ?generation.PreparedCompactionPayload = null;
+        defer if (study_payload) |*owned| owned.deinit();
+        var fit_study: ?generation.PreparedCompactionStudy = null;
+        defer if (fit_study) |*owned| owned.deinit();
+        if (self_study_enabled) {
+            const policy = try serving.Driver.policy(serving_request);
+            study_payload = try generation.prepareCompactionPayload(self.allocator, self.model.chat_tmpl.?, self.model.getTokenizer(), native, .{ .enable_thinking = false }, policy, case.prompt_count + quality.max_output_tokens, self.model.manifest.add_bos_token);
+            if (!std.mem.eql(u8, study_payload.?.rendered.text, prompt)) return error.NativeQualityInputChanged;
+            fit_study = try generation.prepareCompactionStudy(self.allocator, self.model.chat_tmpl.?, self.model.getTokenizer(), native, .{ .enable_thinking = false }, &study_payload.?, .fit_training_v1, context_study_templates.authority(.fit_training_v1), self.pipeline.gpt_config.max_position_embeddings, self.model.manifest.add_bos_token);
+            const suffix_count = fit_study.?.ids.len;
+            const repeat_count = try std.math.add(usize, suffix_count, context_study_templates.response_tokens);
+            std.debug.print("attention_match_self_study_preflight original_count={d} suffix_count={d} generated_count={d} repeat_count={d} template_variant=fit_training_v1\n", .{ case.prompt_count, suffix_count, context_study_templates.response_tokens, repeat_count });
+            if (suffix_count < 64 or repeat_count < 320) return error.SelfStudyRepeatTooShort;
+        }
+        const reference: quality.Reference = .{
             .count = case.reference_count,
             .sha256 = try parseDigest(case.reference_sequence_sha256),
             .provider = .{ .ctx = &gold, .reveal_fn = Gold.reveal },
-        });
+        };
+        var quality_request = case.request;
+        if (self.staged_private_policy) {
+            quality_request.fit_strategy = .identity_chunk_coefficients_adaptive_v18;
+            quality_request.admission = .cumulative_ladder_4_3_2;
+            quality_request.chunk_rows = 256;
+            quality_request.reject_exact_active_fixed_point = true;
+            quality_request.private_dense512_policy = true;
+            quality_request.private_future_decode_training_v1 = self.staged_future_training_policy;
+            quality_request.private_resident_hybrid_policy = self.staged_resident_hybrid_policy;
+            quality_request.resident_hybrid_authority = if (self.resident_hybrid_authority) |authority| .{
+                .configuration_sha256 = authority.configuration_sha256,
+                .source_freeze_sha256 = authority.source_freeze_sha256,
+                .shape_authority_sha256 = authority.shape_authority_sha256,
+                .policy_module_sha256 = authority.policy_module_sha256,
+                .e2_guarded_development_trial = authority.e2_guarded_development_trial,
+                .e2_fit_source_rows = authority.e2_fit_source_rows,
+                .e2_formal_owner_inventory_sha256 = authority.e2_formal_owner_inventory_sha256,
+                .e2_formal_owner_inventory = authority.e2_formal_owner_inventory,
+                .e4_formal_authority = authority.e4_formal_authority,
+                .cohort = switch (authority.cohort) {
+                    .e4_8128_v1 => .e4_8128_v1,
+                    .e2_8128_v1 => .e2_8128_v1,
+                    .e4_formal_7936_256_v1 => .e4_formal_7936_256_v1,
+                    .e4_formal_32512_256_v1 => .e4_formal_32512_256_v1,
+                },
+            } else null;
+        }
+        quality_request.route_parity_diagnostic = self.route_parity_diagnostic;
+        if (comptime @import("builtin").is_test) if (std.c.getenv("ANTFLY_METAL_QUALITY_CUMULATIVE_ADMISSION")) |raw| {
+            if (!std.mem.eql(u8, std.mem.span(raw), "1")) return error.InvalidNativeQualityRequest;
+            quality_request.admission = .cumulative_ladder_4_3_2;
+        };
+        if (self.capture_accepted_snapshot and (supplied_loaded != null or prepared_loaded != null or quality_request.admission != .cumulative_ladder_4_3_2 or quality_request.encoding != .f16))
+            return error.InvalidNativeQualityRequest;
+        var prepared_candidate: ?quality.PreparedServingCandidate = if (prepared_loaded) |*loaded| try loaded.prepared.takeCandidate() else null;
+        defer if (prepared_candidate) |*candidate| candidate.deinit();
+        var report = if (prepared_candidate) |*candidate|
+            try self.pipeline.qualifyPreparedServingMetalCheckpointQuality(tokens, prompt, quality_request, reference, candidate)
+        else if (supplied_loaded) |*loaded|
+            try self.pipeline.qualifySuppliedMetalCheckpointQuality(tokens, prompt, quality_request, reference, try loaded.candidate(self.pipeline.attention_match_identity orelse return error.UnsupportedKvIdentity, tokens))
+        else if (self.capture_accepted_snapshot)
+            try self.pipeline.qualifyMetalCheckpointQualityCapturing(tokens, prompt, quality_request, reference, if (fit_study) |*owned| owned else null, .{ .output = self.outputs })
+        else
+            try self.pipeline.qualifyMetalCheckpointQuality(tokens, prompt, quality_request, reference, if (fit_study) |*owned| owned else null);
         defer report.deinit();
         if (gold.calls != 1 or !report.collection_complete or !report.reference_revealed_after_both_greedy_branches)
             return error.IncompleteNativeQualityCollection;
+        try report.validateV18Evidence();
         const body = try std.json.Stringify.valueAlloc(self.allocator, .{
             .schema = "antfly.native-checkpoint-quality.case.v2",
             .allocation_scope = "private_native_kv_owners",
@@ -206,9 +302,33 @@ pub const Session = struct {
             .manifest_sha256 = self.manifest_sha256,
             .load_generation = self.model.load_generation,
             .frozen = report.frozen,
-            .calibration_consumers = report.calibration_consumers[0..report.frozen.calibration.consumer_count],
+            .calibration_consumers = if (report.frozen.calibration) |calibration| report.calibration_consumers[0..calibration.consumer_count] else &.{},
             .phase_durations_ns = report.phase_durations_ns,
+            .v18_evidence_profile = @tagName(report.v18_evidence_profile),
+            .v18_evidence_profile_sha256 = std.fmt.bytesToHex(report.v18_evidence_profile_sha256, .lower),
+            .v18_codec_physical_profile = @tagName(report.v18_codec_physical_profile),
+            .v18_codec_physical_profile_sha256 = std.fmt.bytesToHex(report.v18_codec_physical_profile_sha256, .lower),
+            .v18_bounded_tsqr_policy_sha256 = std.fmt.bytesToHex(report.v18_bounded_tsqr_policy_sha256, .lower),
+            .v18_bounded_tsqr_heads = report.v18_bounded_tsqr_heads,
+            .v18_bounded_tsqr_calls = report.v18_bounded_tsqr_calls,
+            .v18_bounded_tsqr_workspace_peak_bytes = report.v18_bounded_tsqr_workspace_peak_bytes,
+            .v18_bounded_tsqr_cancellation_checks = report.v18_bounded_tsqr_cancellation_checks,
+            .primary_query_collection = report.primary_query_collection,
+            .dense512_query_collection = report.dense512_query_collection,
+            .query_collection_combined_before_fit_ns = report.query_collection_combined_before_fit_ns,
+            .future_training_authority = report.future_training_authority,
             .source_serving_prefill = report.source_serving_prefill,
+            .source_route = report.source_route,
+            .source_prefill_full_chunk_rows = report.source_prefill_full_chunk_rows,
+            .source_prefill_full_chunk_count = report.source_prefill_full_chunk_count,
+            .source_prefill_tail_rows = report.source_prefill_tail_rows,
+            .source_prefill_final_token_rows = report.source_prefill_final_token_rows,
+            .source_prefill_e4_fused_half_attempts = report.source_prefill_e4_fused_half_attempts,
+            .source_prefill_e4_fused_half_hits = report.source_prefill_e4_fused_half_hits,
+            .source_prefill_e4_fused_half_pair_dispatches = report.source_prefill_e4_fused_half_pair_dispatches,
+            .source_prefill_e4_fused_half_down_dispatches = report.source_prefill_e4_fused_half_down_dispatches,
+            .source_prefill_e4_fused_half_fallbacks = report.source_prefill_e4_fused_half_fallbacks,
+            .source_prefill_e4_fused_half_fatal_failures = report.source_prefill_e4_fused_half_fatal_failures,
             .collection_elapsed_ns = report.collection_elapsed_ns,
             .model_slot_runtime_kv_bytes_before = report.model_slot_runtime_kv_bytes_before,
             .model_slot_runtime_kv_bytes_after = report.model_slot_runtime_kv_bytes_after,
@@ -222,6 +342,9 @@ pub const Session = struct {
             .compacted_greedy = report.compacted_greedy,
             .exact_teacher = report.exact_teacher,
             .compacted_teacher = report.compacted_teacher,
+            .exact_raw_greedy_diagnostic = report.exact_raw_greedy_diagnostic,
+            .exact_prepared_teacher_diagnostic = report.exact_prepared_teacher_diagnostic,
+            .route_parity_diagnostic_unqualified = report.route_parity_diagnostic_unqualified,
             .reference_sha256 = report.reference_sha256,
             .reference_revealed_after_both_greedy_branches = report.reference_revealed_after_both_greedy_branches,
             .reference_provider_calls = gold.calls,
@@ -236,6 +359,26 @@ pub const Session = struct {
             .max_head_mass_error = report.max_head_mass_error,
             .max_head_output_rmse = report.max_head_output_rmse,
             .fp64_accelerated_value_solves = report.fp64_accelerated_value_solves,
+            .candidate_source = report.candidate_source,
+            .fit_calls = report.fit_calls,
+            .calibration_executed = report.calibration_executed,
+            .admission_strategy = @tagName(report.admission),
+            .chunk_rows = report.chunk_rows,
+            .reject_exact_active_fixed_point = report.reject_exact_active_fixed_point,
+            .fit_strategy = @tagName(report.fit_strategy),
+            .v18_policy_sha256 = report.v18_policy_sha256,
+            .v18_eligible_heads = report.v18_eligible_heads,
+            .v18_attempted_heads = report.v18_attempted_heads,
+            .v18_accepted_heads = report.v18_accepted_heads,
+            .v18_preserved_heads = report.v18_preserved_heads,
+            .v18_fallback_heads = report.v18_fallback_heads,
+            .v18_cache_ready_heads = report.v18_cache_ready_heads,
+            .v18_planned_exact_heads = report.v18_planned_exact_heads,
+            .v18_query_batch_rows = report.v18_query_batch_rows,
+            .v18_planned_head_workspace_bytes = report.v18_planned_head_workspace_bytes,
+            .v18_cache_phase_peak_bound_bytes = report.v18_cache_phase_peak_bound_bytes,
+            .supplied_closure_sha256 = report.supplied_closure_sha256,
+            .accepted_snapshot = report.accepted_snapshot,
             .source_release = report.source_release,
             .compacted_release = report.compacted_release,
         }, .{ .whitespace = .indent_2 });

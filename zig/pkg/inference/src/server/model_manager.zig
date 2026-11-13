@@ -511,6 +511,35 @@ pub const CompactionCandidateSlot = if (builtin.is_test)
 else
     void;
 
+/// Full-CLI qualification capability. This is process-local and has no HTTP,
+/// manifest, environment, or model-name constructor. The operator entrypoint
+/// creates it only after verifying the running executable and candidate bytes.
+pub const QualificationCandidate = struct {
+    pub const Authority = enum { canonical_profile, staged_private_dynamic_budget, qualified_private_dynamic_budget };
+    profile: *const compaction_profile.Profile,
+    profile_sha256: [32]u8,
+    binary_sha256: [32]u8,
+    implementation_semantic_sha256: [32]u8,
+    authority: Authority = .canonical_profile,
+};
+
+fn nativeCheckpointQualificationAuthority(authority: QualificationCandidate.Authority) bool {
+    return authority == .staged_private_dynamic_budget or authority == .qualified_private_dynamic_budget;
+}
+
+fn genericCompactionQualificationAuthority(authority: QualificationCandidate.Authority) bool {
+    return authority == .canonical_profile;
+}
+
+test "qualified private authority is native-only" {
+    try std.testing.expect(nativeCheckpointQualificationAuthority(.qualified_private_dynamic_budget));
+    try std.testing.expect(nativeCheckpointQualificationAuthority(.staged_private_dynamic_budget));
+    try std.testing.expect(!nativeCheckpointQualificationAuthority(.canonical_profile));
+    try std.testing.expect(!genericCompactionQualificationAuthority(.qualified_private_dynamic_budget));
+    try std.testing.expect(!genericCompactionQualificationAuthority(.staged_private_dynamic_budget));
+    try std.testing.expect(genericCompactionQualificationAuthority(.canonical_profile));
+}
+
 comptime {
     if (!builtin.is_test and CompactionCandidateSlot != void)
         @compileError("release builds must not expose compaction candidate storage");
@@ -3416,6 +3445,7 @@ pub const LoadedModel = struct {
     /// loaded generation. Production builds have no candidate storage or
     /// selector input; the frozen release registry remains the sole authority.
     compaction_candidate: CompactionCandidateSlot = if (builtin.is_test) null else {},
+    qualification_candidate: ?QualificationCandidate = null,
     embedding_identity: ?[64]u8 = null,
     embedding_validation: ?@import("../models/embedding_gemma2_identity.zig").SnapshotValidation = null,
     embedding_identity_mutex: std.atomic.Mutex = .unlocked,
@@ -3808,6 +3838,8 @@ pub const LoadedModel = struct {
         profile: *const compaction_profile.Profile,
         profile_sha256: [32]u8,
         profile_semantic_digest: [32]u8,
+        producer_policy: @import("../runtime/kv/attention_match_fit_policy.zig").Policy,
+        producer_policy_sha256: [32]u8,
         query_protocols: []const compaction_profile.QueryProtocolAuthority = &.{},
     };
 
@@ -3815,6 +3847,41 @@ pub const LoadedModel = struct {
         load_generation: u64,
         identity: compaction_profile.Identity,
     };
+
+    /// Select only an operator-installed staged-private candidate against the
+    /// portable native-checkpoint identity.  This deliberately has no registry,
+    /// test-candidate, or generic serving-compaction fallback.
+    pub fn selectNativeCheckpointQualificationProfile(
+        self: *LoadedModel,
+        dtype: runtime.kv.pool.KvDType,
+        control: ?InferenceExecutionControl,
+        layout: runtime.context_policy.Layout,
+    ) !CompactionSelection {
+        if (self.load_generation == 0) return error.UnpublishedModelGeneration;
+        const qualified = self.qualification_candidate orelse return error.UnqualifiedCompactionArtifact;
+        if (!nativeCheckpointQualificationAuthority(qualified.authority) or
+            !std.mem.eql(u8, &qualified.implementation_semantic_sha256, &@import("compaction_identity").digest) or
+            !std.mem.eql(u8, &qualified.profile_sha256, &try compaction_profile.profileArtifactDigest(qualified.profile.*)))
+            return error.InvalidQualificationCandidate;
+        const identity = try self.nativeKvIdentity(dtype, control);
+        const implementation = compaction_profile.servingImplementation(.native_whole_head_v2, true, true);
+        try @import("../context_private_dense_profile.zig").validateNativeCheckpointCompatibilityProfile(
+            qualified.profile.*,
+            identity,
+            layout,
+            implementation,
+        );
+        return .{
+            .load_generation = self.load_generation,
+            .identity = qualified.profile.identity,
+            .profile = qualified.profile,
+            .profile_sha256 = qualified.profile_sha256,
+            .profile_semantic_digest = qualified.profile.semanticDigest(),
+            .producer_policy = qualified.profile.producer_policy,
+            .producer_policy_sha256 = qualified.profile.producer_policy.digest(),
+            .query_protocols = qualified.profile.query_protocols,
+        };
+    }
 
     /// One canonical semantic identity for the optimized serving route. Every
     /// capture, candidate lookup and publication receipt must call this helper
@@ -3877,13 +3944,22 @@ pub const LoadedModel = struct {
         const loaded = try self.compactionIdentity(layout, implementation);
         const identity = loaded.identity;
         const profile = compaction_profile.select(identity) catch |err| blk: {
-            if (comptime !builtin.is_test) return err;
             if (err != error.UnqualifiedCompactionArtifact) return err;
-            const candidate = self.compaction_candidate orelse return err;
+            const candidate_authority: QualificationCandidate.Authority = if (self.qualification_candidate) |qualified| qualified.authority else .canonical_profile;
+            const candidate = if (self.qualification_candidate) |qualified| candidate: {
+                if (!std.mem.eql(u8, &qualified.implementation_semantic_sha256, &@import("compaction_identity").digest) or
+                    !std.mem.eql(u8, &qualified.profile_sha256, &try compaction_profile.profileArtifactDigest(qualified.profile.*))) return error.InvalidQualificationCandidate;
+                break :candidate qualified.profile;
+            } else if (comptime builtin.is_test)
+                self.compaction_candidate orelse return err
+            else
+                return err;
             _ = try compaction_profile.profileArtifactDigest(candidate.*);
             // Validate the complete layout/owner contract at the selection
             // boundary. Exact prompt/output bounds are validated again from
             // the immutable payload by compaction_coordinator.preparePlan.
+            if (!genericCompactionQualificationAuthority(candidate_authority))
+                return error.UnqualifiedCompactionArtifact;
             try candidate.validate(identity, layout, 1, 1);
             break :blk candidate;
         };
@@ -3895,6 +3971,8 @@ pub const LoadedModel = struct {
             .profile = profile,
             .profile_sha256 = try compaction_profile.profileArtifactDigest(profile.*),
             .profile_semantic_digest = profile.semanticDigest(),
+            .producer_policy = profile.producer_policy,
+            .producer_policy_sha256 = profile.producer_policy.digest(),
             .query_protocols = profile.query_protocols,
         };
     }
@@ -3916,10 +3994,13 @@ pub const LoadedModel = struct {
         if (self.context_execution_resource_lease != null)
             return error.InvalidContextExecutionAdmission;
 
+        const resident: runtime.tier.memory.AdmissionAmounts = .{
+            .backend_scratch_bytes = context_execution_pool.admitted_backend_bytes,
+        };
         var lease = try self.model_manager.acquireRunResourceAmounts(
             .gpu,
             limits,
-            .{ .backend_scratch_bytes = context_execution_pool.admitted_backend_bytes },
+            resident,
         );
         errdefer lease.release();
         self.context_execution_pool = try context_execution_pool.Pool.init(
@@ -3931,6 +4012,9 @@ pub const LoadedModel = struct {
             self.context_execution_pool = null;
         }
         try self.context_execution_pool.?.warm(device_bytes_before);
+        // Construction is complete. Keep the pool charged as resident memory
+        // while allowing later requests to sample a fresh pressure epoch.
+        try lease.retain(resident);
         self.context_execution_resource_lease = lease;
         return &self.context_execution_pool.?;
     }
@@ -6280,6 +6364,24 @@ pub const ModelManager = struct {
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe_config: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
     compaction_candidate: CompactionCandidateSlot = if (builtin.is_test) null else {},
+    qualification_candidate: ?QualificationCandidate = null,
+
+    pub fn configureQualificationCandidate(self: *ModelManager, candidate: compaction_profile.Profile, binary_sha256: [32]u8, implementation_semantic_sha256: [32]u8, authority: QualificationCandidate.Authority) !void {
+        if (self.loaded.count() != 0 or self.loaded_aliases.count() != 0 or self.in_flight_loads.count() != 0 or self.qualification_candidate != null)
+            return error.CompactionCandidateAfterModelLoad;
+        if (!std.mem.eql(u8, &implementation_semantic_sha256, &@import("compaction_identity").digest))
+            return error.InvalidQualificationCandidate;
+        const profile_sha256 = try compaction_profile.profileArtifactDigest(candidate);
+        const profile = try cloneCompactionProfile(self.allocator, candidate);
+        errdefer destroyCompactionProfile(self.allocator, profile);
+        self.qualification_candidate = .{
+            .profile = profile,
+            .profile_sha256 = profile_sha256,
+            .binary_sha256 = binary_sha256,
+            .implementation_semantic_sha256 = implementation_semantic_sha256,
+            .authority = authority,
+        };
+    }
 
     pub fn init(allocator: std.mem.Allocator, session_manager: backends.SessionManager) ModelManager {
         return initWithRuntimeEpoch(
@@ -8872,6 +8974,10 @@ pub const ModelManager = struct {
                 self.compaction_candidate = null;
             }
         }
+        if (self.qualification_candidate) |candidate| {
+            destroyCompactionProfile(self.allocator, candidate.profile);
+            self.qualification_candidate = null;
+        }
         if (self.resource_domain) |lifetime| {
             if (self.owns_resource_domain) lifetime.close();
             self.tokenizer_cache_config.resource_budget = null;
@@ -10759,6 +10865,7 @@ pub const ModelManager = struct {
             .chunk_planning = chunk_planning,
             .load_generation = load_generation,
             .compaction_candidate = if (builtin.is_test) self.compaction_candidate else {},
+            .qualification_candidate = self.qualification_candidate,
             .resolution_revision = resolution_revision,
             .native_kv_asset_generation = native_kv_asset_generation,
             .native_kv_tokenizer_contract = if (native_kv_asset_generation != null) .{
@@ -10832,6 +10939,25 @@ pub const ModelManager = struct {
             model.deinit();
             self.allocator.destroy(model);
         };
+
+        // Establish the trusted native4 identity before this loaded generation
+        // can publish or any request can populate its compiled executor cache.
+        // This shifts the one-time admitted bundle hash out of first inference;
+        // unsupported model families retain ordinary inference unchanged.
+        if (native_kv_asset_generation != null) {
+            const warmed_identity: ?runtime.kv.attention_match_checkpoint.Identity = model.nativeKvIdentity(.f16, control) catch |err| switch (err) {
+                error.UnsupportedKvIdentity => null,
+                error.Canceled,
+                error.Cancelled,
+                error.Timeout,
+                error.ProcessIsolationRequired,
+                error.HardCancellationWatchdogNotStarted,
+                error.InferenceWorkerShuttingDown,
+                => return err,
+                else => return err,
+            };
+            _ = warmed_identity;
+        }
 
         // Publication performs max-loaded eviction. When the cache is already
         // full, prewarming first makes the incoming runtime compete with the

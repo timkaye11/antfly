@@ -28,6 +28,7 @@ const Protocol = protocol_mod.Session;
 const CoverageTrust = @import("context_serving_coverage_trust.zig").Trust;
 const CliRunner = @import("context_serving_cli_process.zig").Runner;
 const native_profile = @import("context_native_profile.zig");
+const private_dense_profile = @import("context_private_dense_profile.zig");
 
 const RuntimeStudyAuthority = struct {
     template_sha256: []const u8,
@@ -160,13 +161,7 @@ const LegacyCandidate = struct {
     profile: profiles.Profile,
 };
 
-fn parseCandidate(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-) !LegacyCandidate {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
-    defer allocator.free(bytes);
+fn parseCandidateBytes(allocator: std.mem.Allocator, bytes: []const u8) !LegacyCandidate {
     var artifact_sha256: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &artifact_sha256, .{});
     var parsed = try std.json.parseFromSlice(FrozenArtifact, allocator, bytes, .{
@@ -316,11 +311,12 @@ fn parseCandidate(
     return .{ .parsed = parsed, .owners = owners, .query_protocols = query_protocols, .profile = profile };
 }
 
-const Candidate = union(enum) {
+pub const Candidate = union(enum) {
     legacy: LegacyCandidate,
     native: native_profile.Loaded,
+    private_dense: private_dense_profile.Loaded,
 
-    fn deinit(self: *Candidate, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Candidate, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .legacy => |*value| {
                 value.parsed.deinit();
@@ -329,14 +325,23 @@ const Candidate = union(enum) {
                 allocator.free(value.query_protocols);
             },
             .native => |*value| value.deinit(),
+            .private_dense => |*value| value.deinit(),
         }
         self.* = undefined;
     }
 
-    fn profile(self: *const Candidate) *const profiles.Profile {
+    pub fn profile(self: *const Candidate) *const profiles.Profile {
         return switch (self.*) {
             .legacy => |*value| &value.profile,
             .native => |*value| &value.profile,
+            .private_dense => |*value| &value.profile,
+        };
+    }
+
+    pub fn isPrivateDense(self: *const Candidate) bool {
+        return switch (self.*) {
+            .private_dense => true,
+            else => false,
         };
     }
 
@@ -344,6 +349,7 @@ const Candidate = union(enum) {
         return switch (self.*) {
             .legacy => |value| value.parsed.value.runtime_candidate.?.implementation.split_decode,
             .native => |value| value.parsed.value.implementation.split_decode,
+            .private_dense => true,
         };
     }
 
@@ -351,11 +357,12 @@ const Candidate = union(enum) {
         return switch (self.*) {
             .legacy => |value| value.parsed.value.runtime_candidate.?.implementation.flash_prefill,
             .native => |value| value.parsed.value.implementation.flash_prefill,
+            .private_dense => true,
         };
     }
 };
 
-const CandidateFormat = enum { legacy, native_v2 };
+const CandidateFormat = enum { legacy, native_v2, private_dense_v1 };
 
 fn candidateFormat(allocator: std.mem.Allocator, bytes: []const u8) !CandidateFormat {
     const Tag = struct { schema: ?[]const u8 = null };
@@ -366,23 +373,44 @@ fn candidateFormat(allocator: std.mem.Allocator, bytes: []const u8) !CandidateFo
     defer tag.deinit();
     if (tag.value.schema) |artifact_schema| if (std.mem.eql(u8, artifact_schema, native_profile.schema))
         return .native_v2;
+    if (tag.value.schema) |artifact_schema| if (std.mem.eql(u8, artifact_schema, private_dense_profile.schema) or
+        std.mem.eql(u8, artifact_schema, private_dense_profile.e2_schema) or
+        std.mem.eql(u8, artifact_schema, private_dense_profile.qualified_resident_schema))
+        return .private_dense_v1;
     return .legacy;
 }
 
-fn loadCandidate(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Candidate {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
-    defer allocator.free(bytes);
-    if (try candidateFormat(allocator, bytes) == .native_v2)
-        return .{ .native = try native_profile.parseBytes(allocator, bytes) };
+pub fn loadCandidateBytes(allocator: std.mem.Allocator, bytes: []const u8) !Candidate {
+    if (bytes.len == 0 or bytes.len > 16 * 1024 * 1024) return error.InvalidServingDriverProfile;
+    switch (try candidateFormat(allocator, bytes)) {
+        .native_v2 => return .{ .native = try native_profile.parseBytes(allocator, bytes) },
+        .private_dense_v1 => return .{ .private_dense = try private_dense_profile.parseBytes(allocator, bytes) },
+        .legacy => {},
+    }
     // Absence of the native tag preserves the legacy parser byte-for-byte;
     // malformed native artifacts never acquire a second interpretation.
-    return .{ .legacy = try parseCandidate(allocator, io, path) };
+    return .{ .legacy = try parseCandidateBytes(allocator, bytes) };
+}
+
+pub fn loadCandidate(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Candidate {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
+    defer allocator.free(bytes);
+    return loadCandidateBytes(allocator, bytes);
 }
 
 test "context qualification profile format keeps legacy and native v2 disjoint" {
     try std.testing.expectEqual(CandidateFormat.legacy, try candidateFormat(std.testing.allocator, "{\"schema_version\":1,\"stage\":\"offline_numerical\"}"));
     try std.testing.expectEqual(CandidateFormat.native_v2, try candidateFormat(std.testing.allocator, "{\"schema\":\"antfly.context.native.qualification-profile.v1\"}"));
+    try std.testing.expectEqual(CandidateFormat.private_dense_v1, try candidateFormat(std.testing.allocator, "{\"schema\":\"antfly.context.private-dense512.staged-profile.v1\"}"));
+    try std.testing.expectEqual(CandidateFormat.private_dense_v1, try candidateFormat(std.testing.allocator, "{\"schema\":\"antfly.context.private-dense512-e2.staged-profile.v1\"}"));
     try std.testing.expectEqual(CandidateFormat.legacy, try candidateFormat(std.testing.allocator, "{\"schema\":\"antfly.context.native.qualification-profile.v0\"}"));
+}
+
+test "generic candidate loader rejects resident compatibility profile schema" {
+    const bytes =
+        \\{"schema":"antfly.context.resident-native-hybrid.compatibility-profile.v1","stage":"resident_native_hybrid_compatibility_profile"}
+    ;
+    try std.testing.expectError(error.UnknownField, loadCandidateBytes(std.testing.allocator, bytes));
 }
 
 test "serving qualification installed persistent Metal driver" {

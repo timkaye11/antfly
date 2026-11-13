@@ -47,6 +47,8 @@ fn compiledModelForwardRequest(
     decode_context: *const gpt_arch.DecodeContext,
     attention_mode: cache_mod.AttentionMode,
     execution_control: ?InferenceExecutionControl,
+    prepare_after_fresh_reset: ?model_runtime.PrepareRequest,
+    suppress_token_ids: []const i32,
 ) !model_runtime.ForwardRequest {
     return if (attention_mode == .paged_decode) blk: {
         if (input_ids.len != 1 or seq_len == 0) return error.UnsupportedShape;
@@ -55,6 +57,7 @@ fn compiledModelForwardRequest(
             .token_id = input_ids[0],
             .position = seq_len - 1,
             .attention_mode = attention_mode,
+            .suppress_token_ids = suppress_token_ids,
         } };
     } else .{ .prefill = .{
         .execution_control = execution_control,
@@ -62,8 +65,11 @@ fn compiledModelForwardRequest(
         .seq_len = seq_len,
         .query_seq_len = decode_context.query_sequence_len,
         .attention_mode = attention_mode,
+        .suppress_token_ids = suppress_token_ids,
+        .prepare_after_fresh_reset = prepare_after_fresh_reset,
         .max_inflight_tokens = if (decode_context.kv_cache) |kv| kv.max_inflight_tokens else 0,
         .allow_swa_ring = if (decode_context.kv_cache) |kv| kv.allow_swa_ring else false,
+        .recent_query_capture = decode_context.recent_prefill_query_capture,
     } };
 }
 
@@ -83,11 +89,54 @@ test "compiled prefill request preserves KV ring policy" {
         },
     };
 
-    const request = try compiledModelForwardRequest(&.{ 1, 2 }, 64, &decode_context, .paged_prefill, null);
+    const request = try compiledModelForwardRequest(&.{ 1, 2 }, 64, &decode_context, .paged_prefill, null, null, &.{});
     switch (request) {
         .prefill => |prefill| {
             try std.testing.expectEqual(@as(usize, 128), prefill.max_inflight_tokens);
             try std.testing.expect(prefill.allow_swa_ring);
+            try std.testing.expect(prefill.recent_query_capture == null);
+        },
+        .decode => return error.TestExpectedEqual,
+    }
+}
+
+test "compiled prefill request preserves recent query capture descriptor identity" {
+    const Callbacks = struct {
+        fn accepts(_: *anyopaque, _: u32, _: u32) bool {
+            return true;
+        }
+        fn lastEncoded(_: *anyopaque) u64 {
+            return 77;
+        }
+        fn encode(_: *anyopaque, _: model_runtime.RecentPrefillQueryCaptureEncodeRequest) anyerror!void {}
+        fn complete(_: *anyopaque, _: model_runtime.RecentPrefillQueryCaptureCompletion) anyerror!void {}
+    };
+    const capture_context: *anyopaque = @ptrFromInt(64);
+    const descriptor = model_runtime.RecentPrefillQueryCaptureDescriptor{
+        .context = capture_context,
+        .authority_epoch = 19,
+        .accepts_fn = Callbacks.accepts,
+        .last_encoded_frame_fn = Callbacks.lastEncoded,
+        .encode_fn = Callbacks.encode,
+        .complete_fn = Callbacks.complete,
+    };
+    const decode_context = gpt_arch.DecodeContext{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 8128,
+        .query_sequence_len = 448,
+        .kv_sequence_len = 8128,
+        .recent_prefill_query_capture = descriptor,
+    };
+    const request = try compiledModelForwardRequest(&.{ 1, 2 }, 8128, &decode_context, .paged_prefill, null, null, &.{});
+    switch (request) {
+        .prefill => |prefill| {
+            const actual = prefill.recent_query_capture orelse return error.TestExpectedEqual;
+            try std.testing.expect(actual.context == capture_context);
+            try std.testing.expectEqual(@as(u64, 19), actual.authority_epoch);
+            try std.testing.expect(actual.accepts_fn == Callbacks.accepts);
+            try std.testing.expect(actual.last_encoded_frame_fn == Callbacks.lastEncoded);
+            try std.testing.expect(actual.encode_fn == Callbacks.encode);
+            try std.testing.expect(actual.complete_fn == Callbacks.complete);
         },
         .decode => return error.TestExpectedEqual,
     }
@@ -101,11 +150,102 @@ test "compiled model request preserves execution control" {
         .kv_sequence_len = 2,
     };
     const control = InferenceExecutionControl{ .deadline_ns = 0 };
-    const request = try compiledModelForwardRequest(&.{7}, 2, &decode_context, .paged_decode, control);
+    const request = try compiledModelForwardRequest(&.{7}, 2, &decode_context, .paged_decode, control, null, &.{});
     switch (request) {
         .decode => |decode| try std.testing.expectError(error.Timeout, decode.check()),
         .prefill => return error.TestExpectedEqual,
     }
+}
+
+test "compiled model request preserves request suppression in both union arms" {
+    const suppress = [_]i32{ 1, 7, 11, 50, 106 };
+    const prefill_context = gpt_arch.DecodeContext{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 2,
+        .query_sequence_len = 2,
+        .kv_sequence_len = 2,
+    };
+    const prefill = try compiledModelForwardRequest(
+        &.{ 3, 4 },
+        2,
+        &prefill_context,
+        .paged_prefill,
+        null,
+        null,
+        &suppress,
+    );
+    switch (prefill) {
+        .prefill => |request| try std.testing.expectEqualSlices(i32, &suppress, request.suppress_token_ids),
+        .decode => return error.TestExpectedEqual,
+    }
+
+    const decode_context = gpt_arch.DecodeContext{
+        .attention_mode = .paged_decode,
+        .total_sequence_len = 3,
+        .query_sequence_len = 1,
+        .kv_sequence_len = 3,
+    };
+    const decode = try compiledModelForwardRequest(
+        &.{5},
+        3,
+        &decode_context,
+        .paged_decode,
+        null,
+        null,
+        &suppress,
+    );
+    switch (decode) {
+        .decode => |request| try std.testing.expectEqualSlices(i32, &suppress, request.suppress_token_ids),
+        .prefill => return error.TestExpectedEqual,
+    }
+
+    const ordinary = try compiledModelForwardRequest(
+        &.{6},
+        4,
+        &decode_context,
+        .paged_decode,
+        null,
+        null,
+        &.{},
+    );
+    switch (ordinary) {
+        .decode => |request| try std.testing.expectEqual(@as(usize, 0), request.suppress_token_ids.len),
+        .prefill => return error.TestExpectedEqual,
+    }
+}
+
+fn compiledModelPrepareRequest(pipeline: anytype, kv_tokens_hint: usize) model_runtime.PrepareRequest {
+    return .{
+        .execution_control = pipeline.execution_control,
+        .kv_tokens_hint = kv_tokens_hint,
+        .e2b_f16_mirror_admission = pipeline.e2b_f16_mirror_admission,
+    };
+}
+
+fn compiledModelPrepareAfterFreshReset(pipeline: anytype, decode_context: *const gpt_arch.DecodeContext, attention_mode: cache_mod.AttentionMode) ?model_runtime.PrepareRequest {
+    if (attention_mode != .paged_prefill or !pipeline.compiled_runtime_prepare_after_reset) return null;
+    return compiledModelPrepareRequest(pipeline, decode_context.query_sequence_len);
+}
+
+test "compiled model prepare preserves cancellation and mirror admission" {
+    const admission = ops.DecoderRuntimeE2bF16MirrorAdmission{
+        .cohort = .e2b_full35_gate_up_down,
+        .model_layer_count = 35,
+        .backend_cap_bytes = 8 * 1024 * 1024 * 1024,
+        .declared_backend_kv_bytes = 1,
+        .declared_backend_scratch_bytes = 1,
+        .max_context_tokens = 4096,
+        .max_prefill_rows = 512,
+        .layer_count = 35,
+    };
+    const pipeline = .{
+        .execution_control = @as(?InferenceExecutionControl, .{ .deadline_ns = 0 }),
+        .e2b_f16_mirror_admission = @as(?ops.DecoderRuntimeE2bF16MirrorAdmission, admission),
+    };
+    const request = compiledModelPrepareRequest(pipeline, 512);
+    try std.testing.expectEqual(@as(usize, 512), request.kv_tokens_hint);
+    try std.testing.expectEqualDeep(admission, request.e2b_f16_mirror_admission.?);
+    try std.testing.expectError(error.Timeout, request.check());
 }
 
 fn compiledBackendAttachContext(
@@ -126,7 +266,9 @@ fn compiledBackendAttachContext(
         .kv_dtype = pipeline.kv_dtype,
         .shared_moe_cache = pipeline.shared_moe_cache,
         .attention_mode = attention_mode,
+        .model_identity = pipeline.attention_match_identity,
         .attachment_target = pipeline.compiled_attachment_target,
+        .context_owner_binding = pipeline.context_owner_binding,
     };
 }
 
@@ -652,7 +794,7 @@ pub fn graphForwardCompiledModelLast(
     const allocator = pipeline.allocator;
     const attention_mode = cacheAttentionMode(decode_context);
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
-    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
+    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control, compiledModelPrepareAfterFreshReset(pipeline, decode_context, attention_mode), &.{});
     if (backend_def.execute_model_forward_direct) |execute_direct| {
         if (try execute_direct(
             allocator,
@@ -754,11 +896,92 @@ pub fn prepareCompiledModelRuntime(
         cache,
         attach_context,
         .single_device,
-        .{
-            .execution_control = pipeline.execution_control,
-            .kv_tokens_hint = kv_tokens_hint,
-        },
+        compiledModelPrepareRequest(pipeline, kv_tokens_hint),
     );
+}
+
+pub fn finishCompiledModelPrefillForDecode(
+    pipeline: anytype,
+    cache: *cache_mod.GraphCache,
+) !bool {
+    const backend = pipeline.compiled_partition_backend orelse return false;
+    if (pipeline.compiled_attachment_target != .whole_model) return false;
+    const runtime_model = cache.getSessionCompiledModelRuntime(backend, .whole_model) orelse return false;
+    return runtime_model.finishPrefillForDecode(compiledModelPrepareRequest(
+        pipeline,
+        pipeline.compiled_runtime_prepare_token_hint,
+    ));
+}
+
+/// Handoff is available only from the selected whole-model runtime. This does
+/// not relax graph routing or install the destination into generation state;
+/// the checkpoint-preparation caller must own rollback and publication.
+pub fn handoffCompiledModelExactPagedKv(
+    pipeline: anytype,
+    cache: *cache_mod.GraphCache,
+    request: model_runtime.ExactPagedKvHandoffRequest,
+) !model_runtime.ExactPagedKvHandoffReceipt {
+    const backend = pipeline.compiled_partition_backend orelse return error.UnsupportedExactPagedKvHandoff;
+    if (backend != .metal or pipeline.compiled_attachment_target != .whole_model)
+        return error.UnsupportedExactPagedKvHandoff;
+    const runtime_model = cache.getSessionCompiledModelRuntime(backend, .whole_model) orelse
+        return error.MissingCompiledModelRuntime;
+    return runtime_model.handoffExactPagedKv(request);
+}
+
+pub fn compiledModelExactPagedKvAuthority(
+    pipeline: anytype,
+    cache: *cache_mod.GraphCache,
+) !model_runtime.ExactPagedKvSourceAuthority {
+    const backend = pipeline.compiled_partition_backend orelse return error.UnsupportedExactPagedKvHandoff;
+    if (backend != .metal or pipeline.compiled_attachment_target != .whole_model)
+        return error.UnsupportedExactPagedKvHandoff;
+    const runtime_model = cache.getSessionCompiledModelRuntime(backend, .whole_model) orelse
+        return error.MissingCompiledModelRuntime;
+    return runtime_model.exactPagedKvAuthority();
+}
+
+pub fn compiledModelExactPagedKvRangeExporter(
+    pipeline: anytype,
+    cache: *cache_mod.GraphCache,
+) !@import("../runtime/kv/storage_runtime.zig").ExactLayerRangeExporter {
+    const backend = pipeline.compiled_partition_backend orelse return error.UnsupportedExactPagedKvRangeExport;
+    if (backend != .metal or pipeline.compiled_attachment_target != .whole_model)
+        return error.UnsupportedExactPagedKvRangeExport;
+    const runtime_model = cache.getSessionCompiledModelRuntime(backend, .whole_model) orelse
+        return error.MissingCompiledModelRuntime;
+    return runtime_model.exactPagedKvRangeExporter();
+}
+
+pub fn discardCompiledModelExactPagedKvSource(
+    pipeline: anytype,
+    cache: *cache_mod.GraphCache,
+    request: model_runtime.ExactPagedKvSourceDiscardRequest,
+) !model_runtime.ExactPagedKvSourceDiscardReceipt {
+    const backend = pipeline.compiled_partition_backend orelse return error.UnsupportedExactPagedKvHandoff;
+    if (backend != .metal or pipeline.compiled_attachment_target != .whole_model)
+        return error.UnsupportedExactPagedKvHandoff;
+    const runtime_model = cache.getSessionCompiledModelRuntime(backend, .whole_model) orelse
+        return error.MissingCompiledModelRuntime;
+    return runtime_model.discardExactPagedKvSource(request);
+}
+
+/// Retire the request-scoped whole-model runtime after its exact KV has been
+/// fenced into a different owner. Compiled executors and their immutable
+/// weight bindings remain in graph entries; only the session runtime (KV,
+/// activation workspaces, and request-local caches) is destroyed.
+pub fn retireCompiledModelSessionRuntime(
+    pipeline: anytype,
+    cache: *cache_mod.GraphCache,
+) !void {
+    const backend = pipeline.compiled_partition_backend orelse return error.UnsupportedExactPagedKvHandoff;
+    if (backend != .metal or pipeline.compiled_attachment_target != .whole_model)
+        return error.UnsupportedExactPagedKvHandoff;
+    if (cache.getSessionCompiledModelRuntime(backend, .whole_model) == null)
+        return error.MissingCompiledModelRuntime;
+    cache.resetSessionCompiledModelRuntime();
+    if (cache.getSessionCompiledModelRuntime(backend, .whole_model) != null)
+        return error.CompiledModelRuntimeRetirementFailed;
 }
 
 pub fn graphForwardCompiledModelOutput(
@@ -769,7 +992,28 @@ pub fn graphForwardCompiledModelOutput(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !?model_runtime.ModelOutput {
+    return graphForwardCompiledModelOutputSuppress(
+        pipeline,
+        cache,
+        input_ids,
+        batch,
+        seq_len,
+        decode_context,
+        &.{},
+    );
+}
+
+pub fn graphForwardCompiledModelOutputSuppress(
+    pipeline: anytype,
+    cache: *cache_mod.GraphCache,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    suppress_token_ids: []const i32,
+) !?model_runtime.ModelOutput {
     const backend = pipeline.compiled_partition_backend orelse return null;
+    if (suppress_token_ids.len != 0 and backend != .metal) return null;
     if (pipeline.compiled_attachment_target != .whole_model) return null;
     const backend_def = compiledBackendDefinition(backend) orelse return null;
     if (backend_def.model_runtime_strategy == .none) return null;
@@ -783,7 +1027,7 @@ pub fn graphForwardCompiledModelOutput(
 
     const attention_mode = cacheAttentionMode(decode_context);
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
-    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
+    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control, compiledModelPrepareAfterFreshReset(pipeline, decode_context, attention_mode), suppress_token_ids);
     return try execute_direct(
         pipeline.allocator,
         cache,
@@ -802,8 +1046,33 @@ pub fn graphForwardCompiledModelGreedyToken(
     decode_context: *const gpt_arch.DecodeContext,
     vocab_size: usize,
 ) !?i64 {
+    return graphForwardCompiledModelGreedyTokenSuppress(
+        pipeline,
+        cache,
+        input_ids,
+        batch,
+        seq_len,
+        decode_context,
+        vocab_size,
+        &.{},
+        true,
+    );
+}
+
+pub fn graphForwardCompiledModelGreedyTokenSuppress(
+    pipeline: anytype,
+    cache: *cache_mod.GraphCache,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    vocab_size: usize,
+    suppress_token_ids: []const i32,
+    allow_pipeline_rearm: bool,
+) !?i64 {
     _ = batch;
     const backend = pipeline.compiled_partition_backend orelse return null;
+    if (suppress_token_ids.len != 0 and backend != .metal) return null;
     if (pipeline.compiled_attachment_target != .whole_model) return null;
     const backend_def = compiledBackendDefinition(backend) orelse return null;
     if (backend_def.model_runtime_strategy == .none) return null;
@@ -811,7 +1080,11 @@ pub fn graphForwardCompiledModelGreedyToken(
 
     const attention_mode = cacheAttentionMode(decode_context);
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
-    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
+    var request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control, compiledModelPrepareAfterFreshReset(pipeline, decode_context, attention_mode), suppress_token_ids);
+    switch (request) {
+        .decode => |*decode_request| decode_request.allow_pipeline_rearm = allow_pipeline_rearm,
+        .prefill => {},
+    }
     return try execute_direct(
         pipeline.allocator,
         cache,

@@ -197,7 +197,10 @@ paths:
         to f16 and reject other cache precisions. Draft models, media, prompt caches, compiled/graph
         execution and other context/cache policies are unsupported.
 
-        The response is an AFATT001 envelope: JSON metadata followed by exactly
+        The response is an AFATT001 or AFATT002 envelope, selected from Accept:
+        AFATT002 uses application/vnd.antfly.attachments.v2 and carries opaque
+        prepared-producer authority; AFATT001 remains application/vnd.antfly.attachments.v1.
+        Both contain JSON metadata followed by exactly
         one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
         a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions, fitted global KV,
         exact local KV, saved next-token logits, loaded-model fingerprints and
@@ -214,6 +217,12 @@ paths:
       operationId: prepareNativeKvCheckpoint
       parameters:
         - in: header
+          name: Accept
+          description: Supported native checkpoint envelope media types. Send application/vnd.antfly.attachments.v2, application/vnd.antfly.attachments.v1 to prefer AFATT002 while retaining legacy fallback. If none of the requested media types is supported, the server returns 406 rather than silently changing framing.
+          required: false
+          schema:
+            type: string
+        - in: header
           name: X-Antfly-KV-Encoding
           description: Checkpoint encoding. f16 is lossless for the supported cache. fp8 stores validated fitted history in FP8 and restores it to f16, with per-head f16 fallback. rotated4 stores and serves validated fitted rows in a mixed rotated 4-bit/f16 representation, preserving protected rows exactly. f32 exports legacy V2.
           required: false
@@ -229,9 +238,13 @@ paths:
               $ref: '#/components/schemas/GenerateRequest'
       responses:
         '200':
-          description: Native checkpoint envelope; metadata conforms to NativeKvCheckpointMetadata
+          description: Native checkpoint envelope; AFATT001 metadata conforms to NativeKvCheckpointMetadata and AFATT002 outer metadata conforms to NativeKvEnvelopeV2
           content:
             application/vnd.antfly.attachments.v1:
+              schema:
+                type: string
+                format: binary
+            application/vnd.antfly.attachments.v2:
               schema:
                 type: string
                 format: binary
@@ -243,6 +256,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '413':
           description: Checkpoint exceeds transfer or state limits
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '406':
+          description: No requested native checkpoint envelope media type is supported
           content:
             application/json:
               schema:
@@ -259,8 +278,10 @@ paths:
     post:
       summary: Generate from a portable native KV checkpoint
       description: |
-        Accepts one AFATT001 envelope whose JSON metadata is a GenerateRequest
-        and whose single application/vnd.antfly.kv-checkpoint attachment is a
+        Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateRequest;
+        AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+        string contains the GenerateRequest. Its single
+        application/vnd.antfly.kv-checkpoint attachment is a
         complete native checkpoint. The metadata supplies the complete messages,
         tool definitions and template options. Their rendered tokens must have
         the checkpoint tokens as an exact prefix; prefix rewriting is rejected.
@@ -279,6 +300,10 @@ paths:
         required: true
         content:
           application/vnd.antfly.attachments.v1:
+            schema:
+              type: string
+              format: binary
+          application/vnd.antfly.attachments.v2:
             schema:
               type: string
               format: binary
@@ -316,8 +341,10 @@ paths:
     post:
       summary: Resume one checkpoint and generate serial ordinary siblings
       description: |
-        Accepts one AFATT001 envelope whose JSON metadata is a GenerateBatchRequest
-        and whose single application/vnd.antfly.kv-checkpoint attachment belongs
+        Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateBatchRequest;
+        AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+        string contains the GenerateBatchRequest. Its single
+        application/vnd.antfly.kv-checkpoint attachment belongs
         to the first request. The remaining requests use ordinary exact generation.
         All requests run serially in submission order and release their private
         generation state before the next request starts. The checkpoint remains
@@ -343,6 +370,10 @@ paths:
         required: true
         content:
           application/vnd.antfly.attachments.v1:
+            schema:
+              type: string
+              format: binary
+          application/vnd.antfly.attachments.v2:
             schema:
               type: string
               format: binary
@@ -1928,6 +1959,76 @@ components:
           schema:
             $ref: '#/components/schemas/TransientCapacityError'
   schemas:
+    NativeKvPreparedProducerV1:
+      type: object
+      additionalProperties: false
+      description: Opaque producer authority embedded as canonical JSON and base64-encoded in NativeKvEnvelopeV2. Clients preserve its exact encoded bytes; they do not edit policy fields.
+      required: [schema, model, model_artifact_sha256_hex, model_tokenizer_sha256_hex, model_template_sha256_hex, model_layout_sha256_hex, profile_sha256_hex, profile_semantic_sha256_hex, source_sha256_hex, binary_sha256_hex, policy_name, policy_sha256_hex, admission, chunk_rows, reject_exact_active_fixed_point, encoding, logical_revision, logical_tokens, checkpoint_bytes, outcome]
+      properties:
+        schema:
+          type: string
+          enum: [antfly.native-kv-prepared-producer.v1]
+        model:
+          type: string
+          minLength: 1
+        model_artifact_sha256_hex: {type: string, pattern: '^[0-9a-f]{64}$'}
+        model_tokenizer_sha256_hex: {type: string, pattern: '^[0-9a-f]{64}$'}
+        model_template_sha256_hex: {type: string, pattern: '^[0-9a-f]{64}$'}
+        model_layout_sha256_hex: {type: string, pattern: '^[0-9a-f]{64}$'}
+        profile_sha256_hex: {type: string, pattern: '^[0-9a-f]{64}$'}
+        profile_semantic_sha256_hex: {type: string, pattern: '^[0-9a-f]{64}$'}
+        source_sha256_hex:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Compiled compaction implementation semantic digest. The sealed release receipt separately binds the complete source-freeze identity.
+        binary_sha256_hex: {type: string, pattern: '^[0-9a-f]{64}$'}
+        policy_name: {type: string, minLength: 1}
+        policy_sha256_hex: {type: string, pattern: '^[0-9a-f]{64}$'}
+        admission:
+          type: string
+          enum: [fixed, cumulative_ladder_4_3_2]
+        chunk_rows:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        reject_exact_active_fixed_point: {type: boolean}
+        encoding:
+          type: string
+          enum: [f32, f16, fp8, rotated4]
+        logical_revision:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Producer lineage carried by the prepared result and forwarded unchanged. It is not compared to a nonexistent checkpoint-state revision field.
+        logical_tokens:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 32768
+        checkpoint_bytes:
+          type: integer
+          format: int64
+          minimum: 192
+          maximum: 2147483648
+        outcome:
+          type: string
+          enum: [compacted, unchanged_insufficient_savings]
+    NativeKvEnvelopeV2:
+      type: object
+      additionalProperties: false
+      required: [schema, prepared_metadata_base64]
+      properties:
+        schema:
+          type: string
+          enum: [antfly.native-kv-envelope.v2]
+        prepared_metadata_base64:
+          type: string
+          format: byte
+          maxLength: 21848
+          description: Base64 of at most 16 KiB canonical NativeKvPreparedProducerV1 JSON. Resume clients forward this exact string unchanged.
+        request_json:
+          type: string
+          description: Optional JSON-encoded GenerateRequest or GenerateBatchRequest string. This is outer request metadata and is not part of NativeKvPreparedProducerV1.
     NativeKvCheckpointMetadata:
       type: object
       additionalProperties: false
@@ -4287,6 +4388,16 @@ components:
             does not stop on the model's end-of-sequence token and continues until another stop
             condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
           default: false
+        fixed_length_mask_eos:
+          type: boolean
+          description: |
+            Qualification-only fixed-length greedy policy. When true, every primary and additional
+            end-of-sequence token is suppressed from request-local token selection until `max_tokens`
+            is reached. Requires `ignore_eos=true`, deterministic greedy sampling, and no speculative
+            decoding. HTTP serving also requires the operator qualification opt-in
+            `ANTFLY_INFERENCE_JSON_TOKEN_IDS=1`. Omitted or false preserves the existing `ignore_eos`
+            behavior.
+          default: false
         tools:
           type: array
           items:
@@ -5137,6 +5248,27 @@ components:
           nullable: true
           allOf:
             - $ref: '#/components/schemas/GenerateSpeculationStatus'
+        generated_token_ids:
+          type: array
+          items:
+            type: integer
+            format: int32
+          description: Qualification-only unfiltered generated token IDs on terminal usage chunks.
+        applied_suppress_token_ids:
+          type: array
+          items:
+            type: integer
+            format: int32
+          description: Exact deduplicated request-local suppression union applied during token selection.
+        eos_token_ids:
+          type: array
+          items:
+            type: integer
+            format: int32
+          description: EOS token IDs used by the request-scoped fixed-length mask.
+        fixed_length_mask_eos:
+          type: boolean
+          description: True when request-scoped EOS suppression was active.
     GenerateChunkChoice:
       type: object
       required:

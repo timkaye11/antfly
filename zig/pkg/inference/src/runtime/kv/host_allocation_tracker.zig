@@ -20,6 +20,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 var next_owner_identity: std.atomic.Value(u64) = .init(1);
+var next_forwarding_scope_generation: std.atomic.Value(u64) = .init(1);
 pub const context_allocation_scope_schema_version: u32 = 1;
 pub const context_batch_allocation_scope_schema_version: u32 = 1;
 
@@ -81,6 +82,20 @@ pub const DeviceBacking = enum {
     private_device,
 };
 
+pub const PrepareHostBacking = enum { ordinary_c, switchable_c, bounded_page };
+pub const bounded_prepare_e4_physical_bytes: usize = 1152 * 1024 * 1024;
+
+const AllocationBacking = enum(u8) { c, page };
+const AllocationHeader = struct {
+    magic: u64,
+    raw_len: usize,
+    base_offset: usize,
+    logical_len: usize,
+    raw_alignment: std.mem.Alignment,
+    backing: AllocationBacking,
+};
+const allocation_header_magic: u64 = 0x4146_424f_554e_4431;
+
 /// Owner-scoped C allocator with exact requested and Darwin malloc allocation
 /// accounting. The tracker must remain at a stable address until every slice
 /// allocated through allocator() has been freed.
@@ -88,6 +103,9 @@ pub const HostAllocationTracker = struct {
     owner_identity: u64,
     mutex: std.atomic.Mutex = .unlocked,
     logical_limit_bytes: ?usize = null,
+    prepare_host_backing: PrepareHostBacking = .ordinary_c,
+    prepare_host_physical_limit_bytes: ?usize = null,
+    bounded_prepare_denied: bool = false,
     logical_live_bytes: usize = 0,
     logical_peak_bytes: usize = 0,
     physical_live_bytes: usize = 0,
@@ -97,6 +115,11 @@ pub const HostAllocationTracker = struct {
     private_device_live_bytes: usize = 0,
     private_device_peak_bytes: usize = 0,
     total_peak_bytes: usize = 0,
+    /// Non-null only for a request-phase attribution scope. Backing and all
+    /// authoritative cap/peak mutations remain on this parent.
+    forwarding_parent: ?*HostAllocationTracker = null,
+    forwarding_generation: u64 = 0,
+    forwarding_closed: bool = false,
 
     const vtable: std.mem.Allocator.VTable = .{
         .alloc = alloc,
@@ -113,6 +136,167 @@ pub const HostAllocationTracker = struct {
             .physical_peak_bytes = external_control_physical_bytes,
             .total_peak_bytes = external_control_physical_bytes,
         };
+    }
+
+    pub fn initSwitchablePrepare(external_control_physical_bytes: usize) HostAllocationTracker {
+        var result = init(null, external_control_physical_bytes);
+        result.prepare_host_backing = .switchable_c;
+        return result;
+    }
+
+    pub const ForwardingScopeReceipt = struct {
+        schema_version: u32 = 1,
+        owner_identity: u64,
+        scope_generation: u64,
+        completed: bool,
+        child: Snapshot,
+        parent: Snapshot,
+    };
+
+    /// Create a stable-address child before handing out its allocator or
+    /// tracker pointer. The child is attribution only; parent remains the sole
+    /// admission and backing owner.
+    pub fn initForwardingScope(parent: *HostAllocationTracker) !HostAllocationTracker {
+        const parent_snapshot = parent.snapshot();
+        if (!parent_snapshot.available or parent_snapshot.owner_identity == 0 or
+            parent.prepare_host_backing == .switchable_c)
+            return error.InvalidBoundedPrepareOwner;
+        const generation = next_forwarding_scope_generation.fetchAdd(1, .monotonic);
+        if (generation == 0 or generation == std.math.maxInt(u64))
+            @panic("forwarding allocation generation exhausted");
+        return .{
+            .owner_identity = parent_snapshot.owner_identity,
+            .prepare_host_backing = parent.prepare_host_backing,
+            .prepare_host_physical_limit_bytes = parent.prepare_host_physical_limit_bytes,
+            .forwarding_parent = parent,
+            .forwarding_generation = generation,
+        };
+    }
+
+    pub fn closeForwardingScope(self: *HostAllocationTracker, generation: u64) !ForwardingScopeReceipt {
+        self.lock();
+        if (self.forwarding_parent == null or self.forwarding_closed or generation == 0 or generation != self.forwarding_generation) {
+            self.mutex.unlock();
+            return error.StaleContextOwnerScope;
+        }
+        if (self.logical_live_bytes != 0 or self.physical_live_bytes != 0 or
+            self.shared_backing_live_bytes != 0 or self.private_device_live_bytes != 0)
+        {
+            self.mutex.unlock();
+            return error.IncompleteContextAllocationScope;
+        }
+        self.forwarding_closed = true;
+        const child = self.snapshotLocked();
+        const parent = self.forwarding_parent.?;
+        self.mutex.unlock();
+        return .{ .owner_identity = self.owner_identity, .scope_generation = generation, .completed = true, .child = child, .parent = parent.snapshot() };
+    }
+
+    pub fn activateBoundedPrepare(self: *HostAllocationTracker, physical_limit_bytes: usize) !u64 {
+        self.lock();
+        defer self.mutex.unlock();
+        if (physical_limit_bytes != bounded_prepare_e4_physical_bytes or
+            self.prepare_host_backing != .switchable_c or
+            self.prepare_host_physical_limit_bytes != null or
+            self.physical_live_bytes > physical_limit_bytes)
+            return error.InvalidBoundedPrepareOwner;
+        self.prepare_host_backing = .bounded_page;
+        self.prepare_host_physical_limit_bytes = physical_limit_bytes;
+        return self.owner_identity;
+    }
+
+    pub fn verifyBoundedPrepare(self: *HostAllocationTracker, owner_identity: u64) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (owner_identity == 0 or owner_identity != self.owner_identity or
+            self.prepare_host_backing != .bounded_page or
+            self.prepare_host_physical_limit_bytes != bounded_prepare_e4_physical_bytes or
+            self.physical_live_bytes > bounded_prepare_e4_physical_bytes)
+            return error.InvalidBoundedPrepareOwner;
+    }
+
+    pub const BoundedPrepareAvailability = struct {
+        owner_identity: u64,
+        available_bytes: usize,
+    };
+
+    pub const PreparedAllocationRequest = struct {
+        logical_bytes: usize,
+        alignment: std.mem.Alignment,
+    };
+
+    pub const PreparedSequenceAdmission = struct {
+        owner_identity: u64,
+        available_physical_bytes: usize,
+        requested_logical_bytes: usize,
+        required_physical_bytes: usize,
+        fits: bool,
+    };
+
+    /// Read-only exact preflight for sequential allocations through the active
+    /// prepared-page allocator. It shares preparedRawLayout with allocPrepared,
+    /// including AllocationHeader, alignment slop and page rounding, and also
+    /// applies the logical limit to the cumulative sequence.
+    pub fn boundedPrepareSequenceAdmission(self: *HostAllocationTracker, requests: []const PreparedAllocationRequest) !PreparedSequenceAdmission {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.owner_identity == 0 or self.prepare_host_backing != .bounded_page or
+            self.prepare_host_physical_limit_bytes != bounded_prepare_e4_physical_bytes or
+            self.physical_live_bytes > bounded_prepare_e4_physical_bytes or requests.len == 0)
+            return error.InvalidBoundedPrepareOwner;
+        var logical: usize = 0;
+        var physical: usize = 0;
+        for (requests) |request| {
+            if (request.logical_bytes == 0) return error.InvalidBoundedPrepareOwner;
+            const layout = preparedRawLayout(request.logical_bytes, request.alignment, true) orelse return error.InvalidBoundedPrepareOwner;
+            logical = std.math.add(usize, logical, request.logical_bytes) catch return error.InvalidBoundedPrepareOwner;
+            physical = std.math.add(usize, physical, layout.len) catch return error.InvalidBoundedPrepareOwner;
+        }
+        const logical_next = std.math.add(usize, self.logical_live_bytes, logical) catch return error.InvalidBoundedPrepareOwner;
+        const physical_next = std.math.add(usize, self.physical_live_bytes, physical) catch return error.InvalidBoundedPrepareOwner;
+        return .{
+            .owner_identity = self.owner_identity,
+            .available_physical_bytes = bounded_prepare_e4_physical_bytes - self.physical_live_bytes,
+            .requested_logical_bytes = logical,
+            .required_physical_bytes = physical,
+            .fits = physical_next <= bounded_prepare_e4_physical_bytes and if (self.logical_limit_bytes) |limit| logical_next <= limit else true,
+        };
+    }
+
+    /// Exact remaining raw prepared-page authority at the instant of the
+    /// query. Callers still admit each allocation's header/alignment/page
+    /// rounding in allocPrepared; this value can only select a lower-memory
+    /// algorithm and never authorizes allocation by itself.
+    pub fn boundedPrepareAvailability(self: *HostAllocationTracker) !BoundedPrepareAvailability {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.owner_identity == 0 or self.prepare_host_backing != .bounded_page or
+            self.prepare_host_physical_limit_bytes != bounded_prepare_e4_physical_bytes or
+            self.physical_live_bytes > bounded_prepare_e4_physical_bytes)
+            return error.InvalidBoundedPrepareOwner;
+        return .{
+            .owner_identity = self.owner_identity,
+            .available_bytes = bounded_prepare_e4_physical_bytes - self.physical_live_bytes,
+        };
+    }
+
+    pub fn boundedPrepareAllocationDenied(self: *HostAllocationTracker, owner_identity: u64) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return owner_identity != 0 and owner_identity == self.owner_identity and
+            self.prepare_host_backing == .bounded_page and self.bounded_prepare_denied;
+    }
+
+    /// The request's generated-shader source is ordinary Zig host memory.
+    /// Expose this allocator only after the physical prepare cap is active;
+    /// ordinary and merely-switchable owners keep their historical allocator.
+    pub fn boundedPrepareHostAllocator(self: *HostAllocationTracker) ?std.mem.Allocator {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.prepare_host_backing != .bounded_page or
+            self.prepare_host_physical_limit_bytes != bounded_prepare_e4_physical_bytes)
+            return null;
+        return self.allocator();
     }
 
     pub fn allocator(self: *HostAllocationTracker) std.mem.Allocator {
@@ -132,6 +316,10 @@ pub const HostAllocationTracker = struct {
     pub fn snapshot(self: *HostAllocationTracker) Snapshot {
         self.lock();
         defer self.mutex.unlock();
+        return self.snapshotLocked();
+    }
+
+    fn snapshotLocked(self: *HostAllocationTracker) Snapshot {
         const physical_available = comptime physicalAccountingAvailable();
         return .{
             .available = true,
@@ -207,12 +395,24 @@ pub const HostAllocationTracker = struct {
         self.mutex.unlock();
     }
     pub fn recordSharedAllocLocked(self: *HostAllocationTracker, bytes: usize) !void {
-        self.shared_backing_live_bytes = try std.math.add(usize, self.shared_backing_live_bytes, bytes);
+        if (self.forwarding_closed) return error.StaleContextOwnerScope;
+        const child_next = try std.math.add(usize, self.shared_backing_live_bytes, bytes);
+        if (self.forwarding_parent) |parent| {
+            parent.beginSharedMutation();
+            defer parent.endSharedMutation();
+            try parent.recordSharedAllocLocked(bytes);
+        }
+        self.shared_backing_live_bytes = child_next;
         self.shared_backing_peak_bytes = @max(self.shared_backing_peak_bytes, self.shared_backing_live_bytes);
         self.recordTotalPeak();
     }
     pub fn recordSharedFreeLocked(self: *HostAllocationTracker, bytes: usize) void {
         if (bytes > self.shared_backing_live_bytes) @panic("shared backing allocation tracker underflow");
+        if (self.forwarding_parent) |parent| {
+            parent.beginSharedMutation();
+            parent.recordSharedFreeLocked(bytes);
+            parent.endSharedMutation();
+        }
         self.shared_backing_live_bytes -= bytes;
     }
 
@@ -229,6 +429,64 @@ pub const HostAllocationTracker = struct {
         newly_allocated_bytes: usize,
         final_live_bytes: usize,
     ) !void {
+        if (self.forwarding_parent) |parent| {
+            self.lock();
+            if (self.forwarding_closed) {
+                self.mutex.unlock();
+                return error.StaleContextOwnerScope;
+            }
+            const child_before = switch (backing) {
+                .shared_no_copy => self.shared_backing_live_bytes,
+                .private_device => self.private_device_live_bytes,
+            };
+            if (child_before < prior_live_bytes) {
+                self.mutex.unlock();
+                return error.InvalidOwnerAllocationTransition;
+            }
+            const child_overlap = std.math.add(usize, child_before, newly_allocated_bytes) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            const child_final = std.math.add(usize, child_before - prior_live_bytes, final_live_bytes) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            const child_other = switch (backing) {
+                .shared_no_copy => std.math.add(usize, self.physical_live_bytes, self.private_device_live_bytes),
+                .private_device => std.math.add(usize, self.physical_live_bytes, self.shared_backing_live_bytes),
+            } catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            _ = std.math.add(usize, child_other, child_overlap) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            _ = std.math.add(usize, child_other, child_final) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            parent.recordDeviceTransition(backing, prior_live_bytes, newly_allocated_bytes, final_live_bytes) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            const live = switch (backing) {
+                .shared_no_copy => &self.shared_backing_live_bytes,
+                .private_device => &self.private_device_live_bytes,
+            };
+            const peak = switch (backing) {
+                .shared_no_copy => &self.shared_backing_peak_bytes,
+                .private_device => &self.private_device_peak_bytes,
+            };
+            live.* = child_overlap;
+            peak.* = @max(peak.*, child_overlap);
+            self.recordTotalPeak();
+            live.* = child_final;
+            peak.* = @max(peak.*, child_final);
+            self.recordTotalPeak();
+            self.mutex.unlock();
+            return;
+        }
         self.lock();
         defer self.mutex.unlock();
         const live = switch (backing) {
@@ -273,9 +531,27 @@ pub const HostAllocationTracker = struct {
 
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *HostAllocationTracker = @ptrCast(@alignCast(raw));
+        if (self.forwarding_parent) |parent| {
+            self.lock();
+            if (self.forwarding_closed) {
+                self.mutex.unlock();
+                return null;
+            }
+            const ptr = parent.allocator().rawAlloc(len, alignment, ret_addr) orelse {
+                self.mutex.unlock();
+                return null;
+            };
+            const physical = forwardingPhysicalSize(parent, ptr[0..len]);
+            const recorded = self.recordAlloc(len, physical);
+            self.mutex.unlock();
+            if (!recorded) @panic("forwarding attribution overflow after parent allocation");
+            return ptr;
+        }
         self.lock();
         defer self.mutex.unlock();
         if (!self.canAdd(len)) return null;
+        if (self.prepare_host_backing != .ordinary_c)
+            return self.allocPrepared(len, alignment, ret_addr);
         // Keep the backing operation and counter publication in the same
         // critical section. A snapshot can never miss an in-flight allocation
         // and concurrent callers cannot transiently exceed the logical limit.
@@ -289,10 +565,86 @@ pub const HostAllocationTracker = struct {
         return ptr;
     }
 
+    fn preparedRawLayout(len: usize, alignment: std.mem.Alignment, page: bool) ?struct { len: usize, alignment: std.mem.Alignment } {
+        const raw_alignment = if (page) alignment.max(.fromByteUnits(std.heap.pageSize())) else alignment.max(.of(AllocationHeader));
+        const with_header = std.math.add(usize, len, @sizeOf(AllocationHeader)) catch return null;
+        const with_slop = std.math.add(usize, with_header, alignment.toByteUnits() - 1) catch return null;
+        const raw_len = if (page) std.mem.alignForward(usize, with_slop, std.heap.pageSize()) else with_slop;
+        if (raw_len < with_slop) return null;
+        return .{ .len = raw_len, .alignment = raw_alignment };
+    }
+
+    fn allocPrepared(self: *HostAllocationTracker, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const page = self.prepare_host_backing == .bounded_page;
+        const layout = preparedRawLayout(len, alignment, page) orelse return null;
+        if (self.prepare_host_physical_limit_bytes) |limit| {
+            const next = std.math.add(usize, self.physical_live_bytes, layout.len) catch {
+                self.bounded_prepare_denied = true;
+                return null;
+            };
+            if (next > limit) {
+                self.bounded_prepare_denied = true;
+                return null;
+            }
+        }
+        const base = if (page)
+            std.heap.page_allocator.rawAlloc(layout.len, layout.alignment, ret_addr)
+        else
+            std.heap.c_allocator.rawAlloc(layout.len, layout.alignment, ret_addr);
+        const raw_ptr = base orelse return null;
+        const user_addr = alignment.forward(@intFromPtr(raw_ptr) + @sizeOf(AllocationHeader));
+        const allocation_header: *AllocationHeader = @ptrFromInt(user_addr - @sizeOf(AllocationHeader));
+        allocation_header.* = .{
+            .magic = allocation_header_magic,
+            .raw_len = layout.len,
+            .base_offset = user_addr - @intFromPtr(raw_ptr),
+            .logical_len = len,
+            .raw_alignment = layout.alignment,
+            .backing = if (page) .page else .c,
+        };
+        const physical = if (page) layout.len else physicalSize(raw_ptr);
+        if (!self.recordAlloc(len, physical)) {
+            if (page) std.heap.page_allocator.rawFree(raw_ptr[0..layout.len], layout.alignment, ret_addr) else std.heap.c_allocator.rawFree(raw_ptr[0..layout.len], layout.alignment, ret_addr);
+            return null;
+        }
+        return @ptrFromInt(user_addr);
+    }
+
     fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *HostAllocationTracker = @ptrCast(@alignCast(raw));
+        if (self.forwarding_parent) |parent| {
+            if (new_len > memory.len) return false;
+            self.lock();
+            if (self.forwarding_closed) {
+                self.mutex.unlock();
+                return false;
+            }
+            const old_physical = forwardingPhysicalSize(parent, memory);
+            if (memory.len > self.logical_live_bytes or old_physical > self.physical_live_bytes) {
+                self.mutex.unlock();
+                return false;
+            }
+            if (!parent.allocator().rawResize(memory, alignment, new_len, ret_addr)) {
+                self.mutex.unlock();
+                return false;
+            }
+            const new_physical = forwardingPhysicalSize(parent, memory.ptr[0..new_len]);
+            defer self.mutex.unlock();
+            self.logical_live_bytes = self.logical_live_bytes - memory.len + new_len;
+            self.physical_live_bytes = self.physical_live_bytes - old_physical + new_physical;
+            self.recordTotalPeak();
+            return true;
+        }
         self.lock();
         defer self.mutex.unlock();
+        if (self.prepare_host_backing != .ordinary_c) {
+            if (new_len > memory.len) return false;
+            const allocation_header: *AllocationHeader = @ptrFromInt(@intFromPtr(memory.ptr) - @sizeOf(AllocationHeader));
+            if (allocation_header.magic != allocation_header_magic or allocation_header.logical_len != memory.len) return false;
+            self.logical_live_bytes = self.logical_live_bytes - memory.len + new_len;
+            allocation_header.logical_len = new_len;
+            return true;
+        }
         // Growing in place would hide the real old/new coexistence from the
         // peak counter. Decline every growth so Allocator.realloc takes the
         // tracked alloc-copy-free path. Shrinking remains address preserving.
@@ -319,6 +671,27 @@ pub const HostAllocationTracker = struct {
 
     fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *HostAllocationTracker = @ptrCast(@alignCast(raw));
+        if (self.forwarding_parent) |parent| {
+            self.lock();
+            if (self.forwarding_closed) {
+                self.mutex.unlock();
+                @panic("free through closed forwarding allocation scope");
+            }
+            const physical = forwardingPhysicalSize(parent, memory);
+            if (memory.len > self.logical_live_bytes or physical > self.physical_live_bytes) {
+                self.mutex.unlock();
+                @panic("forwarding allocation tracker underflow");
+            }
+            parent.allocator().rawFree(memory, alignment, ret_addr);
+            defer self.mutex.unlock();
+            self.logical_live_bytes -= memory.len;
+            self.physical_live_bytes -= physical;
+            return;
+        }
+        if (self.prepare_host_backing != .ordinary_c) {
+            self.freePrepared(memory, ret_addr);
+            return;
+        }
         const physical = physicalSize(memory.ptr);
         self.lock();
         if (self.logical_live_bytes < memory.len or self.physical_live_bytes < physical)
@@ -327,6 +700,36 @@ pub const HostAllocationTracker = struct {
         // thread could allocate between the counter decrement and C free and
         // the reported peak would miss a real overlap.
         std.heap.c_allocator.rawFree(memory, alignment, ret_addr);
+        self.logical_live_bytes -= memory.len;
+        self.physical_live_bytes -= physical;
+        self.mutex.unlock();
+    }
+
+    fn forwardingPhysicalSize(parent: *HostAllocationTracker, memory: []const u8) usize {
+        if (parent.prepare_host_backing == .ordinary_c) return physicalSize(@constCast(memory.ptr));
+        const header: *const AllocationHeader = @ptrFromInt(@intFromPtr(memory.ptr) - @sizeOf(AllocationHeader));
+        if (header.magic != allocation_header_magic or header.logical_len != memory.len or
+            header.base_offset < @sizeOf(AllocationHeader) or header.base_offset > header.raw_len)
+            @panic("invalid forwarding parent allocation header");
+        if (header.backing == .page) return header.raw_len;
+        const base: [*]u8 = @ptrFromInt(@intFromPtr(memory.ptr) - header.base_offset);
+        return physicalSize(base);
+    }
+
+    fn freePrepared(self: *HostAllocationTracker, memory: []u8, ret_addr: usize) void {
+        const allocation_header: *AllocationHeader = @ptrFromInt(@intFromPtr(memory.ptr) - @sizeOf(AllocationHeader));
+        if (allocation_header.magic != allocation_header_magic or allocation_header.logical_len != memory.len or
+            allocation_header.base_offset < @sizeOf(AllocationHeader) or allocation_header.base_offset > allocation_header.raw_len)
+            @panic("invalid bounded prepare allocation header");
+        const base: [*]u8 = @ptrFromInt(@intFromPtr(memory.ptr) - allocation_header.base_offset);
+        const physical = if (allocation_header.backing == .page) allocation_header.raw_len else physicalSize(base);
+        self.lock();
+        if (self.logical_live_bytes < memory.len or self.physical_live_bytes < physical) @panic("host allocation tracker underflow");
+        const raw_len = allocation_header.raw_len;
+        const raw_alignment = allocation_header.raw_alignment;
+        const backing = allocation_header.backing;
+        allocation_header.magic = 0;
+        if (backing == .page) std.heap.page_allocator.rawFree(base[0..raw_len], raw_alignment, ret_addr) else std.heap.c_allocator.rawFree(base[0..raw_len], raw_alignment, ret_addr);
         self.logical_live_bytes -= memory.len;
         self.physical_live_bytes -= physical;
         self.mutex.unlock();
@@ -359,6 +762,9 @@ pub const RequestAllocationOwner = struct {
         execution_pool_admission_version: u32 = 0,
         execution_pool_admitted_backend_bytes: usize = 0,
         typed_storage_bound: bool = false,
+        compiled_storage_required: bool = false,
+        compiled_storage_bound: bool = false,
+        compiled_storage_detached: bool = false,
         committed_drained: bool = false,
         batch: ?BatchScopeState = null,
         invalidated: bool = false,
@@ -406,6 +812,14 @@ pub const RequestAllocationOwner = struct {
         return .{ .tracker = tracker, .initial = tracker.snapshot() };
     }
 
+    pub fn initSwitchablePrepare() !RequestAllocationOwner {
+        const tracker = try std.heap.c_allocator.create(HostAllocationTracker);
+        errdefer std.heap.c_allocator.destroy(tracker);
+        const control = HostAllocationTracker.externalAllocationPhysicalSize(tracker) orelse 0;
+        tracker.* = HostAllocationTracker.initSwitchablePrepare(control);
+        return .{ .tracker = tracker, .initial = tracker.snapshot() };
+    }
+
     pub fn allocator(self: *RequestAllocationOwner) std.mem.Allocator {
         return self.tracker.allocator();
     }
@@ -427,6 +841,14 @@ pub const RequestAllocationOwner = struct {
         if (witness.load_generation == 0 or witness.load_generation != state.load_generation)
             return error.StaleContextOwnerScope;
         return state;
+    }
+
+    /// Validate an ephemeral runtime binding before an idempotent same-owner
+    /// fast path. Identity alone is insufficient because a copied witness can
+    /// name an older load generation or a scope invalidated by cancellation.
+    pub fn validateContextScopeWitness(self: *RequestAllocationOwner, witness: ContextScopeWitness) !void {
+        const state = try self.scopeState(witness);
+        if (state.invalidated) return error.InvalidContextOwnerScope;
     }
 
     /// Bind the allocator that owns rendered/tokenized context provenance and
@@ -498,6 +920,39 @@ pub const RequestAllocationOwner = struct {
         const state = try self.scopeState(witness);
         if (storage_tracker != self.tracker) return error.ContextFrameOwnershipMismatch;
         state.typed_storage_bound = true;
+    }
+
+    pub fn requireCompiledStorage(self: *RequestAllocationOwner, witness: ContextScopeWitness) !void {
+        const state = try self.scopeState(witness);
+        if (state.compiled_storage_required or state.compiled_storage_bound) return error.InvalidContextOwnerScope;
+        state.compiled_storage_required = true;
+    }
+
+    pub const CompiledStorageState = enum { not_required, required_unbound, bound_live, detached };
+
+    pub fn compiledStorageState(self: *RequestAllocationOwner, witness: ContextScopeWitness) !CompiledStorageState {
+        const state = try self.scopeState(witness);
+        if (!state.compiled_storage_required) return .not_required;
+        if (!state.compiled_storage_bound) return .required_unbound;
+        if (state.compiled_storage_detached) return .detached;
+        return .bound_live;
+    }
+
+    pub fn bindCompiledStorage(self: *RequestAllocationOwner, witness: ContextScopeWitness, storage_tracker: *HostAllocationTracker) !void {
+        const state = try self.scopeState(witness);
+        if (!state.compiled_storage_required or state.compiled_storage_bound or state.compiled_storage_detached or storage_tracker != self.tracker)
+            return error.ContextFrameOwnershipMismatch;
+        state.compiled_storage_bound = true;
+    }
+
+    /// Publish pointer revocation only after mutable runtime storage has
+    /// drained and removed this exact tracker. Cleanup remains legal for an
+    /// invalidated scope, but stale identity/generation still fail closed.
+    pub fn detachCompiledStorage(self: *RequestAllocationOwner, witness: ContextScopeWitness, storage_tracker: *HostAllocationTracker) !void {
+        const state = try self.scopeState(witness);
+        if (!state.compiled_storage_required or !state.compiled_storage_bound or state.compiled_storage_detached or storage_tracker != self.tracker)
+            return error.ContextFrameOwnershipMismatch;
+        state.compiled_storage_detached = true;
     }
 
     /// Bind one allocation ledger to the executable unit that owns it. Exact
@@ -625,7 +1080,8 @@ pub const RequestAllocationOwner = struct {
         // caller to preserve or select a special release function.
         const scope_complete = if (self.context_scope) |state|
             !state.invalidated and state.isolated_route_bound and state.prepared_allocator_bound and
-                state.execution_pool_bound and state.typed_storage_bound and state.committed_drained and
+                state.execution_pool_bound and state.typed_storage_bound and
+                (!state.compiled_storage_required or (state.compiled_storage_bound and state.compiled_storage_detached)) and state.committed_drained and
                 has_committed and (if (state.batch) |batch| batch.completed_items == batch.expected_items else true)
         else
             false;
@@ -676,6 +1132,127 @@ test "context host allocation tracker starts and returns to zero" {
     const final = tracker.snapshot();
     try std.testing.expectEqual(@as(u64, 0), final.logical_live_bytes);
     try std.testing.expectEqual(@as(u64, 0), final.physical_live_bytes);
+}
+
+test "compiled storage participant rejects missing double and stale bindings" {
+    var owner = try RequestAllocationOwner.init(null);
+    const witness = try owner.beginContextScope(7);
+    try owner.requireCompiledStorage(witness);
+    try std.testing.expectError(error.InvalidContextOwnerScope, owner.requireCompiledStorage(witness));
+
+    var foreign = HostAllocationTracker.init(null, 0);
+    try std.testing.expectError(error.ContextFrameOwnershipMismatch, owner.bindCompiledStorage(witness, &foreign));
+    var stale = witness;
+    stale.load_generation += 1;
+    try std.testing.expectError(error.StaleContextOwnerScope, owner.validateContextScopeWitness(stale));
+    try std.testing.expectError(error.StaleContextOwnerScope, owner.bindCompiledStorage(stale, owner.tracker));
+
+    try owner.validateContextScopeWitness(witness);
+
+    try owner.bindCompiledStorage(witness, owner.tracker);
+    try std.testing.expectError(error.ContextFrameOwnershipMismatch, owner.bindCompiledStorage(witness, owner.tracker));
+    try owner.detachCompiledStorage(witness, owner.tracker);
+    try std.testing.expectError(error.ContextFrameOwnershipMismatch, owner.detachCompiledStorage(witness, owner.tracker));
+    const receipt = owner.release();
+    try std.testing.expect(!receipt.context_allocation_scope_complete);
+    try std.testing.expect(!receipt.full_owner_physical_available);
+}
+
+test "compiled storage detach is permitted for invalidated cleanup but stale generation is rejected" {
+    var owner = try RequestAllocationOwner.init(null);
+    const witness = try owner.beginContextScope(11);
+    try owner.requireCompiledStorage(witness);
+    try owner.bindCompiledStorage(witness, owner.tracker);
+    try owner.invalidateContextScope(witness);
+    var stale = witness;
+    stale.load_generation += 1;
+    try std.testing.expectError(error.StaleContextOwnerScope, owner.detachCompiledStorage(stale, owner.tracker));
+    try owner.detachCompiledStorage(witness, owner.tracker);
+    _ = owner.release();
+}
+
+test "compiled runtime witness rejects invalidated scope before idempotent reuse" {
+    var owner = try RequestAllocationOwner.init(null);
+    const witness = try owner.beginContextScope(9);
+    try owner.validateContextScopeWitness(witness);
+    try owner.invalidateContextScope(witness);
+    try std.testing.expectError(error.InvalidContextOwnerScope, owner.validateContextScopeWitness(witness));
+    _ = owner.release();
+}
+
+test "switchable prepare owner frees earlier C allocation after bounded activation" {
+    var owner = try RequestAllocationOwner.initSwitchablePrepare();
+    const allocator = owner.allocator();
+    const before = try allocator.alignedAlloc(u8, .@"64", 97);
+    const identity = try owner.tracker.activateBoundedPrepare(bounded_prepare_e4_physical_bytes);
+    try owner.tracker.verifyBoundedPrepare(identity);
+    const after = try allocator.alloc(u8, std.heap.pageSize() + 1);
+    allocator.free(before);
+    allocator.free(after);
+    const receipt = owner.release();
+    try std.testing.expect(receipt.released);
+    try std.testing.expectEqual(receipt.initial.physical_live_bytes, receipt.final.physical_live_bytes);
+}
+
+test "bounded prepared sequence admission is exact at page edge and read only" {
+    var tracker = HostAllocationTracker.initSwitchablePrepare(0);
+    _ = try tracker.activateBoundedPrepare(bounded_prepare_e4_physical_bytes);
+    const alignment = std.mem.Alignment.of(f32);
+    const edge = std.heap.pageSize() - @sizeOf(AllocationHeader) - (alignment.toByteUnits() - 1);
+    const exact_requests = [_]HostAllocationTracker.PreparedAllocationRequest{
+        .{ .logical_bytes = edge, .alignment = alignment },
+        .{ .logical_bytes = edge, .alignment = alignment },
+    };
+    const one_page = HostAllocationTracker.preparedRawLayout(edge, alignment, true) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(std.heap.pageSize(), one_page.len);
+    tracker.physical_live_bytes = bounded_prepare_e4_physical_bytes - 2 * std.heap.pageSize();
+    const before = tracker.snapshot();
+    const exact = try tracker.boundedPrepareSequenceAdmission(&exact_requests);
+    try std.testing.expect(exact.fits);
+    try std.testing.expectEqual(@as(usize, 2 * std.heap.pageSize()), exact.available_physical_bytes);
+    try std.testing.expectEqual(exact.available_physical_bytes, exact.required_physical_bytes);
+    try std.testing.expectEqualDeep(before, tracker.snapshot());
+
+    var one_byte_over = exact_requests;
+    one_byte_over[0].logical_bytes += 1;
+    const rejected = try tracker.boundedPrepareSequenceAdmission(&one_byte_over);
+    try std.testing.expect(!rejected.fits);
+    try std.testing.expectEqual(@as(usize, 3 * std.heap.pageSize()), rejected.required_physical_bytes);
+    try std.testing.expectEqualDeep(before, tracker.snapshot());
+}
+
+test "bounded prepare rejects a page before mapping and preserves ledger" {
+    var tracker = HostAllocationTracker.initSwitchablePrepare(0);
+    const identity = try tracker.activateBoundedPrepare(bounded_prepare_e4_physical_bytes);
+    try tracker.verifyBoundedPrepare(identity);
+    tracker.physical_live_bytes = bounded_prepare_e4_physical_bytes - std.heap.pageSize();
+    const before = tracker.snapshot();
+    try std.testing.expectError(error.OutOfMemory, tracker.allocator().alloc(u8, std.heap.pageSize() + 1));
+    try std.testing.expectEqualDeep(before, tracker.snapshot());
+}
+
+test "bounded prepare shrink retains exact page physical charge" {
+    var owner = try RequestAllocationOwner.initSwitchablePrepare();
+    const allocator = owner.allocator();
+    _ = try owner.tracker.activateBoundedPrepare(bounded_prepare_e4_physical_bytes);
+    var bytes = try allocator.alloc(u8, std.heap.pageSize() + 1);
+    const physical = owner.tracker.snapshot().physical_live_bytes;
+    try std.testing.expect(allocator.resize(bytes, 1));
+    bytes = bytes[0..1];
+    try std.testing.expectEqual(physical, owner.tracker.snapshot().physical_live_bytes);
+    allocator.free(bytes);
+    _ = owner.release();
+}
+
+test "bounded prepare shader source allocator is exposed only after activation" {
+    var ordinary = HostAllocationTracker.init(null, 0);
+    try std.testing.expect(ordinary.boundedPrepareHostAllocator() == null);
+    var switchable = HostAllocationTracker.initSwitchablePrepare(0);
+    try std.testing.expect(switchable.boundedPrepareHostAllocator() == null);
+    const identity = try switchable.activateBoundedPrepare(bounded_prepare_e4_physical_bytes);
+    try switchable.verifyBoundedPrepare(identity);
+    const allocator = switchable.boundedPrepareHostAllocator() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&switchable)), allocator.ptr);
 }
 
 test "context host allocation tracker observes realloc overlap peak" {
@@ -907,6 +1484,82 @@ test "context host allocation tracker exposes no fake physical fallback" {
     }
 }
 
+test "forwarding query scope charges parent and drains ordinary host backing" {
+    var parent = HostAllocationTracker.init(4096, 0);
+    var child = try HostAllocationTracker.initForwardingScope(&parent);
+    const generation = child.forwarding_generation;
+    const unrelated = try parent.allocator().alloc(u8, 17);
+    const bytes = try child.allocator().alignedAlloc(u8, .fromByteUnits(64), 127);
+    try std.testing.expectEqual(@as(u64, 127), child.snapshot().logical_live_bytes);
+    try std.testing.expectEqual(@as(u64, 144), parent.snapshot().logical_live_bytes);
+    const shrunk = child.allocator().realloc(bytes, 31) catch unreachable;
+    try std.testing.expectEqual(@as(u64, 31), child.snapshot().logical_live_bytes);
+    child.allocator().free(shrunk);
+    const receipt = try child.closeForwardingScope(generation);
+    try std.testing.expect(receipt.completed);
+    try std.testing.expectEqual(@as(u64, 0), receipt.child.tracked_combined_live_bytes);
+    try std.testing.expectEqual(@as(u64, 17), receipt.parent.logical_live_bytes);
+    parent.allocator().free(unrelated);
+    try std.testing.expectError(error.StaleContextOwnerScope, child.closeForwardingScope(generation));
+}
+
+test "forwarding query scope attributes exact prepared page receipt" {
+    if (comptime !HostAllocationTracker.physicalAccountingAvailable()) return error.SkipZigTest;
+    var parent = HostAllocationTracker.initSwitchablePrepare(0);
+    _ = try parent.activateBoundedPrepare(bounded_prepare_e4_physical_bytes);
+    var child = try HostAllocationTracker.initForwardingScope(&parent);
+    const before = parent.snapshot();
+    const bytes = try child.allocator().alloc(u8, 1);
+    const parent_delta = parent.snapshot().physical_live_bytes - before.physical_live_bytes;
+    try std.testing.expect(parent_delta >= std.heap.pageSize());
+    try std.testing.expectEqual(parent_delta, child.snapshot().physical_live_bytes);
+    child.allocator().free(bytes);
+    _ = try child.closeForwardingScope(child.forwarding_generation);
+    try std.testing.expectEqual(before.physical_live_bytes, parent.snapshot().physical_live_bytes);
+}
+
+test "forwarding query scope mirrors device overlap and rejects live close" {
+    var parent = HostAllocationTracker.init(null, 0);
+    var child = try HostAllocationTracker.initForwardingScope(&parent);
+    try child.recordDeviceTransition(.private_device, 0, 4096, 4096);
+    try child.recordDeviceTransition(.private_device, 4096, 8192, 8192);
+    try std.testing.expectEqual(@as(u64, 8192), child.snapshot().private_device_live_bytes);
+    try std.testing.expect(child.snapshot().private_device_peak_bytes >= 12288);
+    try std.testing.expectEqual(child.snapshot().private_device_live_bytes, parent.snapshot().private_device_live_bytes);
+    try std.testing.expectError(error.IncompleteContextAllocationScope, child.closeForwardingScope(child.forwarding_generation));
+    try child.reconcileDeviceLive(.private_device, 8192, 0);
+    _ = try child.closeForwardingScope(child.forwarding_generation);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().private_device_live_bytes);
+}
+
+test "forwarding query scope parent fault leaves both ledgers unchanged" {
+    var parent = HostAllocationTracker.init(null, 0);
+    var child = try HostAllocationTracker.initForwardingScope(&parent);
+    const live = try child.allocator().alloc(u8, 4);
+    try parent.armNextPositiveAllocationFailure();
+    const parent_before = parent.snapshot();
+    const child_before = child.snapshot();
+    try std.testing.expect(child.allocator().rawAlloc(1, .of(u8), @returnAddress()) == null);
+    try std.testing.expectEqualDeep(parent_before, parent.snapshot());
+    try std.testing.expectEqualDeep(child_before, child.snapshot());
+    child.allocator().free(live);
+    _ = try child.closeForwardingScope(child.forwarding_generation);
+}
+
+test "forwarding query scope shared and cancellation cleanup conserve parent" {
+    var parent = HostAllocationTracker.init(null, 0);
+    var child = try HostAllocationTracker.initForwardingScope(&parent);
+    child.beginSharedMutation();
+    try child.recordSharedAllocLocked(4096);
+    child.endSharedMutation();
+    try std.testing.expectEqual(@as(u64, 4096), parent.snapshot().shared_backing_live_bytes);
+    child.beginSharedMutation();
+    child.recordSharedFreeLocked(4096);
+    child.endSharedMutation();
+    _ = try child.closeForwardingScope(child.forwarding_generation);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().tracked_combined_live_bytes);
+}
+
 test "context scope witness requires every typed binding and drained committed snapshot" {
     if (comptime !HostAllocationTracker.physicalAccountingAvailable()) return error.SkipZigTest;
     var owner = try RequestAllocationOwner.init(null);
@@ -976,6 +1629,28 @@ test "each missing context scope stage independently fails closed" {
         const receipt = owner.release();
         try std.testing.expect(!receipt.context_allocation_scope_complete);
         try std.testing.expect(!receipt.full_owner_physical_available);
+    }
+}
+
+test "compiled participant requires both bind and detach receipts for complete scope" {
+    if (comptime !HostAllocationTracker.physicalAccountingAvailable()) return error.SkipZigTest;
+    const Mode = enum { missing_bind, missing_detach, complete };
+    inline for (std.meta.tags(Mode)) |mode| {
+        var owner = try RequestAllocationOwner.init(null);
+        const witness = try owner.beginContextScope(23);
+        try owner.bindIsolatedRoute(witness, .{ .metal = true, .f16_kv = true, .prompt_cache_disabled = true, .media_disabled = true, .speculation_disabled = true, .draft_disabled = true, .legacy_qualification_disabled = true, .retained_prepared_payload = true });
+        try owner.bindPreparedAllocator(witness, owner.allocator());
+        try owner.bindExecutionPool(witness, 23, 1, 64 * 1024 * 1024);
+        try owner.bindTypedStorage(witness, owner.tracker);
+        try owner.requireCompiledStorage(witness);
+        if (mode != .missing_bind) try owner.bindCompiledStorage(witness, owner.tracker);
+        const bytes = try owner.allocator().alloc(u8, 17);
+        try owner.setDrainedCommittedSnapshot(witness, owner.tracker.snapshot());
+        owner.allocator().free(bytes);
+        if (mode == .complete) try owner.detachCompiledStorage(witness, owner.tracker);
+        const receipt = owner.release();
+        try std.testing.expectEqual(mode == .complete, receipt.context_allocation_scope_complete);
+        try std.testing.expectEqual(mode == .complete, receipt.full_owner_physical_available);
     }
 }
 

@@ -22,7 +22,7 @@ from antfly.client_generated.models.prepare_native_kv_checkpoint_x_antfly_kv_enc
 )
 from antfly.client_generated.types import File
 
-CONTENT_TYPE = "application/vnd.antfly.attachments.v1"
+CONTENT_TYPE = "application/vnd.antfly.attachments.v2"
 
 
 @pytest.mark.parametrize("encoding", ["f32", "f16", "fp8", "rotated4"])

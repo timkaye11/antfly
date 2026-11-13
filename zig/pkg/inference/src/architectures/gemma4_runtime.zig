@@ -64,6 +64,188 @@ pub fn supportsPreparedDenseRuntimeConfig(config: gpt_mod.Config) bool {
     return config.family == .gemma and !config.usesMoe();
 }
 
+/// Closed immutable authority for the physically-qualified Gemma4 E4B dense
+/// runtime. This is model identity only: it deliberately excludes mirrors,
+/// bounded PLE, handoff, scratch reservations, and optimization flags.
+pub fn isExactE4bDenseRuntimeConfig(config: gpt_mod.Config) bool {
+    if (config.family != .gemma or config.usesMoe() or config.gemma4_mtp_assistant or
+        !config.gemma4_channel_protocol or !config.hasPle()) return false;
+    if (config.hidden_size != 2560 or config.num_hidden_layers != 42 or
+        config.vocab_size != 262144 or config.ple_hidden_size != 256 or
+        config.num_kv_shared_layers != 18 or config.intermediate_size != 10240 or
+        config.num_attention_heads != 8 or config.num_key_value_heads != 2 or
+        config.headDim() != 256 or config.global_head_dim != 512 or
+        config.sliding_window != 512) return false;
+    if (config.shared_layer_intermediate_size != 0 and
+        config.shared_layer_intermediate_size != 10240) return false;
+    for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+        if (config.intermediateSize(layer) != 10240) return false;
+    }
+    return true;
+}
+
+/// Closed model identity for the E2B fused-Half prefill candidate. Optimization
+/// policy and physical route readiness remain separate runtime authority.
+pub fn isExactE2bDenseRuntimeConfig(config: gpt_mod.Config) bool {
+    if (config.family != .gemma or config.usesMoe() or config.gemma4_mtp_assistant or
+        !config.gemma4_channel_protocol or !config.hasPle()) return false;
+    if (config.hidden_size != 1536 or config.num_hidden_layers != 35 or
+        config.vocab_size != 262144 or config.ple_hidden_size != 256 or
+        config.num_kv_shared_layers != 20 or config.intermediate_size != 6144 or
+        config.shared_layer_intermediate_size != 12288 or
+        config.num_attention_heads != 8 or config.num_key_value_heads != 1 or
+        config.headDim() != 256 or config.global_head_dim != 512 or
+        config.sliding_window != 512) return false;
+    for (0..15) |layer| if (config.intermediateSize(layer) != 6144) return false;
+    for (15..35) |layer| if (config.intermediateSize(layer) != 12288) return false;
+    return true;
+}
+
+test "exact E2B dense runtime authority closes both FFN width cohorts" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .vocab_size = 262144,
+        .ple_hidden_size = 256,
+        .num_kv_shared_layers = 20,
+        .intermediate_size = 6144,
+        .shared_layer_intermediate_size = 12288,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+    };
+    try std.testing.expect(isExactE2bDenseRuntimeConfig(config));
+    const exact = config;
+    config.shared_layer_intermediate_size = 6144;
+    try std.testing.expect(!isExactE2bDenseRuntimeConfig(config));
+    config = exact;
+    config.num_kv_shared_layers = 19;
+    try std.testing.expect(!isExactE2bDenseRuntimeConfig(config));
+    config = exact;
+    config.num_key_value_heads = 2;
+    try std.testing.expect(!isExactE2bDenseRuntimeConfig(config));
+    config = exact;
+    config.hidden_size = 2560;
+    try std.testing.expect(!isExactE2bDenseRuntimeConfig(config));
+    config = exact;
+    config.gemma4_channel_protocol = false;
+    try std.testing.expect(!isExactE2bDenseRuntimeConfig(config));
+}
+
+test "exact E4B dense runtime authority is closed and mirror independent" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .vocab_size = 262144,
+        .ple_hidden_size = 256,
+        .num_kv_shared_layers = 18,
+        .intermediate_size = 10240,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+    };
+    try std.testing.expect(isExactE4bDenseRuntimeConfig(config));
+    const exact = config;
+    config.family = .llama;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.gemma4_mtp_assistant = true;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.gemma4_channel_protocol = false;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.hidden_size = 2559;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.num_hidden_layers = 41;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.vocab_size = 262143;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.ple_hidden_size = 0;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.num_kv_shared_layers = 17;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.intermediate_size = 10239;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.num_attention_heads = 7;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.num_key_value_heads = 1;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.attention_head_dim = 255;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.global_head_dim = 511;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config = exact;
+    config.sliding_window = 511;
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+}
+
+test "exact E4B dense runtime authority rejects MoE PLE and shared FFN variants" {
+    const exact = gpt_mod.Config{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .vocab_size = 262144,
+        .ple_hidden_size = 256,
+        .num_kv_shared_layers = 18,
+        .intermediate_size = 10240,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+    };
+    try std.testing.expect(isExactE4bDenseRuntimeConfig(exact));
+
+    var config = exact;
+    config.num_local_experts = 128;
+    config.num_experts_per_tok = 8;
+    try std.testing.expect(config.usesMoe());
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+
+    config = exact;
+    config.ple_hidden_size = 255;
+    try std.testing.expect(config.hasPle());
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+    config.ple_hidden_size = 0;
+    try std.testing.expect(!config.hasPle());
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+
+    config = exact;
+    config.shared_layer_intermediate_size = 10240;
+    try std.testing.expectEqual(@as(u32, 10240), config.intermediateSize(23));
+    try std.testing.expectEqual(@as(u32, 10240), config.intermediateSize(24));
+    try std.testing.expect(isExactE4bDenseRuntimeConfig(config));
+
+    config = exact;
+    config.shared_layer_intermediate_size = 10239;
+    // Config has one shared-tail override rather than an arbitrary per-layer
+    // array. Prove both sides of its actual layer boundary before asserting
+    // that the exact runtime authority rejects the changed layer geometry.
+    try std.testing.expectEqual(@as(u32, 10240), config.intermediateSize(23));
+    try std.testing.expectEqual(@as(u32, 10239), config.intermediateSize(24));
+    try std.testing.expectEqual(@as(u32, 10239), config.intermediateSize(41));
+    try std.testing.expect(!isExactE4bDenseRuntimeConfig(config));
+}
+
 /// The prepared A4B decoder intentionally sits behind the resident/high-memory
 /// lane. This keeps the compact 2 GiB contract unchanged while allowing larger
 /// Apple Silicon systems to retain all packed experts and backend descriptors.

@@ -2596,6 +2596,14 @@ pub const GenerateChunk = struct {
     /// Authoritative token accounting. When `stream_options.include_usage` is true, streaming responses emit this only on the final chunk, after the finish chunk and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
     usage: OpenApiOptionalNullable(GenerateUsage) = .absent,
     speculation: OpenApiOptionalNullable(GenerateSpeculationStatus) = .absent,
+    /// Qualification-only unfiltered generated token IDs on terminal usage chunks.
+    generated_token_ids: ?[]const i32 = null,
+    /// Exact deduplicated request-local suppression union applied during token selection.
+    applied_suppress_token_ids: ?[]const i32 = null,
+    /// EOS token IDs used by the request-scoped fixed-length mask.
+    eos_token_ids: ?[]const i32 = null,
+    /// True when request-scoped EOS suppression was active.
+    fixed_length_mask_eos: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -2607,6 +2615,10 @@ pub const GenerateChunk = struct {
         .{ "context", "context", true },
         .{ "usage", "usage", false },
         .{ "speculation", "speculation", false },
+        .{ "generated_token_ids", "generated_token_ids", true },
+        .{ "applied_suppress_token_ids", "applied_suppress_token_ids", true },
+        .{ "eos_token_ids", "eos_token_ids", true },
+        .{ "fixed_length_mask_eos", "fixed_length_mask_eos", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2654,6 +2666,22 @@ pub const GenerateChunk = struct {
                 try jw.objectField("speculation");
                 try jw.write(value);
             },
+        }
+        if (self.generated_token_ids) |value| {
+            try jw.objectField("generated_token_ids");
+            try jw.write(value);
+        }
+        if (self.applied_suppress_token_ids) |value| {
+            try jw.objectField("applied_suppress_token_ids");
+            try jw.write(value);
+        }
+        if (self.eos_token_ids) |value| {
+            try jw.objectField("eos_token_ids");
+            try jw.write(value);
+        }
+        if (self.fixed_length_mask_eos) |value| {
+            try jw.objectField("fixed_length_mask_eos");
+            try jw.write(value);
         }
         try jw.endObject();
     }
@@ -2960,6 +2988,8 @@ pub const GenerateRequest = struct {
     chat_template_kwargs: ?GenerateChatTemplateKwargs = null,
     /// inference-native benchmarking and controlled-generation extension. When true, generation does not stop on the model's end-of-sequence token and continues until another stop condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
     ignore_eos: ?bool = null,
+    /// Qualification-only fixed-length greedy policy. When true, every primary and additional end-of-sequence token is suppressed from request-local token selection until `max_tokens` is reached. Requires `ignore_eos=true`, deterministic greedy sampling, and no speculative decoding. HTTP serving also requires the operator qualification opt-in `ANTFLY_INFERENCE_JSON_TOKEN_IDS=1`. Omitted or false preserves the existing `ignore_eos` behavior.
+    fixed_length_mask_eos: ?bool = null,
     /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
     tools: ?[]const Tool = null,
     /// Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
@@ -3015,6 +3045,7 @@ pub const GenerateRequest = struct {
         .{ "stream_options", "stream_options", true },
         .{ "chat_template_kwargs", "chat_template_kwargs", true },
         .{ "ignore_eos", "ignore_eos", true },
+        .{ "fixed_length_mask_eos", "fixed_length_mask_eos", true },
         .{ "tools", "tools", true },
         .{ "min_p", "min_p", true },
         .{ "repetition_penalty", "repetition_penalty", true },
@@ -3091,6 +3122,10 @@ pub const GenerateRequest = struct {
         }
         if (self.ignore_eos) |value| {
             try jw.objectField("ignore_eos");
+            try jw.write(value);
+        }
+        if (self.fixed_length_mask_eos) |value| {
+            try jw.objectField("fixed_length_mask_eos");
             try jw.write(value);
         }
         if (self.tools) |value| {
@@ -4128,6 +4163,68 @@ pub const NativeKvCheckpointMetadata = struct {
         try jw.write(self.preserved_heads);
         try jw.endObject();
     }
+};
+
+pub const NativeKvEnvelopeV2 = struct {
+    schema: []const u8,
+    /// Base64 of at most 16 KiB canonical NativeKvPreparedProducerV1 JSON. Resume clients forward this exact string unchanged.
+    prepared_metadata_base64: []const u8,
+    /// Optional JSON-encoded GenerateRequest or GenerateBatchRequest string. This is outer request metadata and is not part of NativeKvPreparedProducerV1.
+    request_json: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema", "schema", false },
+        .{ "prepared_metadata_base64", "prepared_metadata_base64", false },
+        .{ "request_json", "request_json", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema");
+        try jw.write(self.schema);
+        try jw.objectField("prepared_metadata_base64");
+        try jw.write(self.prepared_metadata_base64);
+        if (self.request_json) |value| {
+            try jw.objectField("request_json");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opaque producer authority embedded as canonical JSON and base64-encoded in NativeKvEnvelopeV2. Clients preserve its exact encoded bytes; they do not edit policy fields.
+pub const NativeKvPreparedProducerV1 = struct {
+    schema: []const u8,
+    model: []const u8,
+    model_artifact_sha256_hex: []const u8,
+    model_tokenizer_sha256_hex: []const u8,
+    model_template_sha256_hex: []const u8,
+    model_layout_sha256_hex: []const u8,
+    profile_sha256_hex: []const u8,
+    profile_semantic_sha256_hex: []const u8,
+    /// Compiled compaction implementation semantic digest. The sealed release receipt separately binds the complete source-freeze identity.
+    source_sha256_hex: []const u8,
+    binary_sha256_hex: []const u8,
+    policy_name: []const u8,
+    policy_sha256_hex: []const u8,
+    admission: []const u8,
+    chunk_rows: i64,
+    reject_exact_active_fixed_point: bool,
+    encoding: []const u8,
+    /// Producer lineage carried by the prepared result and forwarded unchanged. It is not compared to a nonexistent checkpoint-state revision field.
+    logical_revision: i64,
+    logical_tokens: i64,
+    checkpoint_bytes: i64,
+    outcome: []const u8,
 };
 
 pub const PredictRequest = struct {

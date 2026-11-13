@@ -28,11 +28,18 @@ const Control = @import("attention_match.zig").Control;
 /// This selects calibration inputs; it never changes the authoritative history
 /// or authorizes a candidate without the independent numerical validation.
 pub fn studyTokens(allocator: std.mem.Allocator, source: []const i64, maximum: usize) ![]i64 {
+    return studyTokensPass(allocator, source, maximum, 0);
+}
+
+pub fn studyTokensPass(allocator: std.mem.Allocator, source: []const i64, maximum: usize, pass: u8) ![]i64 {
     if (source.len < 2 or source.len > checkpoint.max_context_tokens or maximum < 2 or maximum > checkpoint.max_context_tokens)
         return error.CompactionQueryLimit;
+    if (pass > 1) return error.CompactionQueryLimit;
     for (source) |token| if (token < 0) return error.InvalidCompactionQueries;
-    if (source.len <= maximum or maximum < 256)
+    if (source.len <= maximum or maximum < 256) {
+        if (pass != 0) return error.CompactionQueryLimit;
         return allocator.dupe(i64, source[source.len - @min(source.len, maximum) ..]);
+    }
     const window = 64;
     // Split the bounded budget between historical spans and recent context.
     // Two historical windows can both be occupied by tool declarations,
@@ -61,22 +68,24 @@ pub fn studyTokens(allocator: std.mem.Allocator, source: []const i64, maximum: u
     }
     const scores = try allocator.alloc(f64, count);
     defer allocator.free(scores);
-    const selected = try allocator.alloc(bool, count);
-    defer allocator.free(selected);
-    @memset(selected, false);
+    const rank = try allocator.alloc(u16, count);
+    defer allocator.free(rank);
+    @memset(rank, std.math.maxInt(u16));
+    const total_take = try std.math.mul(usize, take, @as(usize, pass) + 1);
+    if (total_take > count or total_take > std.math.maxInt(u16)) return error.CompactionQueryLimit;
     for (scores, 0..) |*value, i| {
         value.* = 0;
         for (frequency[i * window ..][0..window]) |n| value.* += 1.0 / @as(f64, @floatFromInt(n));
     }
-    for (0..take) |_| {
+    for (0..total_take) |selection_index| {
         var best: ?usize = null;
         var best_distance: usize = 0;
         for (scores, 0..) |value, i| {
-            if (selected[i]) continue;
+            if (rank[i] != std.math.maxInt(u16)) continue;
             // Equal-scoring boilerplate is spread across the prefix instead
             // of filling every remaining slot with adjacent early windows.
             var distance = count - i;
-            for (selected, 0..) |chosen, j| if (chosen) {
+            for (rank, 0..) |chosen, j| if (chosen != std.math.maxInt(u16)) {
                 distance = @min(distance, if (i > j) i - j else j - i);
             };
             if (best == null or value > scores[best.?] or
@@ -86,14 +95,17 @@ pub fn studyTokens(allocator: std.mem.Allocator, source: []const i64, maximum: u
                 best_distance = distance;
             }
         }
-        selected[best orelse return error.InvalidCompactionQueries] = true;
+        rank[best orelse return error.InvalidCompactionQueries] = @intCast(selection_index);
     }
     const result = try allocator.alloc(i64, maximum);
     var written: usize = 0;
-    for (selected, 0..) |chosen, i| if (chosen) {
+    const first_rank = @as(usize, pass) * take;
+    const last_rank = first_rank + take;
+    for (rank, 0..) |chosen, i| if (chosen >= first_rank and chosen < last_rank) {
         @memcpy(result[written..][0..window], source[i * window ..][0..window]);
         written += window;
     };
+    if (written != informative) return error.InvalidCompactionQueries;
     @memcpy(result[written..], source[source.len - recent ..]);
     return result;
 }
@@ -185,6 +197,9 @@ pub const Options = struct {
     heldout_stride: usize = 5,
     max_bytes: usize = 64 * 1024 * 1024,
     max_capture_rows: usize = 512,
+    /// DEV-only explicit positions within the repeat. Null preserves the
+    /// historical evenly-spaced sampler byte-for-byte.
+    explicit_sample_offsets: ?[]const u32 = null,
 };
 
 const Sample = struct { position: u64, heldout: bool, index: usize };
@@ -210,6 +225,12 @@ fn plan(consumers: []const Consumer, source_length: usize, repeat_length: usize,
     _ = try add(source_length, repeat_length);
     const samples = @min(repeat_length, options.samples_per_consumer);
     if (samples > 1024) return error.CompactionQueryLimit;
+    if (options.explicit_sample_offsets) |offsets| {
+        if (offsets.len != options.samples_per_consumer or offsets.len != samples) return error.InvalidCompactionQueries;
+        for (offsets, 0..) |offset, i| {
+            if (offset >= repeat_length or (i > 0 and offsets[i - 1] >= offset)) return error.InvalidCompactionQueries;
+        }
+    }
     const heldout = (samples - 1) / options.heldout_stride + 1;
     var heads: usize = 0;
     var width: usize = 0;
@@ -295,7 +316,8 @@ pub const Collector = struct {
         var nh: usize = 0;
         for (samples, 0..) |*sample, i| {
             // Include both ends of the repeat and keep integer positions unique.
-            const position = try add(source_length, (try mul(i, repeat_length - 1)) / (p.samples - 1));
+            const offset = if (options.explicit_sample_offsets) |offsets| offsets[i] else (try mul(i, repeat_length - 1)) / (p.samples - 1);
+            const position = try add(source_length, offset);
             const heldout = i % options.heldout_stride == 0;
             sample.* = .{ .position = position, .heldout = heldout, .index = if (heldout) nh else nt };
             if (heldout) {
@@ -458,6 +480,30 @@ test "attention_match queries sample entire repeat and split every GQA/shared co
     try std.testing.expectEqualSlices(f32, &.{ 2086, 2087 }, batches[7].heldout);
 }
 
+test "explicit sample offsets own exact positions and preserve default sampler" {
+    const one = [_]Consumer{.{ .layer = 0, .donor = 0, .query_heads = 1, .kv_heads = 1, .dim = 1 }};
+    const offsets = [_]u32{ 0, 2, 5, 7 };
+    var explicit = try Collector.init(std.testing.allocator, &one, 8, 8, .{ .samples_per_consumer = 4, .max_capture_rows = 4, .explicit_sample_offsets = &offsets });
+    defer explicit.deinit();
+    try std.testing.expectEqual(@as(u64, 8), explicit.samples[0].position);
+    try std.testing.expectEqual(@as(u64, 10), explicit.samples[1].position);
+    try std.testing.expectEqual(@as(u64, 13), explicit.samples[2].position);
+    try std.testing.expectEqual(@as(u64, 15), explicit.samples[3].position);
+    var baseline = try Collector.init(std.testing.allocator, &one, 8, 8, .{ .samples_per_consumer = 4, .max_capture_rows = 4 });
+    defer baseline.deinit();
+    try std.testing.expectEqual(@as(u64, 8), baseline.samples[0].position);
+    try std.testing.expectEqual(@as(u64, 10), baseline.samples[1].position);
+    try std.testing.expectEqual(@as(u64, 12), baseline.samples[2].position);
+    try std.testing.expectEqual(@as(u64, 15), baseline.samples[3].position);
+}
+
+test "explicit sample offsets reject count bounds and ordering before allocation" {
+    const one = [_]Consumer{.{ .layer = 0, .donor = 0, .query_heads = 1, .kv_heads = 1, .dim = 1 }};
+    try std.testing.expectError(error.InvalidCompactionQueries, Collector.init(std.testing.allocator, &one, 8, 8, .{ .samples_per_consumer = 4, .explicit_sample_offsets = &.{ 0, 2, 3 } }));
+    try std.testing.expectError(error.InvalidCompactionQueries, Collector.init(std.testing.allocator, &one, 8, 8, .{ .samples_per_consumer = 4, .explicit_sample_offsets = &.{ 0, 2, 2, 7 } }));
+    try std.testing.expectError(error.InvalidCompactionQueries, Collector.init(std.testing.allocator, &one, 8, 8, .{ .samples_per_consumer = 4, .explicit_sample_offsets = &.{ 0, 2, 3, 8 } }));
+}
+
 test "attention_match queries reject missing consumers bad shapes nonfinite values and budgets" {
     var collector = try Collector.init(std.testing.allocator, &fixture, 8, 8, .{ .samples_per_consumer = 4, .max_capture_rows = 4 });
     defer collector.deinit();
@@ -602,4 +648,22 @@ test "attention_match Metal calibration seal separates roles geometry positions 
     try std.testing.expectError(error.Cancelled, collector.seal(.{ .check_fn = Stop.check }));
     collector.values[0] = std.math.nan(f32);
     try std.testing.expectError(error.NonFiniteAttention, collector.seal(.{}));
+}
+
+test "attention_match consecutive study pass is deterministic and historically disjoint" {
+    var source: [2048]i64 = undefined;
+    for (&source, 0..) |*token, i| token.* = @intCast(i);
+    const zero = try studyTokens(std.testing.allocator, &source, 512);
+    defer std.testing.allocator.free(zero);
+    const explicit_zero = try studyTokensPass(std.testing.allocator, &source, 512, 0);
+    defer std.testing.allocator.free(explicit_zero);
+    const one = try studyTokensPass(std.testing.allocator, &source, 512, 1);
+    defer std.testing.allocator.free(one);
+    try std.testing.expectEqualSlices(i64, zero, explicit_zero);
+    try std.testing.expectEqualSlices(i64, zero[256..], one[256..]);
+    for (0..4) |left| for (0..4) |right| try std.testing.expect(!std.mem.eql(i64, zero[left * 64 ..][0..64], one[right * 64 ..][0..64]));
+    const again = try studyTokensPass(std.testing.allocator, &source, 512, 1);
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqualSlices(i64, one, again);
+    try std.testing.expectError(error.CompactionQueryLimit, studyTokensPass(std.testing.allocator, &source, 512, 2));
 }

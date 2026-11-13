@@ -20,8 +20,11 @@
 // and loops until EOS or max_tokens. Matches Go inference's TextGenerationPipeline.
 
 const std = @import("std");
+const prompt_lookup = @import("prompt_lookup.zig");
 const native_kv_checkpoint = @import("../runtime/kv/attention_match_checkpoint.zig");
 const native_checkpoint_release = @import("../runtime/kv/attention_match_release.zig");
+const quality_mod = @import("../runtime/kv/metal_checkpoint_quality.zig");
+const compaction_identity = @import("compaction_identity");
 const builtin = @import("builtin");
 const context_fault_injection = @import("../context_fault_injection.zig");
 const Gemma4Projection = @import("gemma4_channels.zig").Projection;
@@ -48,6 +51,14 @@ const context_study_runner = @import("../backends/context_study_runner.zig");
 const context_teacher_forced = @import("../backends/context_teacher_forced.zig");
 const decoder_tail_runtime = @import("../backends/decoder_tail_runtime.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
+const recent_prefill_capture = @import("../runtime/kv/attention_match_prefill_recent64_capture.zig");
+const metal_recent_prefill_capture = @import("../backends/metal_recent_prefill_query_capture.zig");
+const future_train_p64_capture = @import("../runtime/kv/attention_match_future_train_p64_capture.zig");
+const metal_future_train_p64_capture = @import("../backends/metal_future_train_p64_capture.zig");
+const future_train_phase_p64_capture = @import("../runtime/kv/attention_match_future_train_phase_p64_capture.zig");
+const metal_future_train_phase_p64_capture = @import("../backends/metal_future_train_phase_p64_capture.zig");
+const future_hho_equivalence_capture = @import("../runtime/kv/attention_match_future_hho_equivalence_capture.zig");
+const metal_future_hho_equivalence_capture = @import("../backends/metal_future_hho_equivalence_capture.zig");
 const runtime = @import("../runtime/root.zig");
 const jinja = @import("jinja");
 const grammar_mod = @import("grammar.zig");
@@ -67,6 +78,15 @@ fn selectedScoreCancellationCheck(raw: ?*anyopaque) callconv(.c) c_int {
     const control: *const InferenceExecutionControl = @ptrCast(@alignCast(raw orelse return 0));
     control.check() catch return 1;
     return 0;
+}
+
+test "compiled whole-model decode disables only known terminal continuation" {
+    try std.testing.expect(NativeGenerationPipeline.decodeBudgetAllowsPipelineRearm(0, 300));
+    try std.testing.expect(NativeGenerationPipeline.decodeBudgetAllowsPipelineRearm(298, 300));
+    try std.testing.expect(!NativeGenerationPipeline.decodeBudgetAllowsPipelineRearm(299, 300));
+    try std.testing.expect(!NativeGenerationPipeline.decodeBudgetAllowsPipelineRearm(1, 2));
+    try std.testing.expect(!NativeGenerationPipeline.decodeBudgetAllowsPipelineRearm(0, 1));
+    try std.testing.expect(!NativeGenerationPipeline.decodeBudgetAllowsPipelineRearm(0, 0));
 }
 
 var next_quality_context_instance: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) std.atomic.Value(u64).init(1) else {};
@@ -352,6 +372,22 @@ pub fn nativeGenerationPrefillChunkCeiling(
     config: gpt_mod.Config,
     configured_ceiling: usize,
 ) usize {
+    return nativeGenerationPrefillChunkCeilingPolicy(
+        backend,
+        config,
+        configured_ceiling,
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_E4_PREFILL_CHUNK_2048", false),
+        platform.env.getenvBoolDefault("ANTFLY_DISABLE_GEMMA4_METAL_E4_PREFILL_CHUNK_2048", false),
+    );
+}
+
+fn nativeGenerationPrefillChunkCeilingPolicy(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+    configured_ceiling: usize,
+    enable_e4_diagnostic: bool,
+    disable_e4_diagnostic: bool,
+) usize {
     const ceiling = @max(configured_ceiling, 1);
     if (backend == .metal and
         config.family == .gemma and
@@ -363,6 +399,13 @@ pub fn nativeGenerationPrefillChunkCeiling(
         config.sliding_window == 512 and
         !config.gemma4_mtp_assistant)
     {
+        const exact_e4 = config.hidden_size == 2560 and
+            config.num_hidden_layers == 42 and
+            config.intermediate_size == 10240 and
+            config.num_kv_shared_layers == 18;
+        if (exact_e4 and enable_e4_diagnostic and !disable_e4_diagnostic) {
+            return @min(ceiling, 2048);
+        }
         return @min(ceiling, 512);
     }
     // Gemma4 E2B CUDA evidence currently selects the fixed 512-row schedule.
@@ -388,6 +431,25 @@ pub fn nativeGenerationPrefillChunkCeiling(
         return @min(ceiling, 512);
     }
     return ceiling;
+}
+
+/// Diagnostic telemetry only. Admission remains authoritative and callers log
+/// only the chunk already selected and committed by the request budget.
+pub fn traceNativeGenerationE4PrefillChunkAdmission(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+    prompt_tokens: usize,
+    selected_chunk_rows: usize,
+) void {
+    if (backend != .metal or
+        !platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_E4_PREFILL_CHUNK_2048", false) or
+        platform.env.getenvBoolDefault("ANTFLY_DISABLE_GEMMA4_METAL_E4_PREFILL_CHUNK_2048", false) or
+        config.family != .gemma or config.hidden_size != 2560 or config.num_hidden_layers != 42 or
+        config.num_attention_heads != 8 or config.effectiveKVHeads() != 2 or config.headDim() != 256 or
+        config.global_head_dim != 512 or config.intermediate_size != 10240 or
+        config.num_kv_shared_layers != 18 or config.sliding_window != 512 or
+        !config.hasPle() or config.gemma4_mtp_assistant) return;
+    std.log.info("metal_e4_prefill_chunk2048_admission: selected_rows={d} prompt_tokens={d}", .{ selected_chunk_rows, prompt_tokens });
 }
 
 pub fn userFacingErrorMessage(err: anyerror) []const u8 {
@@ -447,6 +509,899 @@ pub const CompactionQualification = struct {
     publish: bool = false,
 };
 
+pub const NativeCheckpointQualificationArm = enum { optimal_compiled_exact, packed_exact, attention_matching };
+
+fn stagedPublishDisposition(compacted: bool, validation_complete: bool, request_private_publish_complete: bool) !bool {
+    if (!compacted) return false;
+    if (!validation_complete or !request_private_publish_complete) return error.InvalidNativeCheckpointResult;
+    return true;
+}
+
+test "native checkpoint staged publication distinguishes unchanged from malformed compacted evidence" {
+    try std.testing.expect(!try stagedPublishDisposition(false, false, false));
+    try std.testing.expect(!try stagedPublishDisposition(false, true, true));
+    try std.testing.expect(try stagedPublishDisposition(true, true, true));
+    try std.testing.expectError(error.InvalidNativeCheckpointResult, stagedPublishDisposition(true, false, true));
+    try std.testing.expectError(error.InvalidNativeCheckpointResult, stagedPublishDisposition(true, true, false));
+}
+pub const NativeCheckpointTrainingPolicy = enum { primary_only, private_dense512_reference_v1, private_future_decode_mix_v1, private_train_challenge_hybrid_resident_v1 };
+
+pub const ResidentHybridCohort = enum { e4_8128_v1, e2_8128_v1, e4_formal_7936_256_v1, e4_formal_32512_256_v1 };
+
+pub const ResidentHybridAuthority = struct {
+    cohort: ResidentHybridCohort = .e4_8128_v1,
+    e4_formal_authority: ?@import("../runtime/kv/attention_match_e4_formal_authority.zig").Authority = null,
+    e2_guarded_development_trial: bool = false,
+    /// Exact authenticated E2 fit source shape. Transport capacity is not an
+    /// authority for this field; the configuration and shape digests bind it.
+    e2_fit_source_rows: usize = 8128,
+    e2_formal_owner_inventory_sha256: [32]u8 = @splat(0),
+    e2_formal_owner_inventory: ?@import("../runtime/kv/attention_match_e2_formal_owner_inventory.zig").Artifact = null,
+    configuration_sha256: [32]u8,
+    source_freeze_sha256: [32]u8,
+    shape_authority_sha256: [32]u8,
+    policy_module_sha256: [32]u8,
+
+    pub fn validate(self: @This()) !void {
+        const expected_formal_cohort: ?@import("../runtime/kv/attention_match_e4_formal_authority.zig").Cohort = switch (self.cohort) {
+            .e4_formal_7936_256_v1 => .formal_7936_256_v1,
+            .e4_formal_32512_256_v1 => .formal_32512_256_v1,
+            else => null,
+        };
+        if (expected_formal_cohort) |formal_cohort| {
+            const formal = self.e4_formal_authority orelse return error.UnqualifiedCompactionArtifact;
+            try formal.validate();
+            if (formal.cohort != formal_cohort or
+                !std.mem.eql(u8, &formal.configuration_sha256, &self.configuration_sha256) or
+                !std.mem.eql(u8, &formal.source_freeze_sha256, &self.source_freeze_sha256) or
+                !std.mem.eql(u8, &formal.shape_authority_sha256, &self.shape_authority_sha256) or
+                !std.mem.eql(u8, &formal.policy_module_sha256, &self.policy_module_sha256))
+                return error.UnqualifiedCompactionArtifact;
+        } else if (self.e4_formal_authority != null) return error.UnqualifiedCompactionArtifact;
+        inline for (.{ self.configuration_sha256, self.source_freeze_sha256, self.shape_authority_sha256, self.policy_module_sha256 }) |digest_value|
+            if (std.mem.allEqual(u8, &digest_value, 0)) return error.UnqualifiedCompactionArtifact;
+        const expected_module_sha256: [32]u8 = switch (self.cohort) {
+            .e4_8128_v1 => blk: {
+                var value: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&value, "e0a407063023d89c40f516270081012329a8981dc5c64de2dd8a985d8469afee") catch unreachable;
+                break :blk value;
+            },
+            .e2_8128_v1 => if (self.e2_fit_source_rows != 8128)
+                @import("../runtime/kv/attention_match_e2_resident_authority.zig").formalFitDigest()
+            else if (self.e2_guarded_development_trial)
+                @import("../runtime/kv/attention_match_e2_resident_authority.zig").guardedTrialDigest()
+            else
+                @import("../runtime/kv/attention_match_e2_resident_authority.zig").digest(),
+            .e4_formal_7936_256_v1, .e4_formal_32512_256_v1 => self.e4_formal_authority.?.policy_module_sha256,
+        };
+        if (self.cohort != .e2_8128_v1 and
+            (self.e2_guarded_development_trial or self.e2_fit_source_rows != 8128 or self.e2_formal_owner_inventory != null or
+                !std.mem.allEqual(u8, &self.e2_formal_owner_inventory_sha256, 0))) return error.UnqualifiedCompactionArtifact;
+        if ((self.cohort == .e4_8128_v1 and self.e2_fit_source_rows != 8128) or
+            (self.cohort == .e2_8128_v1 and self.e2_fit_source_rows != 7_936 and self.e2_fit_source_rows != 8_128 and self.e2_fit_source_rows != 32_512))
+            return error.UnqualifiedCompactionArtifact;
+        if (self.cohort == .e2_8128_v1 and self.e2_fit_source_rows != 8128 and !self.e2_guarded_development_trial)
+            return error.UnqualifiedCompactionArtifact;
+        if (self.cohort == .e2_8128_v1) {
+            if (self.e2_fit_source_rows == 8128) {
+                if (!std.mem.allEqual(u8, &self.e2_formal_owner_inventory_sha256, 0) or self.e2_formal_owner_inventory != null)
+                    return error.UnqualifiedCompactionArtifact;
+            } else {
+                const inventory = self.e2_formal_owner_inventory orelse return error.UnqualifiedCompactionArtifact;
+                try inventory.validate();
+                const final_configuration = @import("../runtime/kv/attention_match_e2_formal_owner_inventory.zig").finalConfigurationDigest(inventory);
+                if (!std.mem.eql(u8, &inventory.digest, &self.e2_formal_owner_inventory_sha256) or
+                    @as(usize, inventory.source_rows) != self.e2_fit_source_rows or
+                    !std.mem.eql(u8, &inventory.context.source_freeze_sha256, &self.source_freeze_sha256) or
+                    !std.mem.eql(u8, &final_configuration, &self.configuration_sha256) or
+                    !std.mem.eql(u8, &inventory.context.shape_sha256, &self.shape_authority_sha256))
+                    return error.UnqualifiedCompactionArtifact;
+            }
+        }
+        if (!std.mem.eql(u8, &self.policy_module_sha256, &expected_module_sha256))
+            return error.UnqualifiedCompactionArtifact;
+    }
+};
+
+pub const VerifiedFormalE2Provenance = struct {
+    parent_full_cli_binary_sha256: [32]u8,
+    source_freeze_sha256: [32]u8,
+    context_binary_sha256: [32]u8,
+    hardware_sha256: [32]u8,
+};
+
+/// The only formal E2 authority producer. Its provenance arguments must come
+/// from the verified context-candidate/full-CLI parser and the live Metal
+/// destination. Artifact-contained hashes are never accepted as their own
+/// authority.
+pub fn formalE2ResidentAuthority(inventory: @import("../runtime/kv/attention_match_e2_formal_owner_inventory.zig").Artifact, verified: VerifiedFormalE2Provenance) !ResidentHybridAuthority {
+    try inventory.validate();
+    if (!std.mem.eql(u8, &inventory.context.binary_sha256, &verified.parent_full_cli_binary_sha256) or
+        !std.mem.eql(u8, &inventory.context.source_freeze_sha256, &verified.source_freeze_sha256) or
+        !std.mem.eql(u8, &inventory.context.capture_binary_sha256, &verified.context_binary_sha256) or
+        !std.mem.eql(u8, &inventory.context.hardware_sha256, &verified.hardware_sha256))
+        return error.UnqualifiedCompactionArtifact;
+    var authority: ResidentHybridAuthority = .{
+        .cohort = .e2_8128_v1,
+        .e2_guarded_development_trial = true,
+        .e2_fit_source_rows = @intCast(inventory.source_rows),
+        .e2_formal_owner_inventory_sha256 = inventory.digest,
+        .e2_formal_owner_inventory = inventory,
+        .configuration_sha256 = @import("../runtime/kv/attention_match_e2_formal_owner_inventory.zig").finalConfigurationDigest(inventory),
+        .source_freeze_sha256 = inventory.context.source_freeze_sha256,
+        .shape_authority_sha256 = inventory.context.shape_sha256,
+        .policy_module_sha256 = @import("../runtime/kv/attention_match_e2_resident_authority.zig").formalFitDigest(),
+    };
+    try authority.validate();
+    return authority;
+}
+
+/// Diagnostic-only capture boundary used after the native source and request
+/// owner ledger are installed but before any formal fit begins.
+pub const FormalE2InventoryCaptureGrant = struct {
+    checkpoint_identity: native_kv_checkpoint.Identity,
+    /// Verified parent full-CLI binary. This is not the context-test binary.
+    binary_sha256: [32]u8,
+    context_binary_sha256: [32]u8,
+    hardware_profile_sha256: [32]u8,
+    source_freeze_sha256: [32]u8,
+    prompt_tokens_sha256: [32]u8,
+    prompt_tokens: u32,
+
+    pub fn validate(self: @This(), actual: native_kv_checkpoint.Identity, prompt: []const i64) !void {
+        if (!builtin.is_test or !native_kv_checkpoint.Identity.eql(self.checkpoint_identity, actual) or
+            self.prompt_tokens != prompt.len or std.mem.allEqual(u8, &self.binary_sha256, 0) or
+            std.mem.allEqual(u8, &self.context_binary_sha256, 0) or
+            std.mem.allEqual(u8, &self.hardware_profile_sha256, 0) or std.mem.allEqual(u8, &self.source_freeze_sha256, 0))
+            return error.UnqualifiedCompactionArtifact;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for (prompt) |token| {
+            var frame: [8]u8 = undefined;
+            std.mem.writeInt(i64, &frame, token, .little);
+            hash.update(&frame);
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        if (!std.mem.eql(u8, &digest, &self.prompt_tokens_sha256)) return error.UnqualifiedCompactionArtifact;
+    }
+};
+
+pub fn captureFormalE2OwnerInventory(
+    identity: native_kv_checkpoint.Identity,
+    raw: @import("../runtime/kv/attention_match_e2_formal_owner_inventory.zig").RawInventory,
+    grant: FormalE2InventoryCaptureGrant,
+    source_rows: usize,
+    owner_identity: u64,
+    owner_logical_bytes: u64,
+    owner_physical_bytes: u64,
+) !@import("../runtime/kv/attention_match_e2_formal_owner_inventory.zig").Artifact {
+    if (!native_kv_checkpoint.Identity.eql(identity, grant.checkpoint_identity) or
+        std.mem.allEqual(u8, &grant.binary_sha256, 0) or std.mem.allEqual(u8, &grant.hardware_profile_sha256, 0) or
+        std.mem.allEqual(u8, &grant.context_binary_sha256, 0) or
+        std.mem.allEqual(u8, &grant.source_freeze_sha256, 0)) return error.UnqualifiedCompactionArtifact;
+    return @import("../runtime/kv/attention_match_e2_formal_owner_inventory.zig").captureRaw(identity, raw, .{
+        .source_freeze_sha256 = grant.source_freeze_sha256,
+        .binary_sha256 = grant.binary_sha256,
+        .capture_binary_sha256 = grant.context_binary_sha256,
+        .hardware_sha256 = grant.hardware_profile_sha256,
+        .owner_identity = owner_identity,
+        .owner_logical_bytes = owner_logical_bytes,
+        .owner_physical_bytes = owner_physical_bytes,
+    }, source_rows);
+}
+
+pub fn residentHybridTrainingPolicyDigest(authority: ?ResidentHybridAuthority) [32]u8 {
+    const value = authority orelse return @splat(0);
+    return switch (value.cohort) {
+        .e4_8128_v1 => @import("../runtime/kv/attention_match_resident_native_hybrid_profile.zig").digest(),
+        .e2_8128_v1 => if (value.e2_fit_source_rows != 8128)
+            @import("../runtime/kv/attention_match_e2_resident_authority.zig").formalFitDigest()
+        else if (value.e2_guarded_development_trial)
+            @import("../runtime/kv/attention_match_e2_resident_authority.zig").guardedTrialDigest()
+        else
+            @import("../runtime/kv/attention_match_e2_resident_authority.zig").digest(),
+        .e4_formal_7936_256_v1, .e4_formal_32512_256_v1 => value.e4_formal_authority.?.policy_module_sha256,
+    };
+}
+
+fn residentHybridGeometryRoute(cohort: ResidentHybridCohort) runtime.kv.attention_match_engine.Options.AdaptiveV18GeometryRoute {
+    return switch (cohort) {
+        .e2_8128_v1, .e4_formal_32512_256_v1 => .bounded_page_over_96,
+        .e4_8128_v1, .e4_formal_7936_256_v1 => .flat_gram_only,
+    };
+}
+
+fn e2GuardedDevelopmentTrial(authority: ResidentHybridAuthority) bool {
+    return authority.cohort == .e2_8128_v1 and authority.e2_guarded_development_trial;
+}
+
+test "E2 guarded development trial is distinct from disabled E2 and E4" {
+    var authority: ResidentHybridAuthority = .{ .cohort = .e2_8128_v1, .configuration_sha256 = @splat(1), .source_freeze_sha256 = @splat(2), .shape_authority_sha256 = @splat(3), .policy_module_sha256 = @import("../runtime/kv/attention_match_e2_resident_authority.zig").digest() };
+    try std.testing.expect(!e2GuardedDevelopmentTrial(authority));
+    authority.e2_guarded_development_trial = true;
+    authority.policy_module_sha256 = @import("../runtime/kv/attention_match_e2_resident_authority.zig").guardedTrialDigest();
+    try authority.validate();
+    try std.testing.expect(e2GuardedDevelopmentTrial(authority));
+    authority.cohort = .e4_8128_v1;
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, authority.validate());
+}
+
+test "E2 formal fit rejects arbitrary nonzero owner inventory digest" {
+    var authority: ResidentHybridAuthority = .{
+        .cohort = .e2_8128_v1,
+        .e2_guarded_development_trial = true,
+        .e2_fit_source_rows = 7_936,
+        .configuration_sha256 = @splat(1),
+        .source_freeze_sha256 = @splat(2),
+        .shape_authority_sha256 = @splat(3),
+        .policy_module_sha256 = @import("../runtime/kv/attention_match_e2_resident_authority.zig").formalFitDigest(),
+        .e2_formal_owner_inventory_sha256 = @splat(4),
+    };
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, authority.validate());
+    authority.e2_fit_source_rows = 32_512;
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, authority.validate());
+}
+
+fn validateE2ResidentOwnerCounts(counts: [3]usize) !void {
+    if (!std.meta.eql(counts, [3]usize{ 8, 8, 40 })) return error.UnqualifiedCompactionArtifact;
+}
+
+fn validateE2ResidentConsumerGeometry(config: gpt_mod.Config) !void {
+    if (!gemma4_runtime.isExactE2bDenseRuntimeConfig(config)) return error.UnqualifiedCompactionArtifact;
+    var counts: [3]usize = @splat(0);
+    for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+        if (config.layerUsesSlidingAttention(layer)) continue;
+        const geometry = try config.kvDonorGeometry(layer);
+        const owner: usize = switch (geometry.donor_layer) {
+            4 => 0,
+            9 => 1,
+            14 => 2,
+            else => return error.UnqualifiedCompactionArtifact,
+        };
+        if (geometry.num_kv_heads != 1 or geometry.head_dim != 512 or config.num_attention_heads != 8) return error.UnqualifiedCompactionArtifact;
+        counts[owner] = std.math.add(usize, counts[owner], config.num_attention_heads) catch return error.UnqualifiedCompactionArtifact;
+    }
+    try validateE2ResidentOwnerCounts(counts);
+}
+
+test "E2 resident consumer census is aggregate56 with owner14 maximum40" {
+    try validateE2ResidentOwnerCounts(.{ 8, 8, 40 });
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, validateE2ResidentOwnerCounts(.{ 8, 8, 24 }));
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, validateE2ResidentOwnerCounts(.{ 8, 8, 56 }));
+}
+
+pub fn validateResidentHybridGrantBinding(
+    training_policy: NativeCheckpointTrainingPolicy,
+    authority_kind: NativeCheckpointOperatorGrant.AuthorityKind,
+    arm: NativeCheckpointQualificationArm,
+    fit_strategy: NativeCheckpointPrepare.QualityFitStrategy,
+    training_mix_policy_sha256: [32]u8,
+    authority: ?ResidentHybridAuthority,
+    capability: @import("../runtime/kv/compaction_profile.zig").PrepareHostOwnerCapability,
+) !void {
+    if (training_policy != .private_train_challenge_hybrid_resident_v1) {
+        if (authority != null or capability != .none) return error.UnqualifiedCompactionArtifact;
+        return;
+    }
+    const allowed = authority_kind == .candidate_profile and (capability == .none or capability == .bounded_page_e4_resident_1152m_v1) or
+        authority_kind == .qualified_private_profile and capability == .bounded_page_e4_resident_1152m_v1;
+    if (!allowed or arm != .attention_matching or
+        fit_strategy != .identity_chunk_coefficients_adaptive_v18 or authority == null or
+        !std.mem.eql(u8, &training_mix_policy_sha256, &residentHybridTrainingPolicyDigest(authority)))
+        return error.UnqualifiedCompactionArtifact;
+    try authority.?.validate();
+}
+
+pub fn isPrivateAdaptiveTraining(policy: NativeCheckpointTrainingPolicy) bool {
+    return policy == .private_dense512_reference_v1 or policy == .private_future_decode_mix_v1 or policy == .private_train_challenge_hybrid_resident_v1;
+}
+
+fn nativeCheckpointTrainingPolicyDigest(policy: NativeCheckpointTrainingPolicy, resident_authority: ?ResidentHybridAuthority) [32]u8 {
+    if (policy == .private_dense512_reference_v1)
+        return runtime.kv.attention_match_reference_coverage.dense512PolicyDigest();
+    if (policy == .private_future_decode_mix_v1)
+        return runtime.kv.attention_match_future_decode_training.policyDigest();
+    if (policy == .private_train_challenge_hybrid_resident_v1)
+        return residentHybridTrainingPolicyDigest(resident_authority);
+    var result: [32]u8 = undefined;
+    const authority = switch (policy) {
+        .primary_only => "antfly.native-checkpoint-training.primary-only.v1",
+        .private_dense512_reference_v1 => unreachable,
+        .private_future_decode_mix_v1 => unreachable,
+        .private_train_challenge_hybrid_resident_v1 => unreachable,
+    };
+    std.crypto.hash.sha2.Sha256.hash(authority, &result, .{});
+    return result;
+}
+
+fn nativeCheckpointServingTrainingBindingDigest() [32]u8 {
+    var result: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("antfly.native-checkpoint-serving-training-binding.v3;independent-position-namespace=1;primary-heldout=unchanged;workspace=1GiB;geometry-budget=derived-physical-primary;fallback-percent=95;maximum-fallbacks=3;minimum-global-savings=1.5;training-query-batch-rows=64;probability=exact-f32-widened;geometry=per-query-gram;gram-delta=packed-fp64-accelerate;gram-delta-tile-rows=64;joint-fixed-original-memo=1", &result, .{});
+    return result;
+}
+
+/// Process-local capability for the staged full-CLI checkpoint qualification
+/// route. Only the sealed operator installer constructs this value; request
+/// JSON, headers, environment variables, and enrolled/default profiles cannot.
+fn formalE4PromptBindingValid(
+    shape: @import("../runtime/kv/attention_match_e4_formal_authority.zig").Shape,
+    route: MetalCheckpointQualificationRoute,
+    prompt_tokens: u32,
+    restored_prefix_tokens: u32,
+    appended_prompt_tokens: u32,
+    reserved_output_tokens: u32,
+) bool {
+    if (prompt_tokens != shape.source_rows) return false;
+    return switch (route) {
+        .checkpoint_prepare => restored_prefix_tokens == 0 and appended_prompt_tokens == shape.source_rows and reserved_output_tokens == 0,
+        .checkpoint_resume => restored_prefix_tokens == shape.source_rows and appended_prompt_tokens == 0 and reserved_output_tokens == shape.output_rows,
+        .exact => restored_prefix_tokens == 0 and appended_prompt_tokens == shape.source_rows and reserved_output_tokens == shape.output_rows,
+        else => false,
+    };
+}
+
+test "context formal E4 grant distinguishes preparation from full prefix resume and inference" {
+    const shape: @import("../runtime/kv/attention_match_e4_formal_authority.zig").Shape = .{ .source_rows = 32512, .output_rows = 256, .range_count = 119, .candidate_count = 357 };
+    try std.testing.expect(formalE4PromptBindingValid(shape, .checkpoint_prepare, 32512, 0, 32512, 0));
+    try std.testing.expect(formalE4PromptBindingValid(shape, .checkpoint_resume, 32512, 32512, 0, 256));
+    try std.testing.expect(formalE4PromptBindingValid(shape, .exact, 32512, 0, 32512, 256));
+    try std.testing.expect(!formalE4PromptBindingValid(shape, .checkpoint_prepare, 32512, 0, 32512, 256));
+    try std.testing.expect(!formalE4PromptBindingValid(shape, .checkpoint_resume, 32512, 32512, 0, 0));
+    try std.testing.expect(!formalE4PromptBindingValid(shape, .checkpoint_resume, 32512, 32256, 256, 256));
+    try std.testing.expect(!formalE4PromptBindingValid(shape, .exact, 32512, 0, 32512, 64));
+    try std.testing.expect(!formalE4PromptBindingValid(shape, .exact, 7936, 0, 7936, 256));
+    try std.testing.expect(!formalE4PromptBindingValid(shape, .none, 32512, 0, 32512, 256));
+}
+
+pub const NativeCheckpointOperatorGrant = struct {
+    pub const AuthorityKind = enum { candidate_profile, qualified_private_profile, staged_exact_baseline };
+    pub const PrepareHostOwnerProfile = enum { none, bounded_page_e4_resident_1152m_v1, bounded_page_e4_formal_1152m_v1 };
+    checkpoint_identity: runtime.kv.attention_match_checkpoint.Identity,
+    profile_sha256: [32]u8,
+    profile_semantic_sha256: [32]u8,
+    binary_sha256: [32]u8,
+    implementation_semantic_sha256: [32]u8,
+    execution: native_checkpoint_release.Execution,
+    policy: @import("../runtime/kv/attention_match_fit_policy.zig").Policy,
+    request_id: u64,
+    prompt_tokens_sha256: [32]u8,
+    prompt_tokens: u32,
+    restored_prefix_tokens: u32,
+    appended_prompt_tokens: u32,
+    reserved_output_tokens: u32,
+    route: MetalCheckpointQualificationRoute,
+    arm: NativeCheckpointQualificationArm,
+    fit_strategy: NativeCheckpointPrepare.QualityFitStrategy = .legacy,
+    training_policy: NativeCheckpointTrainingPolicy = .primary_only,
+    training_mix_policy_sha256: [32]u8 = @splat(0),
+    resident_hybrid_authority: ?ResidentHybridAuthority = null,
+    authority_kind: AuthorityKind = .candidate_profile,
+    baseline_authority_sha256: [32]u8 = @splat(0),
+    compiled_packed_prefill_bridge: ?CompiledPackedPrefillBridgeAuthority = null,
+    prepare_host_owner_profile: PrepareHostOwnerProfile = .none,
+    prepare_host_owner_capability: @import("../runtime/kv/compaction_profile.zig").PrepareHostOwnerCapability = .none,
+
+    pub fn isPrivateProfile(self: @This()) bool {
+        return self.authority_kind == .candidate_profile or self.authority_kind == .qualified_private_profile;
+    }
+
+    /// Process-local consumer storage policy derived only from the
+    /// authenticated operator grant. Uploaded metadata and HTTP fields cannot
+    /// opt into the exact local-window representation.
+    pub fn usesExactLocalWindowCapacity(self: @This()) bool {
+        return self.isPrivateProfile() and
+            self.arm == .attention_matching and
+            self.fit_strategy == .identity_chunk_coefficients_adaptive_v18 and
+            isPrivateAdaptiveTraining(self.training_policy);
+    }
+
+    pub fn validatePrepareHostOwnerActivation(
+        self: @This(),
+        actual: runtime.kv.attention_match_checkpoint.Identity,
+        prompt_tokens: usize,
+    ) !void {
+        const owner_shape_valid = switch (self.prepare_host_owner_profile) {
+            .bounded_page_e4_resident_1152m_v1 => prompt_tokens == 8128 and self.resident_hybrid_authority != null and self.resident_hybrid_authority.?.cohort == .e4_8128_v1,
+            .bounded_page_e4_formal_1152m_v1 => self.resident_hybrid_authority != null and switch (self.resident_hybrid_authority.?.cohort) {
+                .e4_formal_7936_256_v1 => prompt_tokens == 7_936,
+                .e4_formal_32512_256_v1 => prompt_tokens == 32_512,
+                else => false,
+            },
+            .none => false,
+        };
+        if (!owner_shape_valid or
+            self.request_id == 0 or std.mem.allEqual(u8, &self.binary_sha256, 0) or
+            std.mem.allEqual(u8, &self.profile_sha256, 0) or
+            std.mem.allEqual(u8, &self.profile_semantic_sha256, 0) or
+            !std.mem.eql(u8, &self.implementation_semantic_sha256, &compaction_identity.digest) or
+            !runtime.kv.attention_match_checkpoint.Identity.eql(self.checkpoint_identity, actual) or
+            (self.authority_kind == .qualified_private_profile and self.prepare_host_owner_capability != .bounded_page_e4_resident_1152m_v1) or
+            (self.authority_kind != .candidate_profile and self.authority_kind != .qualified_private_profile) or self.arm != .attention_matching or
+            self.fit_strategy != .identity_chunk_coefficients_adaptive_v18 or
+            self.training_policy != .private_train_challenge_hybrid_resident_v1 or
+            !std.meta.eql(self.policy, @import("../runtime/kv/attention_match_fit_policy.zig").Policy.cumulative256_exact_cycle_v1))
+            return error.UnqualifiedCompactionArtifact;
+        try self.execution.validate();
+    }
+
+    pub fn validate(
+        self: @This(),
+        actual: runtime.kv.attention_match_checkpoint.Identity,
+        policy: @import("../runtime/kv/attention_match_fit_policy.zig").Policy,
+        profile_sha256: [32]u8,
+        profile_semantic_sha256: [32]u8,
+    ) !void {
+        if (self.request_id == 0 or self.prompt_tokens == 0 or self.route == .none or
+            std.mem.allEqual(u8, &self.prompt_tokens_sha256, 0) or
+            std.mem.allEqual(u8, &self.binary_sha256, 0) or
+            !std.mem.eql(u8, &self.implementation_semantic_sha256, &compaction_identity.digest) or
+            !runtime.kv.attention_match_checkpoint.Identity.eql(self.checkpoint_identity, actual) or
+            !std.meta.eql(self.policy, policy) or
+            !std.mem.eql(u8, &self.profile_sha256, &profile_sha256) or
+            !std.mem.eql(u8, &self.profile_semantic_sha256, &profile_semantic_sha256))
+            return error.UnqualifiedCompactionArtifact;
+        if (self.fit_strategy == .identity_chunk_coefficients_adaptive_v18 and
+            (self.arm != .attention_matching or !std.meta.eql(self.policy, @import("../runtime/kv/attention_match_fit_policy.zig").Policy.cumulative256_exact_cycle_v1)))
+            return error.UnqualifiedCompactionArtifact;
+        if (self.training_policy == .private_dense512_reference_v1 and
+            (self.fit_strategy != .identity_chunk_coefficients_adaptive_v18 or self.arm != .attention_matching))
+            return error.UnqualifiedCompactionArtifact;
+        if (self.training_policy == .private_future_decode_mix_v1 and
+            (self.fit_strategy != .identity_chunk_coefficients_adaptive_v18 or self.arm != .attention_matching or
+                !std.mem.eql(u8, &self.training_mix_policy_sha256, &runtime.kv.attention_match_future_decode_training.policyDigest())))
+            return error.UnqualifiedCompactionArtifact;
+        try validateResidentHybridGrantBinding(self.training_policy, self.authority_kind, self.arm, self.fit_strategy, self.training_mix_policy_sha256, self.resident_hybrid_authority, self.prepare_host_owner_capability);
+        if (self.resident_hybrid_authority) |resident| {
+            if (resident.e4_formal_authority) |formal| {
+                try formal.validate();
+                if (!formalE4PromptBindingValid(formal.shape, self.route, self.prompt_tokens, self.restored_prefix_tokens, self.appended_prompt_tokens, self.reserved_output_tokens))
+                    return error.UnqualifiedCompactionArtifact;
+            }
+        }
+        if (self.prepare_host_owner_profile != .none and
+            ((self.authority_kind == .qualified_private_profile and self.prepare_host_owner_capability != .bounded_page_e4_resident_1152m_v1) or
+                (self.authority_kind != .candidate_profile and self.authority_kind != .qualified_private_profile) or self.arm != .attention_matching or
+                self.fit_strategy != .identity_chunk_coefficients_adaptive_v18 or
+                self.training_policy != .private_train_challenge_hybrid_resident_v1 or self.resident_hybrid_authority == null or
+                !std.meta.eql(self.policy, @import("../runtime/kv/attention_match_fit_policy.zig").Policy.cumulative256_exact_cycle_v1)))
+            return error.UnqualifiedCompactionArtifact;
+        if (self.training_policy != .private_future_decode_mix_v1 and self.training_policy != .private_train_challenge_hybrid_resident_v1 and !std.mem.allEqual(u8, &self.training_mix_policy_sha256, 0))
+            return error.UnqualifiedCompactionArtifact;
+        switch (self.authority_kind) {
+            .candidate_profile, .qualified_private_profile => if (!std.mem.allEqual(u8, &self.baseline_authority_sha256, 0)) return error.UnqualifiedCompactionArtifact,
+            .staged_exact_baseline => if (self.arm == .attention_matching or self.fit_strategy != .legacy or
+                self.training_policy != .primary_only or std.mem.allEqual(u8, &self.baseline_authority_sha256, 0) or
+                !std.mem.eql(u8, &self.baseline_authority_sha256, &self.profile_sha256)) return error.UnqualifiedCompactionArtifact,
+        }
+        if (self.compiled_packed_prefill_bridge) |capability| {
+            try capability.validate();
+            if (self.authority_kind != .staged_exact_baseline or self.arm != .packed_exact)
+                return error.UnqualifiedCompactionArtifact;
+        }
+        try self.execution.validate();
+    }
+};
+
+fn residentWideCacheAuthority(
+    profile: NativeCheckpointOperatorGrant.PrepareHostOwnerProfile,
+    tracker: ?*runtime.kv.host_allocation_tracker.HostAllocationTracker,
+    owner_identity: u64,
+) !?@import("../runtime/kv/attention_match_wide_cache_authority.zig").Authority {
+    return switch (profile) {
+        .none => if (owner_identity == 0) null else error.InvalidBoundedPrepareOwner,
+        .bounded_page_e4_resident_1152m_v1 => blk: {
+            const owner = tracker orelse return error.InvalidBoundedPrepareOwner;
+            break :blk try @import("../runtime/kv/attention_match_native_resident_hybrid_bridge.zig").wideCacheAuthority(owner, owner_identity);
+        },
+        .bounded_page_e4_formal_1152m_v1 => blk: {
+            const owner = tracker orelse return error.InvalidBoundedPrepareOwner;
+            break :blk try @import("../runtime/kv/attention_match_native_resident_hybrid_bridge.zig").wideCacheAuthority(owner, owner_identity);
+        },
+    };
+}
+
+pub const CompiledPackedPrefillBridgeAuthority = struct {
+    observation_sha256: [32]u8,
+    max_copy_bytes: usize,
+    max_host_staging_bytes: usize,
+    max_logical_tokens: usize,
+
+    pub fn validate(self: @This()) !void {
+        if (std.mem.allEqual(u8, &self.observation_sha256, 0) or self.max_copy_bytes == 0 or
+            self.max_copy_bytes > 4 * 1024 * 1024 * 1024 or self.max_host_staging_bytes == 0 or
+            self.max_host_staging_bytes > 256 * 1024 * 1024 or self.max_logical_tokens == 0 or
+            self.max_logical_tokens > 32768) return error.UnqualifiedCompactionArtifact;
+    }
+
+    pub fn digest(self: @This()) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly.compiled-packed-prefill-bridge-authority.v1\x00");
+        hash.update(&self.observation_sha256);
+        inline for (.{ self.max_copy_bytes, self.max_host_staging_bytes, self.max_logical_tokens }) |value| {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, @intCast(value), .little);
+            hash.update(&bytes);
+        }
+        return hash.finalResult();
+    }
+};
+
+test "compiled packed prefill authority binds observation and both copy budgets" {
+    const capability: CompiledPackedPrefillBridgeAuthority = .{ .observation_sha256 = @splat(1), .max_copy_bytes = 4, .max_host_staging_bytes = 2, .max_logical_tokens = 8 };
+    try capability.validate();
+    var changed = capability;
+    changed.observation_sha256[0] ^= 1;
+    const digest = capability.digest();
+    const changed_digest = changed.digest();
+    try std.testing.expect(!std.mem.eql(u8, &digest, &changed_digest));
+    changed = capability;
+    changed.max_host_staging_bytes = 0;
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, changed.validate());
+    changed = capability;
+    changed.max_logical_tokens = 0;
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, changed.validate());
+}
+
+fn attachPackedHookBeforePrefill(config: GenerationConfig) bool {
+    return config.compiled_packed_prefill_bridge == null;
+}
+
+fn deferPackedSessionInitialization(config: GenerationConfig) bool {
+    return config.compiled_packed_prefill_bridge != null;
+}
+
+const CompiledPackedRuntimeCleanupGuard = struct {
+    cache: ?*graph_mod.cache.GraphCache,
+    armed: bool,
+
+    fn deinit(self: *@This()) void {
+        if (self.armed) self.cache.?.resetSessionCompiledModelRuntime();
+        self.armed = false;
+    }
+
+    fn handoffComplete(self: *@This()) void {
+        self.armed = false;
+    }
+};
+
+test "compiled packed bridge defers external hook publication until import" {
+    var config = GenerationConfig{};
+    try std.testing.expect(attachPackedHookBeforePrefill(config));
+    config.compiled_packed_prefill_bridge = .{ .observation_sha256 = @splat(1), .max_copy_bytes = 1, .max_host_staging_bytes = 1, .max_logical_tokens = 1 };
+    try std.testing.expect(!attachPackedHookBeforePrefill(config));
+    try std.testing.expect(deferPackedSessionInitialization(config));
+}
+
+test "compiled packed runtime cleanup guard is armed idempotent and disarmed by handoff" {
+    const Probe = struct {
+        deinits: *usize,
+        fn prefill(_: *anyopaque, _: std.mem.Allocator, _: graph_mod.model_runtime.PrefillRequest) !graph_mod.model_runtime.ModelOutput {
+            return error.UnexpectedPrefill;
+        }
+        fn deinit(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.deinits.* += 1;
+        }
+        const vtable = graph_mod.model_runtime.ModelRuntime.VTable{ .prefill = prefill, .deinit = deinit };
+    };
+    var cache = graph_mod.cache.GraphCache.init(std.testing.allocator);
+    errdefer cache.deinit();
+    var deinits: usize = 0;
+    var probe = Probe{ .deinits = &deinits };
+    cache.putSessionCompiledModelRuntime(.metal, .whole_model, .{ .ptr = &probe, .vtable = &Probe.vtable });
+
+    var unarmed = CompiledPackedRuntimeCleanupGuard{ .cache = &cache, .armed = false };
+    unarmed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), deinits);
+    try std.testing.expect(cache.getSessionCompiledModelRuntime(.metal, .whole_model) != null);
+
+    var armed = CompiledPackedRuntimeCleanupGuard{ .cache = &cache, .armed = true };
+    armed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), deinits);
+    try std.testing.expect(cache.getSessionCompiledModelRuntime(.metal, .whole_model) == null);
+    armed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), deinits);
+
+    cache.putSessionCompiledModelRuntime(.metal, .whole_model, .{ .ptr = &probe, .vtable = &Probe.vtable });
+    var success = CompiledPackedRuntimeCleanupGuard{ .cache = &cache, .armed = true };
+    success.handoffComplete();
+    success.deinit();
+    try std.testing.expectEqual(@as(usize, 1), deinits);
+    try std.testing.expect(cache.getSessionCompiledModelRuntime(.metal, .whole_model) != null);
+    cache.deinit();
+    try std.testing.expectEqual(@as(usize, 2), deinits);
+}
+
+fn validResidentHybridAuthorityForTest() ResidentHybridAuthority {
+    var module_sha256: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&module_sha256, "e0a407063023d89c40f516270081012329a8981dc5c64de2dd8a985d8469afee") catch unreachable;
+    return .{ .configuration_sha256 = @splat(1), .source_freeze_sha256 = @splat(2), .shape_authority_sha256 = @splat(3), .policy_module_sha256 = module_sha256 };
+}
+
+test "resident hybrid grant binding accepts only complete staged candidate authority" {
+    const profile_digest = @import("../runtime/kv/attention_match_resident_native_hybrid_profile.zig").digest();
+    const authority = validResidentHybridAuthorityForTest();
+    try validateResidentHybridGrantBinding(.private_train_challenge_hybrid_resident_v1, .candidate_profile, .attention_matching, .identity_chunk_coefficients_adaptive_v18, profile_digest, authority, .none);
+    try validateResidentHybridGrantBinding(.private_train_challenge_hybrid_resident_v1, .qualified_private_profile, .attention_matching, .identity_chunk_coefficients_adaptive_v18, profile_digest, authority, .bounded_page_e4_resident_1152m_v1);
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, validateResidentHybridGrantBinding(.private_train_challenge_hybrid_resident_v1, .candidate_profile, .attention_matching, .identity_chunk_coefficients_adaptive_v18, profile_digest, null, .none));
+    var wrong_module = authority;
+    wrong_module.policy_module_sha256 = @splat(9);
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, validateResidentHybridGrantBinding(.private_train_challenge_hybrid_resident_v1, .candidate_profile, .attention_matching, .identity_chunk_coefficients_adaptive_v18, profile_digest, wrong_module, .none));
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, validateResidentHybridGrantBinding(.private_train_challenge_hybrid_resident_v1, .qualified_private_profile, .attention_matching, .identity_chunk_coefficients_adaptive_v18, profile_digest, authority, .none));
+}
+
+test "resident hybrid option setup keeps E2 bounded and E4 flat with distinct training digests" {
+    const e4 = validResidentHybridAuthorityForTest();
+    var e2 = e4;
+    e2.cohort = .e2_8128_v1;
+    e2.e2_guarded_development_trial = true;
+    e2.e2_fit_source_rows = 7_936;
+    try std.testing.expect(residentHybridGeometryRoute(e4.cohort) == .flat_gram_only);
+    try std.testing.expect(residentHybridGeometryRoute(e2.cohort) == .bounded_page_over_96);
+    const e4_digest = residentHybridTrainingPolicyDigest(e4);
+    const e2_digest = residentHybridTrainingPolicyDigest(e2);
+    try std.testing.expect(!std.mem.eql(u8, &e4_digest, &e2_digest));
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, validateResidentHybridGrantBinding(.private_train_challenge_hybrid_resident_v1, .candidate_profile, .attention_matching, .identity_chunk_coefficients_adaptive_v18, e4_digest, e2, .none));
+}
+
+test "qualified private grant has candidate execution policy without candidate authority" {
+    var grant: NativeCheckpointOperatorGrant = undefined;
+    grant.authority_kind = .qualified_private_profile;
+    grant.arm = .attention_matching;
+    grant.fit_strategy = .identity_chunk_coefficients_adaptive_v18;
+    grant.training_policy = .private_dense512_reference_v1;
+    try std.testing.expect(grant.isPrivateProfile());
+    try std.testing.expect(grant.usesExactLocalWindowCapacity());
+    grant.authority_kind = .staged_exact_baseline;
+    try std.testing.expect(!grant.isPrivateProfile());
+    try std.testing.expect(!grant.usesExactLocalWindowCapacity());
+}
+
+fn updateOperatorQualificationTokenDigest(hash: *std.crypto.hash.sha2.Sha256, ids: anytype) void {
+    var encoded: [8]u8 = undefined;
+    for (ids) |raw| {
+        const id: i64 = @intCast(raw);
+        std.mem.writeInt(i64, &encoded, id, .little);
+        hash.update(&encoded);
+    }
+}
+
+pub fn NativeCheckpointPromptBinding(comptime Token: type) type {
+    return struct {
+        restored_prefix: []const u32,
+        appended_prompt: []const Token,
+        total_tokens: u32,
+        restored_tokens: u32,
+        appended_tokens: u32,
+    };
+}
+
+/// Resolve the same full-prompt prefix reuse consumed by resumeNativeCheckpoint.
+/// The caller must pass the complete rendered prompt; a repeated saved prefix is
+/// authority, not newly appended input. This helper performs no allocation and
+/// never changes the token stream used by model execution.
+fn resolveNativeCheckpointPromptBindingTyped(comptime Token: type, saved: []const u32, full_prompt: []const Token) !NativeCheckpointPromptBinding(Token) {
+    if (saved.len > native_kv_checkpoint.max_context_tokens or full_prompt.len > native_kv_checkpoint.max_context_tokens)
+        return error.KvCheckpointAppendLimit;
+    if (full_prompt.len < saved.len) return error.KvCheckpointPrefixMismatch;
+    if (saved.len != 0 and full_prompt.len - saved.len > 8192) return error.KvCheckpointAppendLimit;
+    for (saved, full_prompt[0..saved.len]) |expected, raw| {
+        const actual = std.math.cast(u32, raw) orelse return error.InvalidKvCheckpoint;
+        if (actual != expected) return error.KvCheckpointPrefixMismatch;
+    }
+    for (full_prompt[saved.len..]) |raw| _ = std.math.cast(u32, raw) orelse return error.InvalidKvCheckpoint;
+    return .{
+        .restored_prefix = saved,
+        .appended_prompt = full_prompt[saved.len..],
+        .total_tokens = std.math.cast(u32, full_prompt.len) orelse return error.InvalidNativeCheckpointRequest,
+        .restored_tokens = std.math.cast(u32, saved.len) orelse return error.InvalidNativeCheckpointRequest,
+        .appended_tokens = std.math.cast(u32, full_prompt.len - saved.len) orelse return error.InvalidNativeCheckpointRequest,
+    };
+}
+
+pub fn resolveNativeCheckpointPromptBinding(saved: []const u32, full_prompt: []const i64) !NativeCheckpointPromptBinding(i64) {
+    return resolveNativeCheckpointPromptBindingTyped(i64, saved, full_prompt);
+}
+
+pub fn resolveNativeCheckpointPromptBindingI32(saved: []const u32, full_prompt: []const i32) !NativeCheckpointPromptBinding(i32) {
+    return resolveNativeCheckpointPromptBindingTyped(i32, saved, full_prompt);
+}
+
+fn operatorQualificationTokenDigest(prefix: []const u32, append: []const i64) ![32]u8 {
+    return context_teacher_forced.operatorPromptTokenDigest(prefix, append);
+}
+
+test "native checkpoint operator grant binds model profile policy and request" {
+    const identity: runtime.kv.attention_match_checkpoint.Identity = .{
+        .weights = @splat(1),
+        .tokenizer = @splat(2),
+        .template = @splat(3),
+        .layout = @splat(4),
+    };
+    const grant: NativeCheckpointOperatorGrant = .{
+        .checkpoint_identity = identity,
+        .profile_sha256 = @splat(5),
+        .profile_semantic_sha256 = @splat(6),
+        .binary_sha256 = @splat(7),
+        .implementation_semantic_sha256 = compaction_identity.digest,
+        .execution = .{ .forward_frame = true, .precomputed_tail = true },
+        .policy = .cumulative256_exact_cycle_v1,
+        .request_id = 9,
+        .prompt_tokens_sha256 = @splat(8),
+        .prompt_tokens = 3,
+        .restored_prefix_tokens = 0,
+        .appended_prompt_tokens = 3,
+        .reserved_output_tokens = 2,
+        .route = .exact,
+        .arm = .attention_matching,
+    };
+    try grant.validate(identity, .cumulative256_exact_cycle_v1, @splat(5), @splat(6));
+    var wrong = identity;
+    wrong.layout[0] ^= 1;
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, grant.validate(wrong, .cumulative256_exact_cycle_v1, @splat(5), @splat(6)));
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, grant.validate(identity, .legacy_fixed, @splat(5), @splat(6)));
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, grant.validate(identity, .cumulative256_exact_cycle_v1, @splat(0), @splat(6)));
+    var zero_request = grant;
+    zero_request.request_id = 0;
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, zero_request.validate(identity, .cumulative256_exact_cycle_v1, @splat(5), @splat(6)));
+    var wrong_implementation = grant;
+    wrong_implementation.implementation_semantic_sha256[0] ^= 1;
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, wrong_implementation.validate(identity, .cumulative256_exact_cycle_v1, @splat(5), @splat(6)));
+    var zero_binary = grant;
+    zero_binary.binary_sha256 = @splat(0);
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, zero_binary.validate(identity, .cumulative256_exact_cycle_v1, @splat(5), @splat(6)));
+
+    try std.testing.expect(!grant.usesExactLocalWindowCapacity());
+    var private_candidate = grant;
+    private_candidate.fit_strategy = .identity_chunk_coefficients_adaptive_v18;
+    private_candidate.training_policy = .private_dense512_reference_v1;
+    try std.testing.expect(private_candidate.usesExactLocalWindowCapacity());
+    private_candidate.authority_kind = .staged_exact_baseline;
+    try std.testing.expect(!private_candidate.usesExactLocalWindowCapacity());
+    private_candidate.authority_kind = .candidate_profile;
+    private_candidate.arm = .packed_exact;
+    try std.testing.expect(!private_candidate.usesExactLocalWindowCapacity());
+}
+
+test "context staged exact baseline grant rejects profile and attention claims" {
+    const identity: runtime.kv.attention_match_checkpoint.Identity = .{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) };
+    var grant: NativeCheckpointOperatorGrant = .{
+        .checkpoint_identity = identity,
+        .profile_sha256 = @splat(5),
+        .profile_semantic_sha256 = @splat(6),
+        .binary_sha256 = @splat(7),
+        .implementation_semantic_sha256 = compaction_identity.digest,
+        .execution = .{},
+        .policy = .legacy_fixed,
+        .request_id = 9,
+        .prompt_tokens_sha256 = @splat(8),
+        .prompt_tokens = 3,
+        .restored_prefix_tokens = 0,
+        .appended_prompt_tokens = 3,
+        .reserved_output_tokens = 2,
+        .route = .exact,
+        .arm = .packed_exact,
+        .authority_kind = .staged_exact_baseline,
+        .baseline_authority_sha256 = @splat(5),
+    };
+    try grant.validate(identity, .legacy_fixed, @splat(5), @splat(6));
+    grant.arm = .attention_matching;
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, grant.validate(identity, .legacy_fixed, @splat(5), @splat(6)));
+    grant.arm = .packed_exact;
+    grant.baseline_authority_sha256 = @splat(9);
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, grant.validate(identity, .legacy_fixed, @splat(5), @splat(6)));
+    grant.baseline_authority_sha256 = @splat(5);
+    grant.authority_kind = .candidate_profile;
+    try std.testing.expectError(error.UnqualifiedCompactionArtifact, grant.validate(identity, .legacy_fixed, @splat(5), @splat(6)));
+}
+
+test "operator qualification prompt digest binds restored prefix and append order" {
+    const prefix = [_]u32{ 3, 5 };
+    const append = [_]i64{ 7, 11 };
+    const reordered = [_]i64{ 11, 7 };
+    try std.testing.expect(!std.mem.eql(u8, &try operatorQualificationTokenDigest(&prefix, &append), &try operatorQualificationTokenDigest(&prefix, &reordered)));
+    const full = [_]i64{ 3, 5, 7, 11 };
+    try std.testing.expectEqualSlices(u8, &try operatorQualificationTokenDigest(&prefix, &append), &try operatorQualificationTokenDigest(&.{}, &full));
+}
+
+test "native checkpoint prompt binding deduplicates restored prefix and preserves true suffix" {
+    const saved = [_]u32{ 3, 5, 7 };
+    const repeated = [_]i64{ 3, 5, 7 };
+    const repeated_with_suffix = [_]i64{ 3, 5, 7, 11, 13 };
+    const empty = try resolveNativeCheckpointPromptBinding(&saved, &repeated);
+    try std.testing.expectEqualSlices(u32, &saved, empty.restored_prefix);
+    try std.testing.expectEqual(@as(usize, 0), empty.appended_prompt.len);
+    try std.testing.expectEqual(@as(u32, 3), empty.total_tokens);
+    try std.testing.expectEqual(@as(u32, 3), empty.restored_tokens);
+    try std.testing.expectEqual(@as(u32, 0), empty.appended_tokens);
+    const suffix = try resolveNativeCheckpointPromptBinding(&saved, &repeated_with_suffix);
+    try std.testing.expectEqualSlices(i64, &.{ 11, 13 }, suffix.appended_prompt);
+    try std.testing.expectEqual(@as(u32, 5), suffix.total_tokens);
+    try std.testing.expectEqual(@as(u32, 2), suffix.appended_tokens);
+}
+
+test "native checkpoint prompt binding rejects rewrites invalid tokens and limits" {
+    const saved = [_]u32{ 3, 5, 7 };
+    try std.testing.expectError(error.KvCheckpointPrefixMismatch, resolveNativeCheckpointPromptBinding(&saved, &.{ 3, 4, 7 }));
+    try std.testing.expectError(error.KvCheckpointPrefixMismatch, resolveNativeCheckpointPromptBinding(&saved, &.{ 3, 5 }));
+    try std.testing.expectError(error.InvalidKvCheckpoint, resolveNativeCheckpointPromptBinding(&saved, &.{ 3, 5, 7, -1 }));
+    var too_many: [3 + 8193]i64 = @splat(0);
+    too_many[0] = 3;
+    too_many[1] = 5;
+    too_many[2] = 7;
+    try std.testing.expectError(error.KvCheckpointAppendLimit, resolveNativeCheckpointPromptBinding(&saved, &too_many));
+    const empty_saved: []const u32 = &.{};
+    var prepare_prompt: [8193]i64 = @splat(0);
+    const prepare = try resolveNativeCheckpointPromptBinding(empty_saved, &prepare_prompt);
+    try std.testing.expectEqual(@as(u32, prepare_prompt.len), prepare.appended_tokens);
+    var above_context: [native_kv_checkpoint.max_context_tokens + 1]i64 = @splat(0);
+    try std.testing.expectError(error.KvCheckpointAppendLimit, resolveNativeCheckpointPromptBinding(empty_saved, &above_context));
+}
+
+pub const PrefillExecutionStats = struct {
+    completed_rows: usize = 0,
+    completed_chunks: usize = 0,
+    maximum_chunk_rows: usize = 0,
+    maximum_chunk_count: usize = 0,
+    other_chunk_rows: usize = 0,
+
+    fn observe(self: *@This(), rows: usize) !void {
+        if (rows == 0) return error.InvalidPrefillChunkPlan;
+        self.completed_rows = try std.math.add(usize, self.completed_rows, rows);
+        self.completed_chunks = try std.math.add(usize, self.completed_chunks, 1);
+        if (rows > self.maximum_chunk_rows) {
+            self.other_chunk_rows = try std.math.add(usize, self.other_chunk_rows, try std.math.mul(usize, self.maximum_chunk_rows, self.maximum_chunk_count));
+            self.maximum_chunk_rows = rows;
+            self.maximum_chunk_count = 1;
+        } else if (rows == self.maximum_chunk_rows) {
+            self.maximum_chunk_count = try std.math.add(usize, self.maximum_chunk_count, 1);
+        } else {
+            self.other_chunk_rows = try std.math.add(usize, self.other_chunk_rows, rows);
+        }
+    }
+};
+
+const NativeQualityServingPrefillStats = struct {
+    requested_ceiling_rows: usize,
+    used_chunk_rows: usize,
+    full_chunk_count: usize,
+    tail_rows: usize,
+    completed_chunks: usize,
+};
+
+fn nativeQualityServingPrefillStats(requested_ceiling_rows: usize, observed: PrefillExecutionStats) !NativeQualityServingPrefillStats {
+    if (requested_ceiling_rows == 0 or observed.completed_rows == 0 or observed.completed_chunks == 0 or observed.maximum_chunk_rows == 0) return error.InvalidPrefillChunkPlan;
+    if (observed.maximum_chunk_count == 0 or observed.maximum_chunk_rows > requested_ceiling_rows) return error.InvalidPrefillChunkPlan;
+    return .{
+        .requested_ceiling_rows = requested_ceiling_rows,
+        .used_chunk_rows = observed.maximum_chunk_rows,
+        .full_chunk_count = observed.maximum_chunk_count,
+        .tail_rows = observed.other_chunk_rows,
+        .completed_chunks = observed.completed_chunks,
+    };
+}
+
+test "quality serving prefill metrics report selected ceiling and actual calls" {
+    var observed: PrefillExecutionStats = .{};
+    try observed.observe(2048);
+    try observed.observe(2048);
+    try observed.observe(2048);
+    try observed.observe(1792);
+    const multi = try nativeQualityServingPrefillStats(2048, observed);
+    try std.testing.expectEqual(@as(usize, 2048), multi.requested_ceiling_rows);
+    try std.testing.expectEqual(@as(usize, 2048), multi.used_chunk_rows);
+    try std.testing.expectEqual(@as(usize, 3), multi.full_chunk_count);
+    try std.testing.expectEqual(@as(usize, 1792), multi.tail_rows);
+    try std.testing.expectEqual(@as(usize, 4), multi.completed_chunks);
+    var short_observed: PrefillExecutionStats = .{};
+    try short_observed.observe(17);
+    const short = try nativeQualityServingPrefillStats(2048, short_observed);
+    try std.testing.expectEqual(@as(usize, 2048), short.requested_ceiling_rows);
+    try std.testing.expectEqual(@as(usize, 17), short.used_chunk_rows);
+    try std.testing.expectEqual(@as(usize, 1), short.completed_chunks);
+    try std.testing.expectError(error.InvalidPrefillChunkPlan, nativeQualityServingPrefillStats(0, short_observed));
+}
+
 pub const GenerationConfig = struct {
     token_observer: ?token_logprobs.Observer = null,
     /// No qualification bypass exists in native/server release builds.
@@ -465,9 +1420,15 @@ pub const GenerationConfig = struct {
     /// Test/qualification-binary-only ingress for portable Metal checkpoints.
     /// Metal checkpoint path. Production availability remains release-profile
     /// gated and is intentionally absent until hardware qualification seals it.
-    metal_native_checkpoint_qualification: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
-    metal_checkpoint_qualification_route: if (builtin.is_test) MetalCheckpointQualificationRoute else void = if (builtin.is_test) .none else {},
-    metal_checkpoint_qualification_request: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    metal_native_checkpoint_qualification: bool = false,
+    metal_checkpoint_qualification_route: MetalCheckpointQualificationRoute = .none,
+    metal_checkpoint_qualification_request: u64 = 0,
+    metal_checkpoint_packed_singleton_evidence_sink: ?*@import("../backends/packed_context_session.zig").Session.SingletonDecodeSealEvidence = null,
+    native_checkpoint_operator_grant: ?NativeCheckpointOperatorGrant = null,
+    compiled_packed_prefill_bridge: ?CompiledPackedPrefillBridgeAuthority = null,
+    /// Server-authenticated portable checkpoint prepare requires every exact
+    /// donor row until the fit has completed. Never infer this from HTTP mode.
+    native_checkpoint_prepare_full_history: bool = false,
     /// Request-wide owner ledger created before compaction preflight. Packed
     /// session allocations join this ledger but do not own its lifetime.
     context_owner_allocation_tracker: ?*@import("../runtime/kv/host_allocation_tracker.zig").HostAllocationTracker = null,
@@ -496,6 +1457,9 @@ pub const GenerationConfig = struct {
     frequency_penalty: f32 = 0,
     presence_penalty: f32 = 0,
     prefill_chunk_size: usize = 0,
+    /// Internal observer for successfully committed prefill chunks. It does
+    /// not participate in scheduling or admission.
+    prefill_execution_stats: ?*PrefillExecutionStats = null,
     /// Borrowed immutable geometry produced by scheduler + memory admission.
     /// Empty preserves the scalar legacy path for embedders that do not yet
     /// participate in server admission.
@@ -536,6 +1500,14 @@ pub const GenerationConfig = struct {
     /// Benchmark/compatibility mode: continue decoding when the model emits an
     /// EOS token. Defaults to production stop-on-EOS behavior.
     ignore_eos: bool = false,
+    /// Qualification-only fixed-length policy. Suppress all configured EOS IDs
+    /// from this request's greedy choices without mutating model-global state.
+    fixed_length_mask_eos: bool = false,
+    /// Request-local effective suppression set. The backing storage is owned by
+    /// generateWithCallback and never escapes that call.
+    request_suppress_token_ids: ?[]const i32 = null,
+    /// Qualification evidence: retain pre-projection generated IDs in the result.
+    return_raw_token_ids: bool = false,
     /// Optional chat-template reasoning control. Null preserves the model's
     /// default; false asks templates that support `enable_thinking` to open a
     /// public/final response channel directly.
@@ -549,6 +1521,10 @@ pub const GenerationConfig = struct {
     /// Optional canonical little-endian f32 logits for the final Qwen3-VL
     /// prefill row. Qualification-only; requires qwen3vl_parity_json_path.
     qwen3vl_parity_logits_path: ?[]const u8 = null,
+
+    fn effectiveSuppressTokenIds(self: GenerationConfig, model: *const gpt_mod.Config) []const i32 {
+        return self.request_suppress_token_ids orelse model.suppress_token_ids[0..model.suppress_token_ids_len];
+    }
 };
 
 pub const MetalCheckpointQualificationRoute = enum {
@@ -695,6 +1671,63 @@ fn validateKvCachePolicy(config: GenerationConfig) !void {
     }
 }
 
+const max_request_suppress_token_ids = gpt_mod.max_suppress_token_ids + gpt_mod.max_extra_eos_token_ids + 1;
+
+fn appendUniqueValidTokenId(
+    out: *[max_request_suppress_token_ids]i32,
+    len: *usize,
+    token_id: i32,
+    vocab_size: u32,
+) !void {
+    if (token_id < 0 or token_id >= vocab_size) return error.InvalidFixedLengthEosToken;
+    if (std.mem.indexOfScalar(i32, out[0..len.*], token_id) != null) return;
+    if (len.* == out.len) return error.TooManySuppressedTokens;
+    out[len.*] = token_id;
+    len.* += 1;
+}
+
+fn buildRequestSuppressTokenIds(
+    model: gpt_mod.Config,
+    config: GenerationConfig,
+    out: *[max_request_suppress_token_ids]i32,
+) ![]const i32 {
+    if (!config.fixed_length_mask_eos) {
+        const original = model.suppressTokenIds();
+        if (original.len > out.len) return error.TooManySuppressedTokens;
+        @memcpy(out[0..original.len], original);
+        return out[0..original.len];
+    }
+    var len: usize = 0;
+    for (model.suppressTokenIds()) |token_id| try appendUniqueValidTokenId(out, &len, token_id, model.vocab_size);
+    if (!config.ignore_eos or config.max_tokens <= 0 or !isPureGreedyConfig(config) or config.grammar != null or
+        config.speculation_requested or config.draft_model != null)
+        return error.UnsupportedFixedLengthEosMask;
+    try appendUniqueValidTokenId(out, &len, model.eos_token_id, model.vocab_size);
+    for (model.extra_eos_token_ids[0..model.extra_eos_token_ids_len]) |token_id|
+        try appendUniqueValidTokenId(out, &len, token_id, model.vocab_size);
+    if (len >= model.vocab_size) return error.AllTokensSuppressed;
+    std.mem.sort(i32, out[0..len], {}, std.sort.asc(i32));
+    return out[0..len];
+}
+
+/// Owns the effective per-request suppression union. `ids()` borrows this
+/// object; callers must keep it alive until synchronous generation completes.
+pub const RequestSuppressPolicy = struct {
+    storage: [max_request_suppress_token_ids]i32 = undefined,
+    len: usize = 0,
+
+    pub fn init(model: gpt_mod.Config, config: GenerationConfig) !RequestSuppressPolicy {
+        var result: RequestSuppressPolicy = .{};
+        const built = try buildRequestSuppressTokenIds(model, config, &result.storage);
+        result.len = built.len;
+        return result;
+    }
+
+    pub fn ids(self: *const RequestSuppressPolicy) []const i32 {
+        return self.storage[0..self.len];
+    }
+};
+
 pub fn kvSlidingTrimForced() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
 }
@@ -747,7 +1780,7 @@ pub fn generationKvCapacityPolicyForRoute(
     generation_config: GenerationConfig,
     kv_dtype: runtime.kv.pool.KvDType,
 ) runtime.tier.memory.GenerationKvCapacityPolicy {
-    if (route == .standard) return .full_history;
+    if (route == .standard or generation_config.native_checkpoint_prepare_full_history) return .full_history;
     return generationKvCapacityPolicy(
         route,
         metalSplitSwaRingEligible(model_config, generation_config, kv_dtype),
@@ -771,13 +1804,47 @@ pub fn kvPoolConfig(
     };
 }
 
-/// CUDA logical owners do not need host KV mirrors when their numerical
-/// storage uses a device hook. This applies to request managers and both
-/// shared reader-epoch pools. Shared prompt-cache pools retain their ownership.
+/// GPU request-local managers own only logical block identities. Numerical KV
+/// lives in the paired KvStorageRuntime: Metal and CUDA bind its device hook
+/// before generation starts, while that storage retains its existing host
+/// fallback policy. Shared prompt-cache pools retain their own ownership.
 pub fn requestKvManagerPoolConfig(storage_config: runtime.kv.pool.KvPoolConfig) runtime.kv.pool.KvPoolConfig {
     var config = storage_config;
-    if (config.backend == .cuda) config.store_cpu_bytes = false;
+    if (config.backend == .metal or config.backend == .cuda) config.store_cpu_bytes = false;
     return config;
+}
+
+pub const RequestKvPoolConfigs = struct {
+    manager: runtime.kv.pool.KvPoolConfig,
+    storage: runtime.kv.pool.KvPoolConfig,
+};
+
+pub const RequestKvNumericalAuthority = enum {
+    outer_storage,
+    compiled_whole_model,
+};
+
+/// Keep request-manager metadata policy separate from numerical storage.
+/// CUDA storage remains device-authoritative as before; Metal retains the
+/// original host-backed fallback while its manager drops duplicate payloads.
+pub fn requestKvPoolConfigs(storage_config: runtime.kv.pool.KvPoolConfig) RequestKvPoolConfigs {
+    return requestKvPoolConfigsForAuthority(storage_config, .outer_storage) catch unreachable;
+}
+
+pub fn requestKvPoolConfigsForAuthority(
+    storage_config: runtime.kv.pool.KvPoolConfig,
+    authority: RequestKvNumericalAuthority,
+) !RequestKvPoolConfigs {
+    if (authority == .compiled_whole_model and
+        (storage_config.backend != .metal or storage_config.dtype != .f16))
+        return error.InvalidKvNumericalAuthority;
+    const manager = requestKvManagerPoolConfig(storage_config);
+    var storage = if (storage_config.backend == .cuda) manager else storage_config;
+    if (authority == .compiled_whole_model) storage.store_cpu_bytes = false;
+    return .{
+        .manager = manager,
+        .storage = storage,
+    };
 }
 
 /// Native checkpoint preparation and restore keep numerical KV on the device.
@@ -918,7 +1985,1066 @@ pub const ChatTemplate = struct {
 
 /// The native checkpoint request owns its output until the transport finishes.
 /// A savings rejection returns an exact checkpoint with an explicit outcome.
+fn wholeFitDigestEnv(name: [*:0]const u8) ![32]u8 {
+    const text = platform.env.getenv(name) orelse return error.InvalidWholeFitInputBinding;
+    if (text.len != 64) return error.InvalidWholeFitInputBinding;
+    var result: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&result, text) catch return error.InvalidWholeFitInputBinding;
+    return result;
+}
+
+fn augmentationSamplesAllowed(samples: u16, dense_reference: bool) bool {
+    return runtime.kv.attention_match_training_augmentation.allowedSamples(samples) or
+        (dense_reference and samples == runtime.kv.attention_match_training_augmentation.dense_reference_samples_per_stratum);
+}
+
+const PrivateDenseTraining = struct {
+    allocator: std.mem.Allocator,
+    batches: []runtime.kv.attention_match_engine.ReferenceBatch,
+    values: []f32,
+    positions: []u64,
+
+    fn clear(self: *@This()) void {
+        const allocator = self.allocator;
+        self.deinit();
+        self.* = .{ .allocator = allocator, .batches = &.{}, .values = &.{}, .positions = &.{} };
+    }
+
+    fn deinit(self: *@This()) void {
+        self.allocator.free(self.batches);
+        self.allocator.free(self.values);
+        self.allocator.free(self.positions);
+        self.* = undefined;
+    }
+};
+
+const PrivateDenseCollection = struct {
+    selection: runtime.kv.attention_match_reference_coverage.Selection,
+    queries: runtime.kv.attention_match_queries.Collector,
+    training: runtime.kv.attention_match_training_augmentation.OwnedTraining,
+    merged: PrivateDenseTraining,
+    diagnostic: quality_mod.QueryCollectionDiagnostic,
+    live_bytes: usize,
+
+    fn deinit(self: *@This()) void {
+        self.merged.deinit();
+        self.training.deinit();
+        self.queries.deinit();
+        self.selection.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Append only the independent domain's TRAIN rows. Primary heldout rows are
+/// borrowed unchanged and are never copied into the fitting domain.
+fn mergePrivateDenseTraining(
+    allocator: std.mem.Allocator,
+    primary: []const runtime.kv.attention_match_engine.ReferenceBatch,
+    dense: []const runtime.kv.attention_match_engine.ReferenceBatch,
+) !PrivateDenseTraining {
+    if (primary.len == 0 or primary.len != dense.len) return error.InvalidTrainingAugmentation;
+    var value_count: usize = 0;
+    var position_count: usize = 0;
+    for (primary, dense) |base, extra| {
+        if (base.consumer_layer != extra.consumer_layer or base.query_head != extra.query_head or
+            base.train_positions.len == 0 or base.heldout_positions.len == 0 or
+            extra.train_positions.len == 0 or extra.heldout.len != 0 or extra.heldout_positions.len != 0 or
+            base.train.len % base.train_positions.len != 0 or extra.train.len % extra.train_positions.len != 0)
+            return error.InvalidTrainingAugmentation;
+        const dim = base.train.len / base.train_positions.len;
+        if (dim == 0 or base.heldout.len != try std.math.mul(usize, base.heldout_positions.len, dim) or extra.train.len / extra.train_positions.len != dim)
+            return error.InvalidTrainingAugmentation;
+        for (0..extra.train_positions.len) |extra_row| for (0..base.heldout_positions.len) |heldout_row| {
+            const extra_values = extra.train[extra_row * dim ..][0..dim];
+            const heldout_values = base.heldout[heldout_row * dim ..][0..dim];
+            if (std.mem.eql(u8, std.mem.sliceAsBytes(extra_values), std.mem.sliceAsBytes(heldout_values)))
+                return error.InvalidTrainingAugmentation;
+        };
+        value_count = try std.math.add(usize, value_count, try std.math.add(usize, base.train.len, extra.train.len));
+        position_count = try std.math.add(usize, position_count, try std.math.add(usize, base.train_positions.len, extra.train_positions.len));
+    }
+    const values = try allocator.alloc(f32, value_count);
+    errdefer allocator.free(values);
+    const positions = try allocator.alloc(u64, position_count);
+    errdefer allocator.free(positions);
+    const batches = try allocator.alloc(runtime.kv.attention_match_engine.ReferenceBatch, primary.len);
+    errdefer allocator.free(batches);
+    var value_at: usize = 0;
+    var position_at: usize = 0;
+    for (primary, dense, batches) |base, extra, *out| {
+        const value_begin = value_at;
+        const position_begin = position_at;
+        @memcpy(values[value_at..][0..base.train.len], base.train);
+        value_at += base.train.len;
+        @memcpy(values[value_at..][0..extra.train.len], extra.train);
+        value_at += extra.train.len;
+        @memcpy(positions[position_at..][0..base.train_positions.len], base.train_positions);
+        position_at += base.train_positions.len;
+        @memcpy(positions[position_at..][0..extra.train_positions.len], extra.train_positions);
+        position_at += extra.train_positions.len;
+        out.* = .{
+            .consumer_layer = base.consumer_layer,
+            .query_head = base.query_head,
+            .train = values[value_begin..value_at],
+            .heldout = base.heldout,
+            .train_positions = positions[position_begin..position_at],
+            .heldout_positions = base.heldout_positions,
+            .independent_train_split = base.train_positions.len,
+        };
+    }
+    return .{ .allocator = allocator, .batches = batches, .values = values, .positions = positions };
+}
+
+fn copyChronologicalTraining(out_values: []f32, out_positions: []u64, batch: runtime.kv.attention_match_engine.ReferenceBatch, dim: usize) !void {
+    const available = std.math.add(usize, batch.train_positions.len, batch.heldout_positions.len) catch return error.InvalidFutureDecodeTraining;
+    const output_values = std.math.mul(usize, out_positions.len, dim) catch return error.InvalidFutureDecodeTraining;
+    const train_values = std.math.mul(usize, batch.train_positions.len, dim) catch return error.InvalidFutureDecodeTraining;
+    const heldout_values = std.math.mul(usize, batch.heldout_positions.len, dim) catch return error.InvalidFutureDecodeTraining;
+    if (dim == 0 or out_positions.len == 0 or out_positions.len > available or
+        out_values.len != output_values or batch.train.len != train_values or batch.heldout.len != heldout_values)
+        return error.InvalidFutureDecodeTraining;
+    var train_at: usize = 0;
+    var held_at: usize = 0;
+    var source_row: usize = 0;
+    for (out_positions, 0..) |*position, row| {
+        // Dense512 covers the full reference continuation. Preserve that span
+        // when selecting its 256 historical TRAIN rows; taking a prefix loses
+        // every query from the later half. A full-size copy remains identical.
+        const wanted = if (out_positions.len == 1) 0 else (std.math.mul(usize, row, available - 1) catch return error.InvalidFutureDecodeTraining) / (out_positions.len - 1);
+        while (true) : (source_row += 1) {
+            const take_train = held_at == batch.heldout_positions.len or
+                (train_at < batch.train_positions.len and batch.train_positions[train_at] < batch.heldout_positions[held_at]);
+            const input_position = if (take_train) batch.train_positions[train_at] else batch.heldout_positions[held_at];
+            const input_values = if (take_train) batch.train[train_at * dim ..][0..dim] else batch.heldout[held_at * dim ..][0..dim];
+            if (take_train) train_at += 1 else held_at += 1;
+            if (source_row == wanted) {
+                position.* = input_position;
+                @memcpy(out_values[row * dim ..][0..dim], input_values);
+                source_row += 1;
+                break;
+            }
+        }
+    }
+}
+
+test "future historical sampling preserves the complete Dense512 chronological span" {
+    var values: [1024]f32 = undefined;
+    var positions: [512]u64 = undefined;
+    for (&positions, 0..) |*position, i| {
+        position.* = 7936 + i;
+        values[i * 2] = @floatFromInt(i);
+        values[i * 2 + 1] = -values[i * 2];
+    }
+    const batch: runtime.kv.attention_match_engine.ReferenceBatch = .{ .consumer_layer = 23, .query_head = 0, .train = &values, .train_positions = &positions, .heldout = &.{}, .heldout_positions = &.{} };
+    var sampled: [512]f32 = undefined;
+    var selected: [256]u64 = undefined;
+    try copyChronologicalTraining(&sampled, &selected, batch, 2);
+    for (selected, 0..) |position, row| {
+        const wanted = row * 511 / 255;
+        try std.testing.expectEqual(@as(u64, 7936 + wanted), position);
+        try std.testing.expectEqual(@as(f32, @floatFromInt(wanted)), sampled[row * 2]);
+        try std.testing.expectEqual(-sampled[row * 2], sampled[row * 2 + 1]);
+        if (row != 0) try std.testing.expect(selected[row - 1] < position);
+    }
+    try std.testing.expectEqual(@as(u64, 8447), selected[255]);
+    // Added-domain inputs and original primary heldout ownership stay borrowed.
+    try std.testing.expectEqual(@as(u64, 7936), positions[0]);
+    try std.testing.expectEqual(@as(u64, 8447), positions[511]);
+}
+
+test "future full chronological copy preserves merged train and heldout row bytes" {
+    const train_values = [_]f32{ 0, 2, 4 };
+    const train_positions = [_]u64{ 7936, 7938, 7940 };
+    const held_values = [_]f32{ 1, 3, 5 };
+    const held_positions = [_]u64{ 7937, 7939, 7941 };
+    const batch: runtime.kv.attention_match_engine.ReferenceBatch = .{ .consumer_layer = 23, .query_head = 0, .train = &train_values, .train_positions = &train_positions, .heldout = &held_values, .heldout_positions = &held_positions };
+    var values: [6]f32 = undefined;
+    var positions: [6]u64 = undefined;
+    try copyChronologicalTraining(&values, &positions, batch, 1);
+    for (values, positions, 0..) |value, position, i| {
+        try std.testing.expectEqual(@as(f32, @floatFromInt(i)), value);
+        try std.testing.expectEqual(@as(u64, 7936 + i), position);
+    }
+}
+
+fn normalizeResidentFutureTraining(allocator: std.mem.Allocator, batches: []const runtime.kv.attention_match_engine.ReferenceBatch, control: runtime.kv.attention_match.Control) !runtime.kv.attention_match_training_augmentation.OwnedTraining {
+    try control.check();
+    const rows = runtime.kv.attention_match_training_augmentation.independent_domain_samples_per_stratum;
+    var normalized = try runtime.kv.attention_match_training_augmentation.mergeCollectorBatchesExact(allocator, batches, rows);
+    errdefer normalized.deinit();
+    try control.check();
+    for (normalized.batches) |batch| if (batch.train_positions.len != rows or batch.heldout.len != 0 or batch.heldout_positions.len != 0)
+        return error.InvalidTrainingAugmentation;
+    return normalized;
+}
+
+test "context resident future capture normalizes all 256 chronological rows into TRAIN" {
+    var train_values: [204]f32 = undefined;
+    var train_positions: [204]u64 = undefined;
+    var heldout_values: [52]f32 = undefined;
+    var heldout_positions: [52]u64 = undefined;
+    var ti: usize = 0;
+    var hi: usize = 0;
+    for (0..256) |row| if (row % 5 == 0) {
+        heldout_positions[hi] = 8128 + row;
+        heldout_values[hi] = @floatFromInt(row);
+        hi += 1;
+    } else {
+        train_positions[ti] = 8128 + row;
+        train_values[ti] = @floatFromInt(row);
+        ti += 1;
+    };
+    try std.testing.expectEqual(train_positions.len, ti);
+    try std.testing.expectEqual(heldout_positions.len, hi);
+    const raw = [_]runtime.kv.attention_match_engine.ReferenceBatch{.{ .consumer_layer = 23, .query_head = 0, .train = &train_values, .heldout = &heldout_values, .train_positions = &train_positions, .heldout_positions = &heldout_positions }};
+    try std.testing.expectError(error.OutOfMemory, normalizeResidentFutureTraining(std.testing.failing_allocator, &raw, .{}));
+    const Cancel = struct {
+        checks: usize = 0,
+        fn check(raw_context: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw_context.?));
+            self.checks += 1;
+            if (self.checks == 2) return error.Cancelled;
+        }
+    };
+    var cancel: Cancel = .{};
+    try std.testing.expectError(error.Cancelled, normalizeResidentFutureTraining(std.testing.allocator, &raw, .{ .context = &cancel, .check_fn = Cancel.check }));
+    var normalized = try normalizeResidentFutureTraining(std.testing.allocator, &raw, .{});
+    defer normalized.deinit();
+    try std.testing.expectEqual(@as(usize, 256), normalized.batches[0].train_positions.len);
+    for (normalized.batches[0].train, normalized.batches[0].train_positions, 0..) |value, position, row| {
+        try std.testing.expectEqual(@as(u64, 8128 + row), position);
+        try std.testing.expectEqual(@as(f32, @floatFromInt(row)), value);
+    }
+}
+
+fn futureCaptureAuthorityForPolicy(capture: NativeCheckpointPrepare.FutureDecodeTrainingCapture, generation_contract_sha256: [32]u8) runtime.kv.attention_match_future_decode_training.Authority {
+    var source_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    inline for (.{ capture.source_before.identity.weights, capture.source_before.identity.tokenizer, capture.source_before.identity.template, capture.source_before.identity.layout }) |value| source_hash.update(&value);
+    var scalar: [8]u8 = undefined;
+    inline for (.{ capture.source_before.sequence_id, @as(u64, @intCast(capture.source_before.logical_tokens)) }) |value| {
+        std.mem.writeInt(u64, &scalar, value, .little);
+        source_hash.update(&scalar);
+    }
+    return .{
+        .source_identity_sha256 = source_hash.finalResult(),
+        .source_tokens_sha256 = capture.source_before.tokens_sha256,
+        .source_revision = capture.source_before.kv_revision,
+        .generation_contract_sha256 = generation_contract_sha256,
+        .generated_ids_sha256 = capture.generated_ids_sha256,
+        .primary_sha256 = @splat(0),
+        .historical_sha256 = @splat(0),
+        .future_sha256 = @splat(0),
+        .heldout_sha256 = @splat(0),
+        .early_eos_observations = capture.early_eos_observations,
+    };
+}
+
+fn futureCaptureAuthority(capture: NativeCheckpointPrepare.FutureDecodeTrainingCapture) runtime.kv.attention_match_future_decode_training.Authority {
+    return futureCaptureAuthorityForPolicy(capture, runtime.kv.attention_match_future_decode_training.policyDigest());
+}
+
+fn bindMergedDomainDigests(authority: *runtime.kv.attention_match_future_decode_training.Authority, batches: []const runtime.kv.attention_match_engine.ReferenceBatch) void {
+    const policy = runtime.kv.attention_match_future_decode_training;
+    var primary = std.crypto.hash.sha2.Sha256.init(.{});
+    var historical = std.crypto.hash.sha2.Sha256.init(.{});
+    var future = std.crypto.hash.sha2.Sha256.init(.{});
+    var heldout = std.crypto.hash.sha2.Sha256.init(.{});
+    for (batches) |batch| {
+        const dim = batch.train.len / policy.training_rows;
+        const p_end = policy.primary_rows * dim;
+        const h_end = p_end + policy.historical_rows * dim;
+        primary.update(std.mem.sliceAsBytes(batch.train[0..p_end]));
+        primary.update(std.mem.sliceAsBytes(batch.train_positions[0..policy.primary_rows]));
+        historical.update(std.mem.sliceAsBytes(batch.train[p_end..h_end]));
+        historical.update(std.mem.sliceAsBytes(batch.train_positions[policy.primary_rows .. policy.primary_rows + policy.historical_rows]));
+        future.update(std.mem.sliceAsBytes(batch.train[h_end..]));
+        future.update(std.mem.sliceAsBytes(batch.train_positions[policy.primary_rows + policy.historical_rows ..]));
+        heldout.update(std.mem.sliceAsBytes(batch.heldout));
+        heldout.update(std.mem.sliceAsBytes(batch.heldout_positions));
+    }
+    authority.primary_sha256 = primary.finalResult();
+    authority.historical_sha256 = historical.finalResult();
+    authority.future_sha256 = future.finalResult();
+    authority.heldout_sha256 = heldout.finalResult();
+}
+
+fn updateResidentDomainDigest(
+    hash: *std.crypto.hash.sha2.Sha256,
+    batch_index: usize,
+    batch: runtime.kv.attention_match_engine.ReferenceBatch,
+    values: []const f32,
+    positions: []const u64,
+) void {
+    var scalar: [8]u8 = undefined;
+    inline for (.{ batch_index, @as(usize, batch.consumer_layer), @as(usize, batch.query_head), positions.len, if (positions.len == 0) @as(usize, 0) else values.len / positions.len }) |value| {
+        std.mem.writeInt(u64, &scalar, @intCast(value), .little);
+        hash.update(&scalar);
+    }
+    hash.update(std.mem.sliceAsBytes(values));
+    hash.update(std.mem.sliceAsBytes(positions));
+}
+
+const ResidentDomainGeometry = struct {
+    batch_count: usize,
+    historical_rows: usize,
+};
+
+fn residentDomainGeometry(cohort: ResidentHybridCohort) ResidentDomainGeometry {
+    return switch (cohort) {
+        .e4_8128_v1 => .{ .batch_count = 56, .historical_rows = 256 },
+        .e2_8128_v1 => .{ .batch_count = 56, .historical_rows = 256 },
+        .e4_formal_7936_256_v1, .e4_formal_32512_256_v1 => .{ .batch_count = 56, .historical_rows = 256 },
+    };
+}
+
+fn residentFuturePolicyDigest(cohort: ResidentHybridCohort) [32]u8 {
+    return switch (cohort) {
+        .e4_8128_v1 => runtime.kv.attention_match_future_decode_training.residentHybridPolicyDigest(),
+        .e2_8128_v1 => runtime.kv.attention_match_future_decode_training.residentE2HybridPolicyDigest(),
+        .e4_formal_7936_256_v1, .e4_formal_32512_256_v1 => runtime.kv.attention_match_future_decode_training.residentHybridPolicyDigest(),
+    };
+}
+
+fn bindResidentFinalDomainDigests(authority: *runtime.kv.attention_match_future_decode_training.Authority, batches: []const runtime.kv.attention_match_engine.ReferenceBatch, geometry: ResidentDomainGeometry) !void {
+    const policy = runtime.kv.attention_match_future_decode_training;
+    if (batches.len != geometry.batch_count) return error.InvalidFutureAugmentation;
+    var primary = std.crypto.hash.sha2.Sha256.init(.{});
+    var historical = std.crypto.hash.sha2.Sha256.init(.{});
+    var future = std.crypto.hash.sha2.Sha256.init(.{});
+    var heldout = std.crypto.hash.sha2.Sha256.init(.{});
+    primary.update("antfly.resident-final-primary-domain.v1\x00");
+    historical.update("antfly.resident-final-historical-domain.v1\x00");
+    future.update("antfly.resident-final-future-domain.v1\x00");
+    heldout.update("antfly.resident-final-heldout-domain.v1\x00");
+    for (batches, 0..) |batch, batch_index| {
+        const training_rows = policy.primary_rows + geometry.historical_rows + policy.future_rows;
+        if (batch.train_positions.len != training_rows or batch.heldout_positions.len != policy.heldout_rows or
+            batch.train.len % training_rows != 0 or batch.heldout.len % policy.heldout_rows != 0)
+            return error.InvalidFutureAugmentation;
+        const dim = batch.train.len / training_rows;
+        if (dim != 512 or batch.heldout.len / policy.heldout_rows != dim) return error.InvalidFutureAugmentation;
+        const primary_value_end = policy.primary_rows * dim;
+        const historical_value_end = (policy.primary_rows + geometry.historical_rows) * dim;
+        updateResidentDomainDigest(&primary, batch_index, batch, batch.train[0..primary_value_end], batch.train_positions[0..policy.primary_rows]);
+        updateResidentDomainDigest(&historical, batch_index, batch, batch.train[primary_value_end..historical_value_end], batch.train_positions[policy.primary_rows .. policy.primary_rows + geometry.historical_rows]);
+        updateResidentDomainDigest(&future, batch_index, batch, batch.train[historical_value_end..], batch.train_positions[policy.primary_rows + geometry.historical_rows ..]);
+        updateResidentDomainDigest(&heldout, batch_index, batch, batch.heldout, batch.heldout_positions);
+    }
+    authority.primary_sha256 = primary.finalResult();
+    authority.historical_sha256 = historical.finalResult();
+    authority.future_sha256 = future.finalResult();
+    authority.heldout_sha256 = heldout.finalResult();
+}
+
+fn validateResidentFinalTrainingDomains(
+    final: []const runtime.kv.attention_match_engine.ReferenceBatch,
+    primary: []const runtime.kv.attention_match_engine.ReferenceBatch,
+    future: []const runtime.kv.attention_match_engine.ReferenceBatch,
+    geometry: ResidentDomainGeometry,
+) !void {
+    const policy = runtime.kv.attention_match_future_decode_training;
+    if (final.len != primary.len or final.len != future.len or final.len != geometry.batch_count)
+        return error.InvalidFutureAugmentation;
+    const training_rows = policy.primary_rows + geometry.historical_rows + policy.future_rows;
+    for (final, primary, future) |candidate, p, f| {
+        if (candidate.consumer_layer != p.consumer_layer or candidate.consumer_layer != f.consumer_layer or
+            candidate.query_head != p.query_head or candidate.query_head != f.query_head or
+            candidate.train_positions.len != training_rows or
+            (candidate.independent_train_split orelse return error.InvalidFutureAugmentation) != policy.primary_rows or
+            (candidate.independent_train_second_split orelse return error.InvalidFutureAugmentation) != policy.primary_rows + geometry.historical_rows or
+            p.train_positions.len != policy.primary_rows or p.heldout_positions.len != policy.heldout_rows or
+            f.train_positions.len != policy.future_rows or f.heldout.len != 0 or f.heldout_positions.len != 0)
+            return error.InvalidFutureAugmentation;
+        const dim = candidate.train.len / training_rows;
+        if (dim != 512 or candidate.train.len != training_rows * dim or
+            p.train.len != policy.primary_rows * dim or p.heldout.len != policy.heldout_rows * dim or
+            f.train.len != policy.future_rows * dim or candidate.heldout.len != p.heldout.len)
+            return error.InvalidFutureAugmentation;
+        const p_values_end = policy.primary_rows * dim;
+        const f_values_begin = (policy.primary_rows + geometry.historical_rows) * dim;
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(candidate.train[0..p_values_end]), std.mem.sliceAsBytes(p.train)) or
+            !std.mem.eql(u8, std.mem.sliceAsBytes(candidate.train_positions[0..policy.primary_rows]), std.mem.sliceAsBytes(p.train_positions)) or
+            !std.mem.eql(u8, std.mem.sliceAsBytes(candidate.train[f_values_begin..]), std.mem.sliceAsBytes(f.train)) or
+            !std.mem.eql(u8, std.mem.sliceAsBytes(candidate.train_positions[policy.primary_rows + geometry.historical_rows ..]), std.mem.sliceAsBytes(f.train_positions)) or
+            !std.mem.eql(u8, std.mem.sliceAsBytes(candidate.heldout), std.mem.sliceAsBytes(p.heldout)) or
+            !std.mem.eql(u8, std.mem.sliceAsBytes(candidate.heldout_positions), std.mem.sliceAsBytes(p.heldout_positions)))
+            return error.InvalidFutureAugmentation;
+    }
+}
+
+fn validateResidentFutureHeldoutIndependence(
+    primary: []const runtime.kv.attention_match_engine.ReferenceBatch,
+    future: []const runtime.kv.attention_match_engine.ReferenceBatch,
+    batch_count: usize,
+) !void {
+    const policy = runtime.kv.attention_match_future_decode_training;
+    if (primary.len != future.len or primary.len != batch_count) return error.InvalidFutureAugmentation;
+    for (primary, future) |p, f| {
+        if (p.consumer_layer != f.consumer_layer or p.query_head != f.query_head or
+            p.heldout_positions.len != policy.heldout_rows or f.train_positions.len != policy.future_rows or
+            f.heldout.len != 0 or f.heldout_positions.len != 0)
+            return error.InvalidFutureAugmentation;
+        const dim = f.train.len / policy.future_rows;
+        if (dim != 512 or f.train.len != policy.future_rows * dim or p.heldout.len != policy.heldout_rows * dim)
+            return error.InvalidFutureAugmentation;
+        for (f.train_positions, 0..) |future_position, future_row| for (p.heldout_positions, 0..) |heldout_position, heldout_row| {
+            if (future_position == heldout_position and
+                std.mem.eql(u8, std.mem.sliceAsBytes(f.train[future_row * dim ..][0..dim]), std.mem.sliceAsBytes(p.heldout[heldout_row * dim ..][0..dim])))
+                return error.FutureDecodeHeldoutLeak;
+        };
+    }
+}
+
+test "context resident future final validation preserves 56 complete P H F heldout tuples" {
+    const policy = runtime.kv.attention_match_future_decode_training;
+    const dim = 512;
+    var p_values: [policy.primary_rows * dim]f32 = undefined;
+    var f_values: [policy.future_rows * dim]f32 = undefined;
+    var final_values: [policy.training_rows * dim]f32 = undefined;
+    var heldout: [policy.heldout_rows * dim]f32 = undefined;
+    var p_positions: [policy.primary_rows]u64 = undefined;
+    var f_positions: [policy.future_rows]u64 = undefined;
+    var final_positions: [policy.training_rows]u64 = undefined;
+    var heldout_positions: [policy.heldout_rows]u64 = undefined;
+    for (&p_values, 0..) |*v, i| v.* = @floatFromInt(i);
+    for (&f_values, 0..) |*v, i| v.* = @floatFromInt(1_000_000 + i);
+    for (&heldout, 0..) |*v, i| v.* = @floatFromInt(2_000_000 + i);
+    for (&p_positions, 0..) |*v, i| v.* = 10_000 + i;
+    for (&f_positions, 0..) |*v, i| v.* = 20_000 + i;
+    for (&heldout_positions, 0..) |*v, i| v.* = 30_000 + i;
+    @memcpy(final_values[0 .. policy.primary_rows * dim], &p_values);
+    @memset(final_values[policy.primary_rows * dim .. (policy.primary_rows + policy.historical_rows) * dim], -7);
+    @memcpy(final_values[(policy.primary_rows + policy.historical_rows) * dim ..], &f_values);
+    @memcpy(final_positions[0..policy.primary_rows], &p_positions);
+    for (final_positions[policy.primary_rows .. policy.primary_rows + policy.historical_rows], 0..) |*v, i| v.* = 15_000 + i;
+    @memcpy(final_positions[policy.primary_rows + policy.historical_rows ..], &f_positions);
+    var primary: [56]runtime.kv.attention_match_engine.ReferenceBatch = undefined;
+    var future: [56]runtime.kv.attention_match_engine.ReferenceBatch = undefined;
+    var final: [56]runtime.kv.attention_match_engine.ReferenceBatch = undefined;
+    var consumer_counts: [8]usize = @splat(0);
+    for (&primary, &future, &final, 0..) |*p, *f, *candidate, i| {
+        const layer: u16 = @intCast(5 + 6 * (i / 8));
+        const query_head: u16 = @intCast(i % 8);
+        const donor_index: usize = @min(i / 8, 3);
+        consumer_counts[donor_index * 2 + query_head / 4] += 1;
+        p.* = .{ .consumer_layer = layer, .query_head = query_head, .train = &p_values, .heldout = &heldout, .train_positions = &p_positions, .heldout_positions = &heldout_positions };
+        f.* = .{ .consumer_layer = layer, .query_head = query_head, .train = &f_values, .heldout = &.{}, .train_positions = &f_positions, .heldout_positions = &.{} };
+        candidate.* = .{ .consumer_layer = layer, .query_head = query_head, .train = &final_values, .heldout = &heldout, .train_positions = &final_positions, .heldout_positions = &heldout_positions, .independent_train_split = 256, .independent_train_second_split = 512 };
+    }
+    try std.testing.expectEqualDeep([_]usize{ 4, 4, 4, 4, 4, 4, 16, 16 }, consumer_counts);
+    // Numeric position overlap between independent epochs is valid when the
+    // query bytes differ.
+    heldout_positions[0] = f_positions[0];
+    try validateResidentFutureHeldoutIndependence(&primary, &future, 56);
+    try validateResidentFinalTrainingDomains(&final, &primary, &future, residentDomainGeometry(.e4_8128_v1));
+    var authority: runtime.kv.attention_match_future_decode_training.Authority = .{
+        .source_identity_sha256 = @splat(1),
+        .source_tokens_sha256 = @splat(2),
+        .source_revision = 9,
+        .generation_contract_sha256 = policy.residentHybridPolicyDigest(),
+        .generated_ids_sha256 = @splat(3),
+        .primary_sha256 = @splat(0),
+        .historical_sha256 = @splat(0),
+        .future_sha256 = @splat(0),
+        .heldout_sha256 = @splat(0),
+        .early_eos_observations = 0,
+    };
+    try bindResidentFinalDomainDigests(&authority, &final, residentDomainGeometry(.e4_8128_v1));
+    const tuple_bound = authority.digest();
+    final[0].query_head = 1;
+    try bindResidentFinalDomainDigests(&authority, &final, residentDomainGeometry(.e4_8128_v1));
+    try std.testing.expect(!std.mem.eql(u8, &tuple_bound, &authority.digest()));
+    final[0].query_head = 0;
+    future[0].query_head = 1;
+    try std.testing.expectError(error.InvalidFutureAugmentation, validateResidentFutureHeldoutIndependence(&primary, &future, 56));
+    future[0].query_head = 0;
+    final[0].independent_train_second_split = 511;
+    try std.testing.expectError(error.InvalidFutureAugmentation, validateResidentFinalTrainingDomains(&final, &primary, &future, residentDomainGeometry(.e4_8128_v1)));
+    final[0].independent_train_second_split = 512;
+    @memcpy(f_values[0..dim], heldout[0..dim]);
+    try std.testing.expectError(error.FutureDecodeHeldoutLeak, validateResidentFutureHeldoutIndependence(&primary, &future, 56));
+    @memcpy(f_values[0..dim], final_values[(policy.primary_rows + policy.historical_rows) * dim ..][0..dim]);
+    final_values[0] += 1;
+    try std.testing.expectError(error.InvalidFutureAugmentation, validateResidentFinalTrainingDomains(&final, &primary, &future, residentDomainGeometry(.e4_8128_v1)));
+}
+
+const FutureTrainingMerge = struct {
+    training: PrivateDenseTraining,
+    authority: runtime.kv.attention_match_future_decode_training.Authority,
+};
+
+fn mergePrivateFutureDecodeTraining(allocator: std.mem.Allocator, primary: []const runtime.kv.attention_match_engine.ReferenceBatch, historical: []const runtime.kv.attention_match_engine.ReferenceBatch, future: []const runtime.kv.attention_match_engine.ReferenceBatch, capture: NativeCheckpointPrepare.FutureDecodeTrainingCapture, control: runtime.kv.attention_match.Control) !FutureTrainingMerge {
+    const policy = runtime.kv.attention_match_future_decode_training;
+    if (primary.len == 0 or primary.len != historical.len or primary.len != future.len) return error.InvalidFutureDecodeTraining;
+    var value_count: usize = 0;
+    for (primary, historical, future) |base, old, next| {
+        if (base.consumer_layer != old.consumer_layer or base.consumer_layer != next.consumer_layer or base.query_head != old.query_head or base.query_head != next.query_head or base.train_positions.len != policy.primary_rows or base.heldout_positions.len != policy.heldout_rows or old.train_positions.len + old.heldout_positions.len < policy.historical_rows or next.train_positions.len + next.heldout_positions.len != policy.future_rows) return error.InvalidFutureDecodeTraining;
+        const dim = base.train.len / base.train_positions.len;
+        if (dim == 0 or base.heldout.len != policy.heldout_rows * dim or old.train.len + old.heldout.len < policy.historical_rows * dim or next.train.len + next.heldout.len != policy.future_rows * dim) return error.InvalidFutureDecodeTraining;
+        value_count = try std.math.add(usize, value_count, policy.training_rows * dim);
+    }
+    const values = try allocator.alloc(f32, value_count);
+    errdefer allocator.free(values);
+    const positions = try allocator.alloc(u64, primary.len * policy.training_rows);
+    errdefer allocator.free(positions);
+    const batches = try allocator.alloc(runtime.kv.attention_match_engine.ReferenceBatch, primary.len);
+    errdefer allocator.free(batches);
+    var value_at: usize = 0;
+    var position_at: usize = 0;
+    for (primary, historical, future, batches) |base, old, next, *out| {
+        const dim = base.train.len / base.train_positions.len;
+        const value_begin = value_at;
+        const position_begin = position_at;
+        @memcpy(values[value_at..][0..base.train.len], base.train);
+        @memcpy(positions[position_at..][0..base.train_positions.len], base.train_positions);
+        value_at += base.train.len;
+        position_at += base.train_positions.len;
+        if (old.heldout.len != 0 or old.heldout_positions.len != 0 or old.train_positions.len != policy.historical_selection.max_rows)
+            return error.InvalidFutureDecodeTraining;
+        var selected = try policy.historical_selection.select(allocator, old.train, old.train_positions, base.heldout_positions, dim, policy.historical_rows, control);
+        defer selected.deinit();
+        for (selected.indices, 0..) |index, row| {
+            @memcpy(values[value_at + row * dim ..][0..dim], old.train[@as(usize, index) * dim ..][0..dim]);
+            positions[position_at + row] = old.train_positions[index];
+        }
+        value_at += policy.historical_rows * dim;
+        position_at += policy.historical_rows;
+        try copyChronologicalTraining(values[value_at..][0 .. policy.future_rows * dim], positions[position_at..][0..policy.future_rows], next, dim);
+        value_at += policy.future_rows * dim;
+        position_at += policy.future_rows;
+        const primary_end = value_begin + policy.primary_rows * dim;
+        const historical_end = primary_end + policy.historical_rows * dim;
+        var authenticated = try policy.buildBound(allocator, .{
+            .primary = .{ .train = values[value_begin..primary_end], .positions = positions[position_begin..][0..policy.primary_rows] },
+            .historical = .{ .train = values[primary_end..historical_end], .positions = positions[position_begin + policy.primary_rows ..][0..policy.historical_rows] },
+            .future = .{ .train = values[historical_end..value_at], .positions = positions[position_begin + policy.primary_rows + policy.historical_rows .. position_at] },
+            .heldout = base.heldout,
+            .heldout_positions = base.heldout_positions,
+            .authority = undefined,
+        }, futureCaptureAuthority(capture), control);
+        defer authenticated.deinit();
+        @memcpy(values[value_begin..value_at], authenticated.train);
+        @memcpy(positions[position_begin..position_at], authenticated.positions);
+        // Primary, historical Dense512 and generated future continuations are
+        // independently sampled domains. Historical and future positions may
+        // overlap numerically and therefore require both explicit boundaries.
+        out.* = .{ .consumer_layer = base.consumer_layer, .query_head = base.query_head, .train = values[value_begin..value_at], .heldout = base.heldout, .train_positions = positions[position_begin..position_at], .heldout_positions = base.heldout_positions, .independent_train_split = policy.primary_rows, .independent_train_second_split = policy.primary_rows + policy.historical_rows };
+        try runtime.kv.attention_match_engine.validateReferencePositions(out.*, @intCast(capture.source_before.logical_tokens));
+    }
+    const training: PrivateDenseTraining = .{ .allocator = allocator, .batches = batches, .values = values, .positions = positions };
+    var authority = futureCaptureAuthority(capture);
+    bindMergedDomainDigests(&authority, training.batches);
+    return .{ .training = training, .authority = authority };
+}
+
+test "future merge preserves three real 256-row overlapping domains for engine validation" {
+    const policy = runtime.kv.attention_match_future_decode_training;
+    const source_tokens: usize = 7936;
+    var primary_values: [policy.primary_rows]f32 = undefined;
+    var historical_values: [512]f32 = undefined;
+    var future_values: [policy.future_rows]f32 = undefined;
+    var heldout_values: [policy.heldout_rows]f32 = undefined;
+    var primary_positions: [policy.primary_rows]u64 = undefined;
+    var historical_positions: [512]u64 = undefined;
+    var future_positions: [policy.future_rows]u64 = undefined;
+    var heldout_positions: [policy.heldout_rows]u64 = undefined;
+    var generated_ids: [policy.generated_tokens]i64 = undefined;
+    var source_ids: [source_tokens]i64 = undefined;
+    for (&source_ids, 0..) |*token, i| token.* = @intCast(i % 97);
+    const source_tokens_sha256 = runtime.kv.attention_match_self_study_training.hashTokens(&source_ids);
+    for (&primary_values, &primary_positions, 0..) |*value, *position, i| {
+        value.* = @floatFromInt(i + 1);
+        position.* = @intCast(source_tokens + i);
+    }
+    for (&historical_values, &historical_positions, 0..) |*value, *position, i| {
+        value.* = @floatFromInt(1000 + i);
+        position.* = @intCast(source_tokens + i);
+    }
+    for (&future_values, &future_positions, &generated_ids, 0..) |*value, *position, *token, i| {
+        value.* = @floatFromInt(2000 + i);
+        position.* = @intCast(source_tokens + i);
+        token.* = @intCast(i + 3);
+    }
+    for (&heldout_values, &heldout_positions, 0..) |*value, *position, i| {
+        value.* = @floatFromInt(3000 + i);
+        position.* = @intCast(source_tokens + policy.generated_tokens + i);
+    }
+    const primary = [_]runtime.kv.attention_match_engine.ReferenceBatch{.{
+        .consumer_layer = 0,
+        .query_head = 0,
+        .train = &primary_values,
+        .heldout = &heldout_values,
+        .train_positions = &primary_positions,
+        .heldout_positions = &heldout_positions,
+    }};
+    const historical = [_]runtime.kv.attention_match_engine.ReferenceBatch{.{
+        .consumer_layer = 0,
+        .query_head = 0,
+        .train = &historical_values,
+        .heldout = &.{},
+        .train_positions = &historical_positions,
+        .heldout_positions = &.{},
+    }};
+    const future = [_]runtime.kv.attention_match_engine.ReferenceBatch{.{
+        .consumer_layer = 0,
+        .query_head = 0,
+        .train = &future_values,
+        .heldout = &.{},
+        .train_positions = &future_positions,
+        .heldout_positions = &.{},
+    }};
+    const collector = try runtime.kv.attention_match_queries.Collector.init(std.testing.allocator, &.{.{
+        .layer = 0,
+        .donor = 0,
+        .query_heads = 1,
+        .kv_heads = 1,
+        .dim = 1,
+    }}, source_tokens, 2, .{ .samples_per_consumer = 2 });
+    var capture: NativeCheckpointPrepare.FutureDecodeTrainingCapture = .{
+        .allocator = std.testing.allocator,
+        .queries = collector,
+        .generated_ids = try std.testing.allocator.dupe(i64, &generated_ids),
+        .generated_ids_sha256 = runtime.kv.attention_match_self_study_training.hashTokens(&generated_ids),
+        .source_before = .{ .identity = .{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) }, .sequence_id = 7, .logical_tokens = source_tokens, .kv_revision = 9, .tokens_sha256 = source_tokens_sha256 },
+        .source_after = .{ .identity = .{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) }, .sequence_id = 7, .logical_tokens = source_tokens, .kv_revision = 9, .tokens_sha256 = source_tokens_sha256 },
+        .early_eos_observations = 0,
+    };
+    defer capture.deinit();
+    const resident_capture = futureCaptureAuthorityForPolicy(capture, policy.residentHybridPolicyDigest());
+    try std.testing.expectEqual(@as(u64, 9), resident_capture.source_revision);
+    try std.testing.expectEqualSlices(u8, &source_tokens_sha256, &resident_capture.source_tokens_sha256);
+    try std.testing.expectEqualSlices(u8, &capture.generated_ids_sha256, &resident_capture.generated_ids_sha256);
+    var changed_capture = capture;
+    changed_capture.source_before.kv_revision = 10;
+    const changed_resident_capture = futureCaptureAuthorityForPolicy(changed_capture, policy.residentHybridPolicyDigest());
+    try std.testing.expect(!std.mem.eql(u8, &resident_capture.digest(), &changed_resident_capture.digest()));
+    var merged = try mergePrivateFutureDecodeTraining(std.testing.allocator, &primary, &historical, &future, capture, .{});
+    defer merged.training.deinit();
+    const batch = &merged.training.batches[0];
+    try std.testing.expectEqual(@as(?usize, 256), batch.independent_train_split);
+    try std.testing.expectEqual(@as(?usize, 512), batch.independent_train_second_split);
+    try std.testing.expectEqual(@as(usize, 768), batch.train_positions.len);
+    for (0..256) |row| {
+        const position = batch.train_positions[256 + row];
+        try std.testing.expect(position >= source_tokens and position < source_tokens + 512);
+        for (heldout_positions) |heldout_position| try std.testing.expect(position != heldout_position);
+        const original_index = position - source_tokens;
+        try std.testing.expectEqual(@as(f32, @floatFromInt(1000 + original_index)), batch.train[256 + row]);
+    }
+    try std.testing.expectEqual(@as(u64, source_tokens), batch.train_positions[256]);
+    try std.testing.expectEqual(@as(u64, source_tokens + 511), batch.train_positions[511]);
+    try std.testing.expectEqualSlices(f32, &future_values, batch.train[512..768]);
+    try std.testing.expectEqualSlices(u64, &future_positions, batch.train_positions[512..768]);
+    try std.testing.expectEqualSlices(u64, &heldout_positions, batch.heldout_positions);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&heldout_values), std.mem.sliceAsBytes(batch.heldout));
+    try runtime.kv.attention_match_engine.validateReferencePositions(batch.*, source_tokens);
+    batch.independent_train_second_split = null;
+    try std.testing.expectError(error.InvalidCompactionQueries, runtime.kv.attention_match_engine.validateReferencePositions(batch.*, source_tokens));
+}
+
+fn privateDenseQueryLiveBytes(
+    primary: *const runtime.kv.attention_match_queries.Collector,
+    dense: *const runtime.kv.attention_match_queries.Collector,
+    selection: *const runtime.kv.attention_match_reference_coverage.Selection,
+    normalized: *const runtime.kv.attention_match_training_augmentation.OwnedTraining,
+    merged: *const PrivateDenseTraining,
+) !usize {
+    var total = try std.math.add(usize, primary.peak_bytes, dense.peak_bytes);
+    total = try std.math.add(usize, total, try std.math.mul(usize, try std.math.add(usize, selection.reference_tokens.len, selection.repeat_tokens.len), @sizeOf(i64)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, selection.offsets.len, @sizeOf(u32)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, selection.positions.len, @sizeOf(u64)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, normalized.batches.len, @sizeOf(runtime.kv.attention_match_engine.ReferenceBatch)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, normalized.values.len, @sizeOf(f32)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, normalized.positions.len, @sizeOf(u64)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, merged.batches.len, @sizeOf(runtime.kv.attention_match_engine.ReferenceBatch)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, merged.values.len, @sizeOf(f32)));
+    return std.math.add(usize, total, try std.math.mul(usize, merged.positions.len, @sizeOf(u64)));
+}
+
+fn applyFlatBatch256Diagnostic(prepare: *NativeCheckpointPrepare, enabled: bool) void {
+    prepare.private_capture_gram_batch256_diagnostic = enabled;
+    if (enabled) {
+        prepare.private_capture_summary = true;
+        prepare.private_incremental_budget = true;
+        prepare.private_training_reduction = true;
+    }
+}
+
+fn configurePrivateQualityDense(
+    prepare: *NativeCheckpointPrepare,
+    plan: NativeCheckpointPrepare.HostPlan,
+    requested: bool,
+    future_decode: bool,
+    resident_hybrid: bool,
+    resident_authority: ?@import("../runtime/kv/metal_checkpoint_quality.zig").Request.ResidentHybridAuthority,
+) !bool {
+    if (!requested) return false;
+    if (future_decode and resident_hybrid) return error.InvalidNativeQualityRequest;
+    if (prepare.quality_fit_strategy != .identity_chunk_coefficients_adaptive_v18 or
+        plan.fit_strategy != .identity_chunk_coefficients_adaptive_v18 or plan.query_reserve_bytes <= NativeCheckpointPrepare.auxiliary_host_bytes)
+        return error.InvalidNativeQualityRequest;
+    prepare.staged_operator_strategy = true;
+    prepare.training_policy = if (resident_hybrid)
+        .private_train_challenge_hybrid_resident_v1
+    else if (future_decode)
+        .private_future_decode_mix_v1
+    else
+        .private_dense512_reference_v1;
+    prepare.resident_hybrid_authority = if (resident_authority) |authority| .{
+        .configuration_sha256 = authority.configuration_sha256,
+        .source_freeze_sha256 = authority.source_freeze_sha256,
+        .shape_authority_sha256 = authority.shape_authority_sha256,
+        .policy_module_sha256 = authority.policy_module_sha256,
+        .e2_guarded_development_trial = authority.e2_guarded_development_trial,
+        .e2_fit_source_rows = authority.e2_fit_source_rows,
+        .e2_formal_owner_inventory_sha256 = authority.e2_formal_owner_inventory_sha256,
+        .e2_formal_owner_inventory = authority.e2_formal_owner_inventory,
+        .cohort = switch (authority.cohort) {
+            .e4_8128_v1 => .e4_8128_v1,
+            .e2_8128_v1 => .e2_8128_v1,
+            .e4_formal_7936_256_v1 => .e4_formal_7936_256_v1,
+            .e4_formal_32512_256_v1 => .e4_formal_32512_256_v1,
+        },
+        .e4_formal_authority = authority.e4_formal_authority,
+    } else null;
+    if (resident_hybrid != (prepare.resident_hybrid_authority != null)) return error.InvalidNativeQualityRequest;
+    if (prepare.resident_hybrid_authority) |authority| try authority.validate();
+    prepare.future_decode_training_policy_sha256 = if (future_decode) runtime.kv.attention_match_future_decode_training.policyDigest() else @splat(0);
+    prepare.bounded_delta_accelerated = prepare.encoding == .f16;
+    prepare.planned_private_query_bytes = plan.query_reserve_bytes;
+    if (resident_hybrid) {
+        prepare.private_capture_summary = true;
+        prepare.private_incremental_budget = true;
+        prepare.private_training_reduction = true;
+    }
+    applyFlatBatch256Diagnostic(prepare, if (comptime builtin.is_test)
+        platform.env.getenvBool("ANTFLY_METAL_QUALITY_FLAT_BATCH256_DIAGNOSTIC")
+    else
+        false);
+    return true;
+}
+
+test "context private Dense quality configures the actual fit request and query reserve" {
+    const plan: NativeCheckpointPrepare.HostPlan = .{
+        .fit_bytes = 8,
+        .reservation_bytes = NativeCheckpointPrepare.auxiliary_host_bytes + 9,
+        .source_bytes = 4,
+        .head_workspace_bytes = 4,
+        .workers = 1,
+        .query_reserve_bytes = NativeCheckpointPrepare.auxiliary_host_bytes + 1,
+        .admission = .cumulative_ladder_4_3_2,
+        .chunk_rows = 256,
+        .reject_exact_active_fixed_point = true,
+        .fit_strategy = .identity_chunk_coefficients_adaptive_v18,
+    };
+    var prepare: NativeCheckpointPrepare = .{ .encoding = .f16, .quality_fit_strategy = .identity_chunk_coefficients_adaptive_v18 };
+    try std.testing.expect(try configurePrivateQualityDense(&prepare, plan, true, false, false, null));
+    try std.testing.expect(prepare.staged_operator_strategy);
+    try std.testing.expectEqual(NativeCheckpointTrainingPolicy.private_dense512_reference_v1, prepare.training_policy);
+    try std.testing.expect(prepare.bounded_delta_accelerated);
+    try std.testing.expectEqual(@as(?usize, NativeCheckpointPrepare.auxiliary_host_bytes + 1), prepare.planned_private_query_bytes);
+    var ordinary: NativeCheckpointPrepare = .{};
+    try std.testing.expect(!try configurePrivateQualityDense(&ordinary, plan, false, false, false, null));
+    try std.testing.expectEqual(NativeCheckpointTrainingPolicy.primary_only, ordinary.training_policy);
+}
+
+test "context resident quality preserves exact policy and authenticated authority" {
+    const plan: NativeCheckpointPrepare.HostPlan = .{ .fit_bytes = 8, .reservation_bytes = NativeCheckpointPrepare.auxiliary_host_bytes + 9, .source_bytes = 4, .head_workspace_bytes = 2 * 1024 * 1024 * 1024, .workers = 1, .query_reserve_bytes = NativeCheckpointPrepare.auxiliary_host_bytes + 1, .admission = .cumulative_ladder_4_3_2, .chunk_rows = 256, .reject_exact_active_fixed_point = true, .fit_strategy = .identity_chunk_coefficients_adaptive_v18 };
+    var module_sha256: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&module_sha256, "e0a407063023d89c40f516270081012329a8981dc5c64de2dd8a985d8469afee");
+    const authority: @import("../runtime/kv/metal_checkpoint_quality.zig").Request.ResidentHybridAuthority = .{ .configuration_sha256 = @splat(1), .source_freeze_sha256 = @splat(2), .shape_authority_sha256 = @splat(3), .policy_module_sha256 = module_sha256 };
+    var prepare: NativeCheckpointPrepare = .{ .encoding = .rotated4, .quality_fit_strategy = .identity_chunk_coefficients_adaptive_v18 };
+    try std.testing.expect(try configurePrivateQualityDense(&prepare, plan, true, false, true, authority));
+    try std.testing.expectEqual(NativeCheckpointTrainingPolicy.private_train_challenge_hybrid_resident_v1, prepare.training_policy);
+    const expected: ResidentHybridAuthority = .{ .configuration_sha256 = authority.configuration_sha256, .source_freeze_sha256 = authority.source_freeze_sha256, .shape_authority_sha256 = authority.shape_authority_sha256, .policy_module_sha256 = authority.policy_module_sha256 };
+    try std.testing.expectEqualDeep(expected, prepare.resident_hybrid_authority.?);
+}
+
+test "flat batch256 diagnostic explicitly enables the complete private tuple" {
+    var prepare: NativeCheckpointPrepare = .{};
+    applyFlatBatch256Diagnostic(&prepare, true);
+    try std.testing.expect(prepare.private_capture_gram_batch256_diagnostic);
+    try std.testing.expect(prepare.private_capture_summary);
+    try std.testing.expect(prepare.private_incremental_budget);
+    try std.testing.expect(prepare.private_training_reduction);
+    applyFlatBatch256Diagnostic(&prepare, false);
+    try std.testing.expect(!prepare.private_capture_gram_batch256_diagnostic);
+}
+
+test "augmentation 512 is typed dense-reference only while legacy primary authority is unaffected" {
+    try std.testing.expect(augmentationSamplesAllowed(320, false));
+    try std.testing.expect(augmentationSamplesAllowed(32, false));
+    try std.testing.expect(augmentationSamplesAllowed(128, false));
+    try std.testing.expect(!augmentationSamplesAllowed(512, false));
+    try std.testing.expect(augmentationSamplesAllowed(512, true));
+}
+
+test "private Dense512 appends TRAIN and preserves primary heldout exactly" {
+    const primary = [_]runtime.kv.attention_match_engine.ReferenceBatch{.{
+        .consumer_layer = 3,
+        .query_head = 1,
+        .train = &.{ 1, 2, 3, 4 },
+        .heldout = &.{ 5, 6 },
+        .train_positions = &.{ 10, 11 },
+        .heldout_positions = &.{12},
+    }};
+    const dense = [_]runtime.kv.attention_match_engine.ReferenceBatch{.{
+        .consumer_layer = 3,
+        .query_head = 1,
+        .train = &.{ 7, 8, 9, 10 },
+        .heldout = &.{},
+        .train_positions = &.{ 11, 12 },
+        .heldout_positions = &.{},
+    }};
+    var merged = try mergePrivateDenseTraining(std.testing.allocator, &primary, &dense);
+    defer merged.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 7, 8, 9, 10 }, merged.batches[0].train);
+    try std.testing.expectEqualSlices(u64, &.{ 10, 11, 11, 12 }, merged.batches[0].train_positions);
+    try std.testing.expectEqual(@as(?usize, 2), merged.batches[0].independent_train_split);
+    try std.testing.expectEqualSlices(f32, primary[0].heldout, merged.batches[0].heldout);
+    try std.testing.expectEqualSlices(u64, primary[0].heldout_positions, merged.batches[0].heldout_positions);
+    try std.testing.expect(@intFromPtr(primary[0].heldout.ptr) == @intFromPtr(merged.batches[0].heldout.ptr));
+}
+
+test "private Dense512 rejects raw primary heldout query copies" {
+    const primary = [_]runtime.kv.attention_match_engine.ReferenceBatch{.{
+        .consumer_layer = 0,
+        .query_head = 0,
+        .train = &.{ 1, 2 },
+        .heldout = &.{ 3, 4 },
+        .train_positions = &.{10},
+        .heldout_positions = &.{11},
+    }};
+    const copied = [_]runtime.kv.attention_match_engine.ReferenceBatch{.{
+        .consumer_layer = 0,
+        .query_head = 0,
+        .train = &.{ 3, 4 },
+        .heldout = &.{},
+        .train_positions = &.{11},
+        .heldout_positions = &.{},
+    }};
+    try std.testing.expectError(error.InvalidTrainingAugmentation, mergePrivateDenseTraining(std.testing.allocator, &primary, &copied));
+}
+
+fn residentSevenPlusOneEvidence(stats: runtime.kv.attention_match_engine.Stats) bool {
+    return stats.v18_eligible_heads == 8 and stats.v18_attempted_heads == 8 and
+        stats.v18_accepted_heads == 7 and stats.v18_cache_ready_heads == 7 and
+        stats.validated_heads == 7 and stats.v18_exact_f32_probability_heads == 7 and
+        stats.v18_preserved_heads == 0 and stats.v18_fallback_heads == 0 and
+        stats.preserved_heads == 0 and stats.v18_planned_exact_heads == 1 and
+        stats.incremental_gram_chooser_calls == 21;
+}
+
+fn residentTwoPlusOneEvidence(stats: runtime.kv.attention_match_engine.Stats) bool {
+    return stats.v18_eligible_heads == 3 and stats.v18_attempted_heads == 3 and
+        stats.v18_accepted_heads == 2 and stats.v18_cache_ready_heads == 2 and
+        stats.validated_heads == 2 and stats.v18_exact_f32_probability_heads == 2 and
+        stats.v18_preserved_heads == 0 and stats.v18_fallback_heads == 0 and
+        stats.preserved_heads == 0 and stats.v18_planned_exact_heads == 1 and
+        stats.incremental_gram_chooser_calls == 6;
+}
+
+fn residentEvidenceProfile(stats: runtime.kv.attention_match_engine.Stats, cohort: ResidentHybridCohort, formal_e2: bool, encoding: native_kv_checkpoint.Encoding) quality_mod.V18EvidenceProfile {
+    if (stats.v18_query_batch_rows != 64 or stats.v18_planned_head_workspace_bytes != 2 * 1024 * 1024 * 1024) return .none;
+    return switch (cohort) {
+        .e4_8128_v1 => if (stats.v18_primary_budget_percent == 91 and residentSevenPlusOneEvidence(stats)) switch (encoding) {
+            .f16 => .resident_f16_fixed91_batch64_workspace2gib,
+            .fp8 => .resident_fp8_fixed91_batch64_workspace2gib,
+            .rotated4 => .resident_rotated4_fixed91_batch64_workspace2gib,
+            else => .none,
+        } else .none,
+        .e2_8128_v1 => if (stats.v18_primary_budget_percent == 60 and residentTwoPlusOneEvidence(stats) and (!formal_e2 or (stats.v18_bounded_heads == 2 and stats.v18_bounded_tsqr_heads == 2 and stats.v18_bounded_tsqr_calls >= 2 and stats.v18_bounded_tsqr_workspace_peak_bytes != 0 and stats.fp64_validation_summary_calls != 0))) switch (encoding) {
+            .f16 => if (formal_e2) .resident_e2_formal_f16_page_tsqr_v1 else .resident_e2_f16_fixed60_batch64_workspace2gib,
+            .fp8 => if (formal_e2) .resident_e2_formal_fp8_page_tsqr_v1 else .resident_e2_fp8_fixed60_batch64_workspace2gib,
+            .rotated4 => if (formal_e2) .resident_e2_formal_rotated4_page_tsqr_v1 else .resident_e2_rotated4_fixed60_batch64_workspace2gib,
+            else => .none,
+        } else .none,
+        .e4_formal_7936_256_v1 => if (stats.v18_primary_budget_percent == 91 and residentSevenPlusOneEvidence(stats)) switch (encoding) {
+            .f16 => .resident_f16_fixed91_batch64_workspace2gib,
+            .fp8 => .resident_fp8_fixed91_batch64_workspace2gib,
+            .rotated4 => .resident_rotated4_fixed91_batch64_workspace2gib,
+            else => .none,
+        } else .none,
+        .e4_formal_32512_256_v1 => if (stats.v18_bounded_heads != 0 and
+            stats.v18_bounded_tsqr_heads == stats.v18_bounded_heads and stats.v18_bounded_tsqr_calls != 0 and
+            stats.v18_bounded_tsqr_workspace_peak_bytes != 0 and stats.fp64_validation_summary_calls != 0 and
+            stats.fp64_validation_policy == .accelerate_fp64_summary_v1 and residentSevenPlusOneEvidence(stats)) switch (encoding) {
+            .f16 => .resident_e4_32512_f16_page_tsqr_v1,
+            .fp8 => .resident_e4_32512_fp8_page_tsqr_v1,
+            .rotated4 => .resident_e4_32512_rotated4_page_tsqr_v1,
+            else => .none,
+        } else .none,
+    };
+}
+
+test "resident evidence selection requires seven fitted heads and one exact clone" {
+    var stats: runtime.kv.attention_match_engine.Stats = .{
+        .v18_eligible_heads = 8,
+        .v18_attempted_heads = 8,
+        .v18_accepted_heads = 7,
+        .v18_cache_ready_heads = 7,
+        .validated_heads = 7,
+        .v18_exact_f32_probability_heads = 7,
+        .v18_planned_exact_heads = 1,
+        .incremental_gram_chooser_calls = 21,
+    };
+    try std.testing.expect(residentSevenPlusOneEvidence(stats));
+    stats.v18_accepted_heads = 6;
+    stats.v18_preserved_heads = 1;
+    try std.testing.expect(!residentSevenPlusOneEvidence(stats));
+    stats.v18_accepted_heads = 7;
+    stats.v18_preserved_heads = 0;
+    stats.v18_cache_ready_heads = 6;
+    stats.v18_fallback_heads = 1;
+    try std.testing.expect(!residentSevenPlusOneEvidence(stats));
+}
+
 pub const NativeCheckpointPrepare = struct {
+    pub const CompiledPrefillExactKvHandoff = struct {
+        pub const LayoutPolicy = enum {
+            split_swa_permitted,
+            full_history_exact,
+            /// Uniform full-history through 8K; above 8K, local donors use
+            /// their exact page-aligned SWA span while global donors retain
+            /// complete logical history. Candidate v8 authenticates this
+            /// policy independently of all older full-history grants.
+            full_history_exact_8k_split_swa_32k,
+        };
+        pub const CodecScope = enum {
+            f16_only,
+            f16_fp8_rotated4,
+        };
+
+        /// Hard device allocation ceiling admitted by the process-local
+        /// qualification owner. This is not populated from HTTP or CLI input.
+        max_copy_bytes: usize,
+        max_host_staging_bytes: usize,
+        codec_scope: CodecScope = .f16_only,
+        max_logical_tokens: usize = std.math.maxInt(usize),
+        layout_policy: LayoutPolicy = .split_swa_permitted,
+
+        pub fn requiresUniformFullHistory(self: @This(), logical_tokens: usize) bool {
+            return switch (self.layout_policy) {
+                .split_swa_permitted => false,
+                .full_history_exact => true,
+                .full_history_exact_8k_split_swa_32k => logical_tokens <= 8192,
+            };
+        }
+
+        pub fn authorizesBounded32kTsqr(self: @This()) bool {
+            if (self.max_logical_tokens != 32768) return false;
+            return self.layout_policy == .full_history_exact or
+                self.layout_policy == .full_history_exact_8k_split_swa_32k;
+        }
+
+        pub fn allows(self: @This(), encoding: runtime.kv.attention_match_checkpoint.Encoding, logical_tokens: usize) bool {
+            if (logical_tokens == 0 or logical_tokens > self.max_logical_tokens) return false;
+            return switch (self.codec_scope) {
+                .f16_only => encoding == .f16,
+                .f16_fp8_rotated4 => encoding == .f16 or encoding == .fp8 or encoding == .rotated4,
+            };
+        }
+    };
+    pub const CompiledPrefillExactKvReceipt = struct {
+        destination_storage_address: usize,
+        device_allocation_bound_bytes: usize,
+        copied_bytes: usize,
+        peak_host_staging_bytes: usize,
+        source_slots_released: usize,
+        source_live_bytes_before: u64,
+        source_live_bytes_after: u64,
+        source_physically_released_bytes: u64,
+    };
+    pub const QualityFitStrategy = @import("../runtime/kv/metal_checkpoint_quality.zig").FitStrategy;
+    pub const FitPolicy = @import("../runtime/kv/attention_match_fit_policy.zig").Policy;
+    pub const Admission = runtime.kv.attention_match_engine.Options.Admission;
+    pub const WholeFitInputExport = struct {
+        output_dir: []const u8,
+        augmentation_output_dir: ?[]const u8 = null,
+        augmentation_samples: u16 = runtime.kv.attention_match_training_augmentation.legacy_samples_per_stratum,
+        samples: u16 = 320,
+        method: runtime.kv.attention_match_whole_fit_input.Method = .top1,
+        source_freeze_sha256: [32]u8,
+        binary_sha256: [32]u8,
+        exporter_sha256: [32]u8,
+        self_study: ?*SelfStudyTrainingCapture = null,
+        reference_coverage: ?*ReferenceCoverageTrainingCapture = null,
+
+        pub fn validateAugmentation(self: @This()) !void {
+            if (self.self_study != null and self.reference_coverage != null) return error.InvalidTrainingAugmentationBinding;
+            if (self.reference_coverage) |capture| {
+                const expected: u16 = switch (capture.policy) {
+                    .coverage320 => runtime.kv.attention_match_reference_coverage.sample_count,
+                    .dense512 => runtime.kv.attention_match_reference_coverage.dense512_sample_count,
+                };
+                if (self.augmentation_samples != expected) return error.InvalidTrainingAugmentationBinding;
+            }
+            if ((self.self_study != null or self.reference_coverage != null) and self.augmentation_output_dir == null) return error.InvalidTrainingAugmentationBinding;
+            if (self.augmentation_output_dir) |path| {
+                const dense_reference = if (self.reference_coverage) |capture| capture.policy == .dense512 and self.augmentation_samples == runtime.kv.attention_match_training_augmentation.dense_reference_samples_per_stratum else false;
+                if (path.len == 0 or !std.fs.path.isAbsolute(path) or !augmentationSamplesAllowed(self.augmentation_samples, dense_reference)) return error.InvalidTrainingAugmentationBinding;
+            } else if (self.augmentation_samples != runtime.kv.attention_match_training_augmentation.legacy_samples_per_stratum) return error.InvalidTrainingAugmentationBinding;
+        }
+    };
+    pub const SelfStudyTrainingCapture = struct {
+        allocator: std.mem.Allocator,
+        queries: runtime.kv.attention_match_queries.Collector,
+        generated_ids: []i64,
+        prompt_tokens: []const i64,
+        prompt_tokens_sha256: [32]u8,
+        rendered_suffix_sha256: [32]u8,
+        generation_contract_sha256: [32]u8,
+        generated_ids_sha256: [32]u8,
+        complete_repeat_sha256: [32]u8,
+        source_before: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        source_after: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        primary_parent_manifest_sha256: [32]u8,
+        pub fn deinit(self: *@This()) void {
+            self.queries.deinit();
+            self.allocator.free(self.generated_ids);
+            self.* = undefined;
+        }
+    };
+    /// Unqualified staged capture from the unmodified exact source. Unlike the
+    /// template study this starts at the source's own next-token logits.
+    pub const FutureDecodeTrainingCapture = struct {
+        allocator: std.mem.Allocator,
+        queries: runtime.kv.attention_match_queries.Collector,
+        generated_ids: []i64,
+        generated_ids_sha256: [32]u8,
+        source_before: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        source_after: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        early_eos_observations: u16,
+        backend_owned_full_logits_calls: u16 = 0,
+        backend_owned_full_logits_ns: u64 = 0,
+        backend_owned_frame_successes: u16 = 0,
+        generic_last_logits_calls: u16 = 0,
+        backend_owned_full_logits_selected: bool = false,
+        gpu_greedy_calls: u16 = 0,
+        gpu_greedy_ns: u64 = 0,
+        gpu_greedy_frame_successes: u16 = 0,
+        gpu_greedy_selected: bool = false,
+        pub fn deinit(self: *@This()) void {
+            self.queries.deinit();
+            self.allocator.free(self.generated_ids);
+            self.* = undefined;
+        }
+    };
+    pub const ReferenceCoverageTrainingCapture = struct {
+        pub const Policy = enum { coverage320, dense512 };
+        allocator: std.mem.Allocator,
+        queries: runtime.kv.attention_match_queries.Collector,
+        selection: runtime.kv.attention_match_reference_coverage.Selection,
+        policy: Policy,
+        source_before: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        source_after: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        primary_parent_manifest_sha256: [32]u8,
+        pub fn deinit(self: *@This()) void {
+            self.queries.deinit();
+            self.selection.deinit();
+            self.* = undefined;
+        }
+    };
     // Keep HTTP admission and the engine's enforced fitting bound identical,
     // with this ceiling above the request-specific geometry plan. Query capture
     // and transfer buffers remain separately reserved. Process RSS is also gated.
@@ -932,40 +3058,158 @@ pub const NativeCheckpointPrepare = struct {
     pub const collection_options: runtime.kv.attention_match_queries.Options = .{ .samples_per_consumer = 320 };
     pub const max_repeat_tokens: usize = 512;
 
-    pub const HostPlan = struct { fit_bytes: usize, reservation_bytes: usize, source_bytes: usize, head_workspace_bytes: usize, workers: usize };
+    pub const HostPlan = struct { fit_bytes: usize, reservation_bytes: usize, source_bytes: usize, head_workspace_bytes: usize, workers: usize, query_reserve_bytes: usize = auxiliary_host_bytes, admission: Admission = .fixed, chunk_rows: u16 = 1024, reject_exact_active_fixed_point: bool = false, fit_strategy: QualityFitStrategy = .legacy };
+
+    pub fn privateDenseQueryMaximumBytes() !usize {
+        // Reserve complete collector caps, normalized Dense rows, and one
+        // merged TRAIN owner. The future path clears the old merge before
+        // capturing its continuation or allocating the replacement.
+        const primary = collection_options.max_bytes;
+        const dense: usize = 80 * 1024 * 1024;
+        const future = runtime.kv.attention_match_self_study_training.maximum_bytes;
+        const metadata: usize = 4 * 1024 * 1024;
+        const authenticated_batch: usize = 2 * 1024 * 1024;
+        const selector = runtime.kv.attention_match_future_decode_training.historical_selection.maximum_workspace_bytes;
+        const generated_ids = runtime.kv.attention_match_future_decode_training.generated_tokens * @sizeOf(i64);
+        var total: usize = 0;
+        for ([_]usize{ primary, dense, dense, primary, dense, future, metadata, authenticated_batch, selector, generated_ids }) |bytes|
+            total = try std.math.add(usize, total, bytes);
+        return total;
+    }
+
+    pub fn fitPolicy(self: *const NativeCheckpointPrepare) FitPolicy {
+        return .{
+            .admission = self.admission,
+            .chunk_rows = self.chunk_rows,
+            .reject_exact_active_fixed_point = self.reject_exact_active_fixed_point,
+        };
+    }
+
+    pub fn validatePlanAdmission(plan: HostPlan, requested: Admission, chunk_rows: u16, reject_exact_active_fixed_point: bool) !void {
+        if (plan.admission != requested or plan.chunk_rows != chunk_rows or plan.reject_exact_active_fixed_point != reject_exact_active_fixed_point)
+            return error.InvalidNativeCheckpointRequest;
+    }
+
+    pub fn v18ParallelPlan(source_bytes: usize, eligible_heads: usize) !HostPlan {
+        return v18ParallelPlanWithWorkspace(source_bytes, eligible_heads, 512 * 1024 * 1024);
+    }
+
+    pub const V18WorkspaceProfile = enum { standard, resident_native_hybrid_2g_v1 };
+
+    pub fn v18ParallelPlanWithWorkspace(source_bytes: usize, eligible_heads: usize, per_head: usize) !HostPlan {
+        return v18ParallelPlanWithWorkspaceProfile(source_bytes, eligible_heads, per_head, .standard);
+    }
+
+    pub fn v18ParallelPlanWithWorkspaceProfile(source_bytes: usize, eligible_heads: usize, per_head: usize, profile: V18WorkspaceProfile) !HostPlan {
+        if (eligible_heads == 0) return error.InvalidNativeCheckpointRequest;
+        const resident_hybrid = profile == .resident_native_hybrid_2g_v1;
+        if (resident_hybrid) {
+            if (per_head != 2 * 1024 * 1024 * 1024) return error.InvalidNativeCheckpointRequest;
+        } else if (per_head != 512 * 1024 * 1024 and per_head != 1024 * 1024 * 1024) {
+            return error.InvalidNativeCheckpointRequest;
+        }
+        // Primary collector (64 MiB), Dense512 collector (80 MiB), normalized
+        // Dense TRAIN, and the merged TRAIN descriptor/value copy are live
+        // together until the synchronous fit returns. Reserve their complete
+        // configured maxima conservatively rather than relying on allocator
+        // reuse or average payload sizes.
+        const query_reserve: usize = if (per_head == 1024 * 1024 * 1024 or resident_hybrid) try privateDenseQueryMaximumBytes() else auxiliary_host_bytes;
+        const resident = try runtime.kv.attention_match_engine.parallelResidentBytes(source_bytes, eligible_heads);
+        // The private Dense512 route already reserves a full 1 GiB for every
+        // worker. Use the existing 3,840 MiB hard ceiling for that explicit
+        // profile so independent heads can run concurrently; this raises no
+        // limit. The ordinary 512 MiB route retains the historical 2 GiB
+        // target whenever its resident source/candidate pair fits there.
+        const gross = if (per_head == 1024 * 1024 * 1024 or resident_hybrid)
+            max_transient_host_bytes
+        else if (resident <= metal_parallel_target_host_bytes)
+            metal_parallel_target_host_bytes
+        else
+            max_transient_host_bytes;
+        if (query_reserve >= gross) return error.CompactionWorkspaceLimit;
+        const aggregate = gross - query_reserve;
+        const planned = try @import("../ops/metal_attention_match_fit.zig").Fitter.parallelPlan(source_bytes, eligible_heads, per_head, aggregate, fit_workers);
+        return .{ .fit_bytes = planned.admitted_bytes, .reservation_bytes = try std.math.add(usize, planned.admitted_bytes, query_reserve), .source_bytes = source_bytes, .head_workspace_bytes = per_head, .workers = planned.workers, .query_reserve_bytes = query_reserve, .admission = .cumulative_ladder_4_3_2, .chunk_rows = 256, .reject_exact_active_fixed_point = true, .fit_strategy = .identity_chunk_coefficients_adaptive_v18 };
+    }
+
+    pub fn v18EligibleHeadCount(config: gpt_mod.Config) !usize {
+        var count: usize = 0;
+        for (0..config.num_hidden_layers) |layer| if (config.isKvDonorLayer(layer) and !config.layerUsesSlidingAttention(layer)) {
+            count = try std.math.add(usize, count, (try config.kvDonorGeometry(layer)).num_kv_heads);
+        };
+        return count;
+    }
 
     pub fn fittingOptions() runtime.kv.attention_match_engine.Options {
-        return .{
+        return fittingOptionsForAdmission(.fixed);
+    }
+
+    pub fn fittingOptionsForAdmission(admission: Admission) runtime.kv.attention_match_engine.Options {
+        return fittingOptionsForPolicy(admission, 1024);
+    }
+
+    pub fn fittingOptionsForPolicy(admission: Admission, chunk_rows: u16) runtime.kv.attention_match_engine.Options {
+        return fittingOptionsForQualityPolicy(admission, chunk_rows, false);
+    }
+
+    pub fn fittingOptionsForQualityPolicy(admission: Admission, chunk_rows: u16, reject_exact_active_fixed_point: bool) runtime.kv.attention_match_engine.Options {
+        var options: runtime.kv.attention_match_engine.Options = .{
+            .admission = admission,
             .storage_precision = .f16,
             .checkpoint_limits = native_kv_checkpoint.serving_limits,
             .prefix_rows = 128,
-            .chunk_rows = 1024,
+            .chunk_rows = chunk_rows,
             .min_retention_divisor = 2,
             .validation = .whole_head,
             .fit = .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set },
         };
+        if (admission == .cumulative_ladder_4_3_2) {
+            options.retention_divisor = 4;
+            options.min_retention_divisor = 2;
+            options.independent_fp64_publication = true;
+            options.min_global_savings_ratio = 1.5;
+        }
+        options.fit.reject_exact_active_fixed_point = reject_exact_active_fixed_point;
+        return options;
     }
 
     /// Exact-prefix preparation only. Admission uses the same per-head sizing
     /// as fitting, including the largest worker and a full-size fallback cache.
     /// Existing compacted states must use their own coverage-aware planner.
     pub fn hostPlan(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding, metal: bool) !HostPlan {
+        return hostPlanWithAdmission(config, tokens, encoding, metal, .fixed);
+    }
+
+    pub fn hostPlanWithAdmission(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding, metal: bool, admission: Admission) !HostPlan {
+        return hostPlanWithPolicy(config, tokens, encoding, metal, admission, 1024);
+    }
+
+    pub fn hostPlanWithPolicy(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding, metal: bool, admission: Admission, chunk_rows: u16) !HostPlan {
+        return hostPlanWithQualityPolicy(config, tokens, encoding, metal, admission, chunk_rows, false);
+    }
+
+    pub fn hostPlanWithQualityPolicy(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding, metal: bool, admission: Admission, chunk_rows: u16, reject_exact_active_fixed_point: bool) !HostPlan {
+        try (FitPolicy{ .admission = admission, .chunk_rows = chunk_rows, .reject_exact_active_fixed_point = reject_exact_active_fixed_point }).validate(encoding, metal);
         if (metal) {
             if (comptime !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
             if (encoding != .f16 and encoding != .fp8 and encoding != .rotated4)
                 return error.UnsupportedMetalKvCheckpointEncoding;
         } else if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
+        if ((admission == .fixed and (chunk_rows != 1024 or reject_exact_active_fixed_point)) or
+            (admission == .cumulative_ladder_4_3_2 and (!metal or
+                (encoding != .f16 and encoding != .fp8 and encoding != .rotated4) or
+                (chunk_rows != 128 and chunk_rows != 256 and chunk_rows != 1024)))) return error.InvalidNativeCheckpointRequest;
         if (config.family != .gemma or !config.usesGemma4Channels() or
             config.num_hidden_layers == 0 or config.num_hidden_layers > 256)
             return error.UnsupportedCompactionQueryModel;
         if (tokens < 2 or tokens > native_kv_checkpoint.max_context_tokens) return error.CompactionQueryLimit;
         const snapshot = runtime.kv.attention_match_snapshot;
-        var options = fittingOptions();
+        var options = fittingOptionsForQualityPolicy(admission, chunk_rows, reject_exact_active_fixed_point);
         options.independent_fp64_publication = metal;
         options.fp8_checkpoint = encoding == .fp8;
         options.rotated4_checkpoint = encoding == .rotated4;
         // Reserve for the largest bounded retry, even when 4:1 succeeds.
-        options.retention_divisor = options.min_retention_divisor.?;
+        if (admission == .fixed) options.retention_divisor = options.min_retention_divisor.?;
         var donors: [256]snapshot.Donor = undefined;
         var mapping: [256]u32 = undefined;
         var count: usize = 0;
@@ -1025,25 +3269,42 @@ pub const NativeCheckpointPrepare = struct {
             if (workspace.solver_bytes > options.fit.max_workspace_bytes) return error.CompactionWorkspaceLimit;
             maximum = @max(maximum, workspace.bytes);
         }
-        return finishHostPlan(source_bytes, heads, maximum, metal);
+        return finishHostPlan(source_bytes, heads, maximum, metal, admission, chunk_rows, reject_exact_active_fixed_point);
     }
 
     /// Admission for an installed checkpoint uses its retained rows and
     /// immutable fitted coverage, including each head's largest retry.
     pub fn hostPlanForState(config: gpt_mod.Config, state: runtime.kv.attention_match_checkpoint.State, encoding: runtime.kv.attention_match_checkpoint.Encoding, control: runtime.kv.attention_match.Control) !HostPlan {
+        return hostPlanForStateWithAdmission(config, state, encoding, .fixed, control);
+    }
+
+    pub fn hostPlanForStateWithAdmission(config: gpt_mod.Config, state: runtime.kv.attention_match_checkpoint.State, encoding: runtime.kv.attention_match_checkpoint.Encoding, admission: Admission, control: runtime.kv.attention_match.Control) !HostPlan {
+        return hostPlanForStateWithPolicy(config, state, encoding, admission, 1024, control);
+    }
+
+    pub fn hostPlanForStateWithPolicy(config: gpt_mod.Config, state: runtime.kv.attention_match_checkpoint.State, encoding: runtime.kv.attention_match_checkpoint.Encoding, admission: Admission, chunk_rows: u16, control: runtime.kv.attention_match.Control) !HostPlan {
+        return hostPlanForStateWithQualityPolicy(config, state, encoding, admission, chunk_rows, false, control);
+    }
+
+    pub fn hostPlanForStateWithQualityPolicy(config: gpt_mod.Config, state: runtime.kv.attention_match_checkpoint.State, encoding: runtime.kv.attention_match_checkpoint.Encoding, admission: Admission, chunk_rows: u16, reject_exact_active_fixed_point: bool, control: runtime.kv.attention_match.Control) !HostPlan {
+        try (FitPolicy{ .admission = admission, .chunk_rows = chunk_rows, .reject_exact_active_fixed_point = reject_exact_active_fixed_point }).validate(encoding, true);
         if (comptime !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
         if (encoding != .f16 and encoding != .fp8 and encoding != .rotated4)
             return error.UnsupportedMetalKvCheckpointEncoding;
+        if ((admission == .fixed and (chunk_rows != 1024 or reject_exact_active_fixed_point)) or
+            (admission == .cumulative_ladder_4_3_2 and
+                ((encoding != .f16 and encoding != .fp8 and encoding != .rotated4) or
+                    (chunk_rows != 128 and chunk_rows != 256 and chunk_rows != 1024)))) return error.InvalidNativeCheckpointRequest;
         if (config.family != .gemma or !config.usesGemma4Channels() or config.num_hidden_layers == 0 or
             config.num_hidden_layers > 256 or config.num_hidden_layers != state.layer_donors.len or
             config.vocab_size != state.logits.len or state.logical_length < 2)
             return error.UnsupportedCompactionQueryModel;
         try state.validateWithControl(native_kv_checkpoint.serving_limits, control);
-        var options = fittingOptions();
+        var options = fittingOptionsForQualityPolicy(admission, chunk_rows, reject_exact_active_fixed_point);
         options.independent_fp64_publication = true;
         options.fp8_checkpoint = encoding == .fp8;
         options.rotated4_checkpoint = encoding == .rotated4;
-        options.retention_divisor = options.min_retention_divisor.?;
+        if (admission == .fixed) options.retention_divisor = options.min_retention_divisor.?;
         const samples = @min(@min(state.tokens.len, max_repeat_tokens), collection_options.samples_per_consumer);
         const heldout = (samples - 1) / collection_options.heldout_stride + 1;
         var maximum: usize = 0;
@@ -1078,10 +3339,10 @@ pub const NativeCheckpointPrepare = struct {
                 maximum = @max(maximum, workspace.bytes);
             }
         }
-        return finishHostPlan(try state.residentBytes(), heads, maximum, true);
+        return finishHostPlan(try state.residentBytes(), heads, maximum, true, admission, chunk_rows, reject_exact_active_fixed_point);
     }
 
-    fn finishHostPlan(source_bytes: usize, heads: usize, maximum: usize, metal: bool) !HostPlan {
+    fn finishHostPlan(source_bytes: usize, heads: usize, maximum: usize, metal: bool, admission: Admission, chunk_rows: u16, reject_exact_active_fixed_point: bool) !HostPlan {
         const engine = runtime.kv.attention_match_engine;
         const fit_bytes, const workers = if (metal) plan: {
             if (comptime build_options.enable_metal) {
@@ -1109,37 +3370,372 @@ pub const NativeCheckpointPrepare = struct {
             if (bytes > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
             break :plan .{ bytes, selected };
         };
-        return .{ .fit_bytes = fit_bytes, .reservation_bytes = try std.math.add(usize, fit_bytes, auxiliary_host_bytes), .source_bytes = source_bytes, .head_workspace_bytes = maximum, .workers = workers };
+        return .{ .fit_bytes = fit_bytes, .reservation_bytes = try std.math.add(usize, fit_bytes, auxiliary_host_bytes), .source_bytes = source_bytes, .head_workspace_bytes = maximum, .workers = workers, .admission = admission, .chunk_rows = chunk_rows, .reject_exact_active_fixed_point = reject_exact_active_fixed_point };
     }
 
+    pub const PreparedQualitySourceSink = struct {
+        context: *anyopaque,
+        write_all_fn: *const fn (*anyopaque, []const u8) anyerror!void,
+        pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+            return self.write_all_fn(self.context, bytes);
+        }
+    };
+    pub const PreparedQualityHeldoutSink = struct {
+        context: *anyopaque,
+        write_fn: *const fn (*anyopaque, []const runtime.kv.attention_match_engine.ReferenceBatch, runtime.kv.attention_match_future_decode_training.Authority, runtime.kv.attention_match_engine.Layout) anyerror!void,
+        pub fn write(self: *@This(), batches: []const runtime.kv.attention_match_engine.ReferenceBatch, authority: runtime.kv.attention_match_future_decode_training.Authority, layout: runtime.kv.attention_match_engine.Layout) !void {
+            return self.write_fn(self.context, batches, authority, layout);
+        }
+    };
+
     fp64_accelerated_value_solves: u64 = 0,
+    prepare_host_owner_profile: NativeCheckpointOperatorGrant.PrepareHostOwnerProfile = .none,
+    prepare_host_owner_identity: u64 = 0,
 
     planned_fit_host_bytes: ?usize = null,
     planned_fit_workers: ?usize = null,
     planned_fit_head_workspace_bytes: ?usize = null,
+    planned_private_query_bytes: ?usize = null,
+    admission: Admission = .fixed,
+    chunk_rows: u16 = 1024,
+    reject_exact_active_fixed_point: bool = false,
+    quality_fit_strategy: QualityFitStrategy = .legacy,
+    /// Set only from a validated process-local operator grant. It does not
+    /// enroll v18 in the registry or change the legacy default.
+    staged_operator_strategy: bool = false,
+    /// Explicit process-local opt-in for the private >96-candidate bounded
+    /// geometry numerator backend. Never enabled by legacy or registry state.
+    bounded_delta_accelerated: bool = false,
+    /// Candidate-v4-only authorization for the bounded 32K TSQR value phase.
+    /// This does not alter the CPU FP64 heldout/publication path.
+    private_bounded_tsqr_value_backend: bool = false,
+    /// Process-local private flat-route performance tuple; never HTTP-derived.
+    private_capture_summary: bool = false,
+    /// Process-local diagnostic selection of the incremental Gram chooser for
+    /// the private capture/summary tuple. Never populated from HTTP input.
+    private_incremental_budget: bool = false,
+    /// Sealed private flat-route TRAIN reduction. This is process-local
+    /// operator authority, never HTTP-derived, and requires the complete
+    /// capture/summary/incremental tuple.
+    private_training_reduction: bool = false,
+    /// Test/diagnostic-only paired flat capture+Gram batch experiment. Only
+    /// the focused test worker's explicit environment gate sets this field;
+    /// server/grant paths and ordinary requests remain 64.
+    private_capture_gram_batch256_diagnostic: bool = false,
+    /// Request-private independent TRAIN domain. This is set only from the
+    /// process-local operator grant; ordinary requests and enrolled profiles
+    /// retain primary-only fitting.
+    training_policy: NativeCheckpointTrainingPolicy = .primary_only,
+    future_decode_training_policy_sha256: [32]u8 = @splat(0),
+    future_training_authority: ?runtime.kv.attention_match_future_decode_training.Authority = null,
+    /// Test-only, diagnostic complete future-mix export. The writer runs after
+    /// the whole-fit parent commits and before numerical fitting starts.
+    future_mix_output_dir: ?[]const u8 = null,
+    future_training_capture: ?runtime.kv.attention_match_future_augmentation.FutureTrainingCaptureEvidence = null,
+    future_historical_study_tokens_sha256: [32]u8 = @splat(0),
+    /// Private staged route only. Null retains the eager checkpoint producer.
+    compiled_prefill_exact_kv_handoff: ?CompiledPrefillExactKvHandoff = null,
+    compiled_prefill_exact_kv_receipt: ?CompiledPrefillExactKvReceipt = null,
+    compiled_prefill_preparation_wall_started_at: ?std.Io.Timestamp = null,
+    compiled_prefill_preparation_wall_ns: u64 = 0,
+    /// Ephemeral synchronous handoff owned by prepareNativeCheckpoint. Never
+    /// serialized or retained after prepareMetalAttentionMatchFit returns.
+    private_training_batches: ?[]const runtime.kv.attention_match_engine.ReferenceBatch = null,
+    /// Borrowed only for the synchronous resident-hybrid rewrite. Both owners
+    /// remain in prepareNativeCheckpoint until probeAttentionMatchFit returns.
+    private_dense_training: ?*const runtime.kv.attention_match_training_augmentation.OwnedTraining = null,
+    private_future_training_batches: ?[]const runtime.kv.attention_match_engine.ReferenceBatch = null,
+    /// Actual collector authority borrowed only by the synchronous resident
+    /// bridge. These values come from the live collector, never staged config.
+    private_collector_source_length: usize = 0,
+    private_collector_repeat_length: usize = 0,
+    private_collector_required_bytes: usize = 0,
+    private_collector_manifest_sha256: [32]u8 = @splat(0),
+    /// Frozen pre-evaluation authorities supplied by the authenticated staged
+    /// configuration. They are not interchangeable with training digests.
+    resident_hybrid_authority: ?ResidentHybridAuthority = null,
+    private_dense512_query_rows: usize = 0,
+    private_query_live_bytes: usize = 0,
+    /// Process-local qualification telemetry. Ordinary requests leave this null.
+    qualification_phase_telemetry: ?@import("native_checkpoint_prepare_phase_observer.zig").Owned = null,
+    primary_query_collection: quality_mod.QueryCollectionDiagnostic = .{},
+    dense512_query_collection: quality_mod.QueryCollectionDiagnostic = .{},
+    query_collection_combined_before_fit_ns: u64 = 0,
     /// Only the independent quality collector requests these extra seals.
     capture_quality_evidence: bool = false,
     quality_source_sha256: [32]u8 = @splat(0),
     quality_calibration: ?runtime.kv.attention_match_queries.Seal = null,
+    whole_fit_input: ?WholeFitInputExport = null,
+    producer_profile_sha256: [32]u8 = @splat(0),
+    producer_profile_semantic_sha256: [32]u8 = @splat(0),
+    /// Set from the validated process-local operator grant before resident
+    /// preparation. Never populated from public checkpoint request input.
+    producer_binary_sha256: [32]u8 = @splat(0),
+    /// Process-local request from the public producer to retain a strict
+    /// prepared-serving quality closure after AFATT002 export.
+    prepared_quality_closure_requested: bool = false,
+    prepared_quality_source_sink: ?PreparedQualitySourceSink = null,
+    prepared_quality_heldout_sink: ?PreparedQualityHeldoutSink = null,
+    prepared_quality_prompt_sha256: [32]u8 = @splat(0),
+    prepared_quality_prompt_tokens: usize = 0,
 
     encoding: runtime.kv.attention_match_checkpoint.Encoding = .f16,
     minimum_savings_ratio: f64 = 1.5,
     validation_workers: usize = 1,
     result: ?Result = null,
+    pub const DevicePayload = struct {
+        allocator: std.mem.Allocator,
+        device: @import("../ops/metal_attention_match_storage.zig").DeviceState,
+        metadata: runtime.kv.attention_match_checkpoint.StreamingMetadata,
+        maximum_head_download_bytes: usize,
+
+        fn deinit(self: *@This()) void {
+            self.device.deinit();
+            self.allocator.free(self.metadata.donors);
+            self.allocator.free(self.metadata.layer_donors);
+            self.allocator.free(self.metadata.logits);
+            self.allocator.free(self.metadata.tokens);
+            self.* = undefined;
+        }
+    };
+    pub const Payload = union(enum) {
+        host: runtime.kv.attention_match_checkpoint.Owned,
+        device: DevicePayload,
+
+        pub fn deinit(self: *@This()) void {
+            switch (self.*) {
+                .host => |*owned| owned.deinit(),
+                .device => |*owned| owned.deinit(),
+            }
+            self.* = undefined;
+        }
+        pub fn identity(self: *const @This()) runtime.kv.attention_match_checkpoint.Identity {
+            return switch (self.*) {
+                .host => |owned| owned.state.identity,
+                .device => |owned| owned.metadata.identity,
+            };
+        }
+        pub fn logicalLength(self: *const @This()) usize {
+            return switch (self.*) {
+                .host => |owned| owned.state.logical_length,
+                .device => |owned| owned.metadata.logical_length,
+            };
+        }
+        pub fn encodedSize(self: *@This(), encoding: runtime.kv.attention_match_checkpoint.Encoding, control: runtime.kv.attention_match.Control) !usize {
+            return switch (self.*) {
+                .host => |owned| runtime.kv.attention_match_checkpoint.encodedSize(owned.state, runtime.kv.attention_match_checkpoint.serving_limits, encoding, control),
+                .device => |*owned| blk: {
+                    var provider: runtime.kv.attention_match_device_checkpoint_provider.Context = .{ .allocator = owned.allocator, .state = &owned.device, .donors = owned.metadata.donors, .maximum_head_download_bytes = owned.maximum_head_download_bytes };
+                    defer provider.deinit();
+                    break :blk runtime.kv.attention_match_checkpoint.encodedSizeFromProvider(owned.metadata, provider.provider(), runtime.kv.attention_match_checkpoint.serving_limits, encoding, control);
+                },
+            };
+        }
+        pub fn exportEncoded(self: *@This(), encoding: runtime.kv.attention_match_checkpoint.Encoding, sink: anytype, control: runtime.kv.attention_match.Control) !runtime.kv.attention_match_checkpoint.ExportDigest {
+            return switch (self.*) {
+                .host => |owned| runtime.kv.attention_match_checkpoint.exportEncoded(owned.state, runtime.kv.attention_match_checkpoint.serving_limits, encoding, sink, control),
+                .device => |*owned| blk: {
+                    var provider: runtime.kv.attention_match_device_checkpoint_provider.Context = .{ .allocator = owned.allocator, .state = &owned.device, .donors = owned.metadata.donors, .maximum_head_download_bytes = owned.maximum_head_download_bytes };
+                    defer provider.deinit();
+                    break :blk runtime.kv.attention_match_checkpoint.exportEncodedFromProvider(owned.metadata, provider.provider(), runtime.kv.attention_match_checkpoint.serving_limits, encoding, sink, control);
+                },
+            };
+        }
+        pub fn artifactDigest(self: *@This(), encoding: runtime.kv.attention_match_checkpoint.Encoding, control: runtime.kv.attention_match.Control) ![32]u8 {
+            const Sink = struct {
+                pub fn writeAll(_: *@This(), _: []const u8) !void {}
+            };
+            var sink: Sink = .{};
+            return (try self.exportEncoded(encoding, &sink, control)).file_sha256;
+        }
+    };
     pub const Result = struct {
-        checkpoint: runtime.kv.attention_match_checkpoint.Owned,
+        payload: Payload,
+        /// Source owner revision observed before snapshot/export. This is
+        /// producer provenance only; a receiver creates its own revision.
+        source_revision: u64,
         outcome: enum { compacted, unchanged_insufficient_savings },
         stats: runtime.kv.attention_match_engine.Stats,
         source_host_bytes: usize,
         query_ns: u64,
         snapshot_ns: u64,
         fit_ns: u64,
+        quality_fit_strategy: QualityFitStrategy = .legacy,
+        v18_policy_sha256: [32]u8 = @splat(0),
+        v18_eligible_heads: usize = 0,
+        v18_attempted_heads: usize = 0,
+        v18_accepted_heads: usize = 0,
+        v18_preserved_heads: usize = 0,
+        v18_fallback_heads: usize = 0,
+        v18_cache_ready_heads: usize = 0,
+        v18_planned_exact_heads: usize = 0,
+        incremental_gram_chooser_calls: usize = 0,
+        v18_query_batch_rows: usize = 0,
+        v18_planned_head_workspace_bytes: usize = 0,
+        v18_cache_phase_peak_bound_bytes: usize = 0,
+        v18_evidence_profile: quality_mod.V18EvidenceProfile = .none,
+        v18_evidence_profile_sha256: [32]u8 = @splat(0),
+        v18_codec_physical_profile: quality_mod.V18EvidenceProfile = .none,
+        v18_codec_physical_profile_sha256: [32]u8 = @splat(0),
+        v18_bounded_tsqr_policy_sha256: [32]u8 = @splat(0),
+        v18_bounded_tsqr_heads: usize = 0,
+        v18_bounded_tsqr_calls: usize = 0,
+        v18_bounded_tsqr_workspace_peak_bytes: usize = 0,
+        v18_bounded_tsqr_cancellation_checks: usize = 0,
+        v18_exact_f32_probability_heads: usize = 0,
+        v18_gram_heads: usize = 0,
+        v18_scored_reuse_heads: usize = 0,
+        v18_gram_backend_calls: usize = 0,
+        v18_bounded_heads: usize = 0,
+        v18_primary_budget_percent: u8 = 0,
+        v18_budget_fallback_heads: usize = 0,
+        v18_bounded_provider_calls: u64 = 0,
+        v18_bounded_provider_rows: u64 = 0,
+        v18_bounded_workspace_bound_bytes: usize = 0,
+        v18_bounded_scoring_cache_prepares: usize = 0,
+        v18_bounded_scoring_selection_hits: usize = 0,
+        v18_bounded_scoring_fit_hits: usize = 0,
+        v18_bounded_range_cache_prepares: usize = 0,
+        v18_bounded_geometry_cache_requests: usize = 0,
+        v18_bounded_geometry_cache_hits: usize = 0,
+        v18_bounded_geometry_cache_loads: usize = 0,
+        v18_bounded_delta_heads: usize = 0,
+        v18_bounded_delta_tiles: usize = 0,
+        v18_bounded_delta_backend_calls: usize = 0,
+        v18_bounded_delta_packed_bytes_peak: usize = 0,
+        v18_bounded_delta_staged_bytes_peak: usize = 0,
+        v18_bounded_delta_fallbacks: usize = 0,
+        v18_numerical_policy: runtime.kv.attention_match_engine.Options.AdaptiveV18NumericalPolicy = .legacy_dense_f64,
+        v18_cache_prepare_ns: u64 = 0,
+        v18_selection_freeze_ns: u64 = 0,
+        v18_joint_value_fit_ns: u64 = 0,
+        v18_gram_construction_ns: u64 = 0,
+        v18_chooser_ns: u64 = 0,
+        v18_final_heldout_ns: u64 = 0,
+        training_reduction_local_original_calls: usize = 0,
+        training_reduction_rounded_harm_calls: usize = 0,
+        training_reduction_tiles: usize = 0,
+        training_reduction_backend_calls: usize = 0,
+        training_reduction_workspace_peak_bytes: usize = 0,
+        training_policy: NativeCheckpointTrainingPolicy = .primary_only,
+        future_training_authority: ?runtime.kv.attention_match_future_decode_training.Authority = null,
+        private_dense512_query_rows: usize = 0,
+        private_query_live_bytes: usize = 0,
+        planned_private_query_bytes: usize = 0,
+        primary_query_collection: quality_mod.QueryCollectionDiagnostic = .{},
+        dense512_query_collection: quality_mod.QueryCollectionDiagnostic = .{},
+        query_collection_combined_before_fit_ns: u64 = 0,
+        /// Set only after full candidate validation and request-private
+        /// publication have completed. This is not a consumer installation.
+        validation_complete: bool = false,
+        request_private_publish_complete: bool = false,
+        prompt_tokens_sha256: [32]u8 = @splat(0),
+        prompt_tokens: usize = 0,
+        source_checkpoint_sha256: [32]u8 = @splat(0),
     };
     pub fn deinit(self: *@This()) void {
-        if (self.result) |*result| result.checkpoint.deinit();
+        if (self.result) |*result| result.payload.deinit();
         self.result = null;
+        if (self.qualification_phase_telemetry) |*owned| owned.deinit();
+        self.qualification_phase_telemetry = null;
     }
 };
+
+fn compiledPrefillDonorCapacity(
+    capacity_tokens: usize,
+    page_size: usize,
+    sliding_window: usize,
+    max_inflight_tokens: usize,
+    sliding: bool,
+    allow_swa_ring: bool,
+) !usize {
+    if (!sliding or !allow_swa_ring) return capacity_tokens;
+    if (max_inflight_tokens == 0 or page_size == 0 or page_size > std.math.maxInt(u16))
+        return error.InvalidExactPagedKvHandoff;
+    const ring_pages = try runtime.kv.storage_runtime.swaRingPageCount(
+        @intCast(page_size),
+        sliding_window,
+        max_inflight_tokens,
+        true,
+    );
+    return try std.math.mul(usize, ring_pages, page_size);
+}
+
+test "compiled prefill codec scope is explicit bounded and backwards safe" {
+    const legacy: NativeCheckpointPrepare.CompiledPrefillExactKvHandoff = .{
+        .max_copy_bytes = 1,
+        .max_host_staging_bytes = 1,
+    };
+    try std.testing.expect(legacy.allows(.f16, 8192));
+    try std.testing.expect(!legacy.allows(.fp8, 8192));
+    try std.testing.expect(!legacy.allows(.rotated4, 8192));
+    try std.testing.expect(!legacy.allows(.f16, 0));
+    try std.testing.expect(legacy.allows(.f16, 8193));
+
+    const all_three: NativeCheckpointPrepare.CompiledPrefillExactKvHandoff = .{
+        .max_copy_bytes = 1,
+        .max_host_staging_bytes = 1,
+        .codec_scope = .f16_fp8_rotated4,
+        .max_logical_tokens = 8192,
+    };
+    inline for (.{ runtime.kv.attention_match_checkpoint.Encoding.f16, .fp8, .rotated4 }) |encoding|
+        try std.testing.expect(all_three.allows(encoding, 8192));
+    try std.testing.expect(!all_three.allows(.f32, 8192));
+    try std.testing.expect(!all_three.allows(.fp8, 8193));
+
+    const v4: NativeCheckpointPrepare.CompiledPrefillExactKvHandoff = .{
+        .max_copy_bytes = 4 * 1024 * 1024 * 1024,
+        .max_host_staging_bytes = 256 * 1024 * 1024,
+        .codec_scope = .f16_fp8_rotated4,
+        .max_logical_tokens = 32768,
+        .layout_policy = .full_history_exact,
+    };
+    inline for (.{ runtime.kv.attention_match_checkpoint.Encoding.f16, .fp8, .rotated4 }) |encoding| {
+        try std.testing.expect(v4.allows(encoding, 8192));
+        try std.testing.expect(v4.allows(encoding, 32768));
+    }
+    try std.testing.expect(!v4.allows(.f32, 32768));
+    try std.testing.expect(!v4.allows(.f16, 32769));
+    try std.testing.expectEqual(NativeCheckpointPrepare.CompiledPrefillExactKvHandoff.LayoutPolicy.full_history_exact, v4.layout_policy);
+    try std.testing.expect(v4.requiresUniformFullHistory(8192));
+    try std.testing.expect(v4.requiresUniformFullHistory(8193));
+    try std.testing.expect(v4.requiresUniformFullHistory(32512));
+    try std.testing.expect(v4.authorizesBounded32kTsqr());
+
+    var v8 = v4;
+    v8.layout_policy = .full_history_exact_8k_split_swa_32k;
+    try std.testing.expect(v8.requiresUniformFullHistory(8192));
+    try std.testing.expect(!v8.requiresUniformFullHistory(8193));
+    try std.testing.expect(!v8.requiresUniformFullHistory(32512));
+    try std.testing.expect(v8.authorizesBounded32kTsqr());
+}
+
+test "compiled E4 32K split layout bounds local donors and preserves global history" {
+    try std.testing.expectEqual(@as(usize, 8192), try compiledPrefillDonorCapacity(8192, 16, 512, 0, true, false));
+    try std.testing.expectEqual(@as(usize, 32512), try compiledPrefillDonorCapacity(32512, 16, 512, 256, true, false));
+    try std.testing.expectEqual(@as(usize, 784), try compiledPrefillDonorCapacity(32512, 16, 512, 256, true, true));
+    try std.testing.expectEqual(@as(usize, 32512), try compiledPrefillDonorCapacity(32512, 16, 512, 256, false, true));
+    try std.testing.expectError(error.InvalidExactPagedKvHandoff, compiledPrefillDonorCapacity(32512, 16, 512, 0, true, true));
+
+    const local_bytes: usize = 20 * 784 * (2 * 256 * @sizeOf(f16) * 2);
+    const global_bytes: usize = 4 * 32512 * (2 * 512 * @sizeOf(f16) * 2);
+    try std.testing.expectEqual(@as(usize, 564789248), local_bytes + global_bytes);
+}
+
+test "native checkpoint actual augmentation gate admits sealed 128 and preserves primary 320" {
+    const base: NativeCheckpointPrepare.WholeFitInputExport = .{ .output_dir = "/primary", .source_freeze_sha256 = @splat(1), .binary_sha256 = @splat(2), .exporter_sha256 = @splat(3) };
+    try base.validateAugmentation();
+    var extended = base;
+    extended.augmentation_output_dir = "/study-pass1-128";
+    extended.augmentation_samples = runtime.kv.attention_match_training_augmentation.extended_portfolio_samples_per_stratum;
+    try extended.validateAugmentation();
+    try std.testing.expectEqual(@as(u16, 320), extended.samples);
+    extended.augmentation_samples = 64;
+    try std.testing.expectError(error.InvalidTrainingAugmentationBinding, extended.validateAugmentation());
+    var no_route = base;
+    no_route.augmentation_samples = runtime.kv.attention_match_training_augmentation.extended_portfolio_samples_per_stratum;
+    try std.testing.expectError(error.InvalidTrainingAugmentationBinding, no_route.validateAugmentation());
+}
 
 test "native checkpoint exact host plan sizes Gemma4 E4B and preserves the release ceiling" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
@@ -1211,9 +3807,41 @@ test "Metal checkpoint host plan admits bounded E4B parallel fitters and all rel
         .max_position_embeddings = 131072,
     };
     const f16_plan = try NativeCheckpointPrepare.hostPlan(config, 8189, .f16, true);
+    const cumulative_plan = try NativeCheckpointPrepare.hostPlanWithAdmission(config, 8189, .f16, true, .cumulative_ladder_4_3_2);
     const fp8_plan = try NativeCheckpointPrepare.hostPlan(config, 8189, .fp8, true);
     const long_plan = try NativeCheckpointPrepare.hostPlan(config, 32752, .f16, true);
     try std.testing.expect(f16_plan.workers >= 2 and f16_plan.workers <= NativeCheckpointPrepare.fit_workers);
+    try std.testing.expectEqual(NativeCheckpointPrepare.Admission.fixed, f16_plan.admission);
+    try std.testing.expectEqual(NativeCheckpointPrepare.Admission.cumulative_ladder_4_3_2, cumulative_plan.admission);
+    try std.testing.expect(cumulative_plan.head_workspace_bytes >= f16_plan.head_workspace_bytes);
+    try std.testing.expect(cumulative_plan.fit_bytes >= f16_plan.fit_bytes);
+    try NativeCheckpointPrepare.validatePlanAdmission(cumulative_plan, .cumulative_ladder_4_3_2, 1024, false);
+    try std.testing.expectError(error.InvalidNativeCheckpointRequest, NativeCheckpointPrepare.validatePlanAdmission(cumulative_plan, .fixed, 1024, false));
+    try std.testing.expectError(error.InvalidNativeCheckpointRequest, NativeCheckpointPrepare.validatePlanAdmission(cumulative_plan, .cumulative_ladder_4_3_2, 256, false));
+    const cumulative_256_plan = try NativeCheckpointPrepare.hostPlanWithPolicy(config, 8189, .f16, true, .cumulative_ladder_4_3_2, 256);
+    try NativeCheckpointPrepare.validatePlanAdmission(cumulative_256_plan, .cumulative_ladder_4_3_2, 256, false);
+    try std.testing.expectError(error.InvalidNativeCheckpointRequest, NativeCheckpointPrepare.validatePlanAdmission(cumulative_256_plan, .cumulative_ladder_4_3_2, 256, true));
+    const fixed_point_plan = try NativeCheckpointPrepare.hostPlanWithQualityPolicy(config, 8189, .f16, true, .cumulative_ladder_4_3_2, 256, true);
+    try NativeCheckpointPrepare.validatePlanAdmission(fixed_point_plan, .cumulative_ladder_4_3_2, 256, true);
+    try std.testing.expectEqual(cumulative_256_plan.fit_bytes, fixed_point_plan.fit_bytes);
+    try std.testing.expectEqual(cumulative_256_plan.head_workspace_bytes, fixed_point_plan.head_workspace_bytes);
+    try std.testing.expectEqual(@as(u16, 256), cumulative_256_plan.chunk_rows);
+    try std.testing.expectError(error.InvalidNativeCheckpointRequest, NativeCheckpointPrepare.hostPlanWithPolicy(config, 8189, .f16, true, .fixed, 256));
+    for ([_]runtime.kv.attention_match_checkpoint.Encoding{ .f16, .fp8, .rotated4 }) |encoding| {
+        for ([_]u16{ 128, 256, 1024 }) |chunk_rows| {
+            const codec_plan = try NativeCheckpointPrepare.hostPlanWithQualityPolicy(config, 8189, encoding, true, .cumulative_ladder_4_3_2, chunk_rows, true);
+            try NativeCheckpointPrepare.validatePlanAdmission(codec_plan, .cumulative_ladder_4_3_2, chunk_rows, true);
+            try std.testing.expect(codec_plan.head_workspace_bytes > 0);
+            try std.testing.expect(codec_plan.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+        }
+    }
+    const cumulative_128 = try NativeCheckpointPrepare.hostPlanWithQualityPolicy(config, 8189, .f16, true, .cumulative_ladder_4_3_2, 128, true);
+    try NativeCheckpointPrepare.validatePlanAdmission(cumulative_128, .cumulative_ladder_4_3_2, 128, true);
+    try std.testing.expectEqual(@as(u16, 128), cumulative_128.chunk_rows);
+    try std.testing.expect(cumulative_128.head_workspace_bytes > 0);
+    try std.testing.expect(cumulative_128.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+    try std.testing.expect(cumulative_128.reservation_bytes >= cumulative_128.fit_bytes);
+    try std.testing.expectError(error.InvalidNativeCheckpointRequest, NativeCheckpointPrepare.validatePlanAdmission(cumulative_128, .cumulative_ladder_4_3_2, 256, true));
     try std.testing.expect(fp8_plan.workers >= 2 and fp8_plan.workers <= NativeCheckpointPrepare.fit_workers);
     try std.testing.expect(f16_plan.fit_bytes <= NativeCheckpointPrepare.metal_parallel_target_host_bytes);
     try std.testing.expect(fp8_plan.fit_bytes <= NativeCheckpointPrepare.metal_parallel_target_host_bytes);
@@ -1340,19 +3968,98 @@ test "Metal checkpoint host plan uses installed rows and newly eligible exact co
     options.independent_fp64_publication = true;
     const workspace = try @import("../ops/metal_attention_match_fit.zig").Fitter.headHostWorkspace(3144, 3140, 8, 1024, 256, 2, options);
     const installed = try NativeCheckpointPrepare.hostPlanForState(config, state, .f16, .{});
+    const cumulative_installed = try NativeCheckpointPrepare.hostPlanForStateWithAdmission(config, state, .f16, .cumulative_ladder_4_3_2, .{});
+    const cumulative_installed_256 = try NativeCheckpointPrepare.hostPlanForStateWithPolicy(config, state, .f16, .cumulative_ladder_4_3_2, 256, .{});
+    for ([_]checkpoint.Encoding{ .f16, .fp8, .rotated4 }) |encoding| {
+        for ([_]u16{ 256, 1024 }) |chunk_rows| {
+            const installed_codec = try NativeCheckpointPrepare.hostPlanForStateWithQualityPolicy(config, state, encoding, .cumulative_ladder_4_3_2, chunk_rows, true, .{});
+            try NativeCheckpointPrepare.validatePlanAdmission(installed_codec, .cumulative_ladder_4_3_2, chunk_rows, true);
+            try std.testing.expectEqual(try state.residentBytes(), installed_codec.source_bytes);
+            try std.testing.expect(installed_codec.head_workspace_bytes > 0);
+            try std.testing.expect(installed_codec.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+        }
+    }
     try std.testing.expectEqual(try state.residentBytes(), installed.source_bytes);
     try std.testing.expectEqual(workspace.bytes, installed.head_workspace_bytes);
     const exact = try NativeCheckpointPrepare.hostPlan(config, 4104, .f16, true);
     try std.testing.expect(installed.source_bytes < exact.source_bytes);
     try std.testing.expect(installed.head_workspace_bytes < exact.head_workspace_bytes);
     try std.testing.expect(installed.fit_bytes <= NativeCheckpointPrepare.metal_parallel_target_host_bytes);
+    try std.testing.expectEqual(NativeCheckpointPrepare.Admission.cumulative_ladder_4_3_2, cumulative_installed.admission);
+    try std.testing.expectEqual(@as(u16, 256), cumulative_installed_256.chunk_rows);
+    // Both policies fit the same eight newly eligible rows. Finer chunks
+    // still reserve nine additional full-source cumulative range descriptors.
+    const Range = @import("../runtime/kv/attention_match_cumulative_cache.zig").Range;
+    try std.testing.expectEqual(cumulative_installed.head_workspace_bytes + 9 * @sizeOf(Range), cumulative_installed_256.head_workspace_bytes);
+    try std.testing.expect(cumulative_installed_256.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+    const cumulative_installed_256_fixed_point = try NativeCheckpointPrepare.hostPlanForStateWithQualityPolicy(config, state, .f16, .cumulative_ladder_4_3_2, 256, true, .{});
+    try std.testing.expect(cumulative_installed_256_fixed_point.reject_exact_active_fixed_point);
+    try std.testing.expectEqual(cumulative_installed_256.head_workspace_bytes, cumulative_installed_256_fixed_point.head_workspace_bytes);
+    try std.testing.expectEqual(cumulative_installed_256.fit_bytes, cumulative_installed_256_fixed_point.fit_bytes);
+    try std.testing.expect(cumulative_installed.head_workspace_bytes >= installed.head_workspace_bytes);
+    try std.testing.expect(cumulative_installed.fit_bytes >= installed.fit_bytes);
     var wrong_config = config;
     wrong_config.attention_head_dim = 4;
     try std.testing.expectError(error.UnsupportedKvSnapshotLayout, NativeCheckpointPrepare.hostPlanForState(wrong_config, state, .f16, .{}));
 }
 
-/// The pipeline retires decoded host arrays after successful GPU restoration.
-/// On failure the request scope still owns and releases them.
+// The pipeline retires decoded host arrays after successful GPU restoration.
+// On failure the request scope still owns and releases them.
+test "private v18 parallel plan reserves full per-head cap and preserves legacy defaults" {
+    const legacy: NativeCheckpointPrepare = .{};
+    try std.testing.expectEqual(NativeCheckpointPrepare.QualityFitStrategy.legacy, legacy.quality_fit_strategy);
+    try std.testing.expect(legacy.compiled_prefill_exact_kv_handoff == null);
+    try std.testing.expect(legacy.compiled_prefill_exact_kv_receipt == null);
+    const plan = try NativeCheckpointPrepare.v18ParallelPlan(128 * 1024 * 1024, 8);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), plan.head_workspace_bytes);
+    try std.testing.expectEqual(NativeCheckpointPrepare.QualityFitStrategy.identity_chunk_coefficients_adaptive_v18, plan.fit_strategy);
+    try std.testing.expect(plan.workers >= 1 and plan.workers <= NativeCheckpointPrepare.fit_workers);
+    try std.testing.expect(plan.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+    try std.testing.expectEqual(plan.fit_bytes + NativeCheckpointPrepare.auxiliary_host_bytes, plan.reservation_bytes);
+}
+
+test "private Dense512 v18 plan admits concurrency only under unchanged hard cap" {
+    const mib: usize = 1024 * 1024;
+    const gib: usize = 1024 * mib;
+    const small_source: usize = 130023424;
+    const dense = try NativeCheckpointPrepare.v18ParallelPlanWithWorkspace(small_source, 8, gib);
+    try std.testing.expectEqual(@as(usize, 3), dense.workers);
+    try std.testing.expectEqual(gib, dense.head_workspace_bytes);
+    try std.testing.expectEqual(try NativeCheckpointPrepare.privateDenseQueryMaximumBytes(), dense.query_reserve_bytes);
+    try std.testing.expectEqual(dense.fit_bytes + dense.query_reserve_bytes, dense.reservation_bytes);
+    try std.testing.expect(dense.reservation_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+
+    // The ordinary profile preserves its historical 2 GiB gross target and
+    // 128 MiB auxiliary reservation.
+    const ordinary = try NativeCheckpointPrepare.v18ParallelPlanWithWorkspace(small_source, 8, 512 * mib);
+    try std.testing.expectEqual(NativeCheckpointPrepare.auxiliary_host_bytes, ordinary.query_reserve_bytes);
+    try std.testing.expect(ordinary.reservation_bytes <= NativeCheckpointPrepare.metal_parallel_target_host_bytes);
+
+    // Larger authenticated source/candidate residency reduces concurrency
+    // under the same ceiling; it never receives a larger request reservation.
+    const two = try NativeCheckpointPrepare.v18ParallelPlanWithWorkspace(600 * mib, 8, gib);
+    try std.testing.expectEqual(@as(usize, 2), two.workers);
+    try std.testing.expect(two.reservation_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+    try std.testing.expectError(error.CompactionWorkspaceLimit, NativeCheckpointPrepare.v18ParallelPlanWithWorkspace(1800 * mib, 8, gib));
+}
+
+test "resident hybrid v18 plan requires typed two GiB admission" {
+    const mib: usize = 1024 * 1024;
+    const gib: usize = 1024 * mib;
+    const source_bytes: usize = 130023424;
+    try std.testing.expectError(error.InvalidNativeCheckpointRequest, NativeCheckpointPrepare.v18ParallelPlanWithWorkspace(source_bytes, 8, 2 * gib));
+    try std.testing.expectError(error.InvalidNativeCheckpointRequest, NativeCheckpointPrepare.v18ParallelPlanWithWorkspaceProfile(source_bytes, 8, gib, .resident_native_hybrid_2g_v1));
+
+    const resident = try NativeCheckpointPrepare.v18ParallelPlanWithWorkspaceProfile(source_bytes, 8, 2 * gib, .resident_native_hybrid_2g_v1);
+    try std.testing.expectEqual(@as(usize, 1), resident.workers);
+    try std.testing.expectEqual(2 * gib, resident.head_workspace_bytes);
+    try std.testing.expectEqual(try NativeCheckpointPrepare.privateDenseQueryMaximumBytes(), resident.query_reserve_bytes);
+    try std.testing.expectEqual(resident.fit_bytes + resident.query_reserve_bytes, resident.reservation_bytes);
+    try std.testing.expect(resident.reservation_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+}
+
+pub const NativeCheckpointLocalCapacityPolicy = enum { legacy_spare512_v1, exact_window_causal_union_v1 };
+
 pub const NativeCheckpointResume = struct {
     checkpoint: ?runtime.kv.attention_match_checkpoint.Owned = null,
     encoding: ?runtime.kv.attention_match_checkpoint.Encoding = null,
@@ -1362,6 +4069,15 @@ pub const NativeCheckpointResume = struct {
     upload_ns: u64 = 0,
     install_ns: u64 = 0,
     suffix_prefill_ns: u64 = 0,
+    artifact_sha256: [32]u8 = @splat(0),
+    producer_policy: NativeCheckpointPrepare.FitPolicy = .legacy_fixed,
+    producer_profile_sha256: [32]u8 = @splat(0),
+    producer_profile_semantic_sha256: [32]u8 = @splat(0),
+    local_capacity_policy: NativeCheckpointLocalCapacityPolicy = .legacy_spare512_v1,
+
+    pub fn fitPolicy(self: *const @This()) NativeCheckpointPrepare.FitPolicy {
+        return self.producer_policy;
+    }
     pub fn deinit(self: *@This()) void {
         if (self.checkpoint) |*saved| saved.deinit();
         self.checkpoint = null;
@@ -1642,6 +4358,9 @@ pub const GenerationResult = struct {
     text: []const u8,
     reasoning_text: ?[]const u8 = null,
     token_ids: ?[]i32 = null,
+    applied_suppress_token_ids: ?[]i32 = null,
+    eos_token_ids: ?[]i32 = null,
+    fixed_length_mask_eos: bool = false,
     prompt_tokens: usize = 0,
     tokens_used: usize,
     finish_reason: []const u8,
@@ -1662,6 +4381,8 @@ pub const GenerationResult = struct {
         self.allocator.free(self.text);
         if (self.reasoning_text) |reasoning| self.allocator.free(reasoning);
         if (self.token_ids) |ids| self.allocator.free(ids);
+        if (self.applied_suppress_token_ids) |ids| self.allocator.free(ids);
+        if (self.eos_token_ids) |ids| self.allocator.free(ids);
         if (comptime @import("builtin").is_test) if (self.teacher_forced_evidence) |*evidence| evidence.deinit();
     }
 };
@@ -1842,6 +4563,9 @@ pub const SpeculativeDecodeStats = struct {
     mtp_acceptance_gate_fallbacks: usize = 0,
     mtp_quality: MtpQualityStats = .{},
     mtp_profile: MtpProfileStats = .{},
+    prompt_lookup_requested: bool = false,
+    prompt_lookup_enabled: bool = false,
+    prompt_lookup: prompt_lookup.Counters = .{},
 
     pub fn rejectedDraftTokens(self: SpeculativeDecodeStats) usize {
         return self.drafted_tokens -| self.matched_draft_tokens;
@@ -2940,6 +5664,22 @@ fn shouldEnterSpeculativeDecodeLoop(callback_allows_generation: bool, first_is_e
     return callback_allows_generation and !first_is_eos and !grammar_complete;
 }
 
+fn promptLookupRequestEligible(
+    explicitly_enabled: bool,
+    draft_requested: bool,
+    has_media: bool,
+    has_grammar_or_logprobs: bool,
+    pure_greedy: bool,
+    exact_context: bool,
+    target_verification_available: bool,
+    owns_decode_loop: bool,
+    rollback_capable_state: bool,
+) bool {
+    return explicitly_enabled and !draft_requested and !has_media and
+        !has_grammar_or_logprobs and pure_greedy and exact_context and
+        target_verification_available and owns_decode_loop and rollback_capable_state;
+}
+
 fn gemma4MtpDedicatedRuntimeEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEDICATED_RUNTIME", true);
 }
@@ -3269,6 +6009,14 @@ fn shouldUsePrefillFirstTokenPath(backend_kind: ops.BackendKind, pure_greedy: bo
     return enabled and backend_kind == .cuda and pure_greedy and !use_speculative;
 }
 
+fn requestSuppressionsAllowResidentGreedy(suppress_token_ids: []const i32) bool {
+    return suppress_token_ids.len == 0;
+}
+
+fn preparedGreedyDeclineAllowsUnsuppressedFallback(fixed_length_mask_eos: bool) bool {
+    return !fixed_length_mask_eos;
+}
+
 fn shouldUseCudaPrefillGreedyToken(
     backend_kind: ops.BackendKind,
     config: GenerationConfig,
@@ -3276,9 +6024,9 @@ fn shouldUseCudaPrefillGreedyToken(
     has_suppress_token_ids: bool,
     enabled: bool,
 ) bool {
-    _ = has_suppress_token_ids;
     return enabled and
         allow_resident_greedy_token and
+        !has_suppress_token_ids and
         backend_kind == .cuda and
         isPureGreedyConfig(config) and
         config.grammar == null;
@@ -3461,6 +6209,8 @@ pub const DecoderRuntimeDebugStats = struct {
     input_seq_empty: u64 = 0,
     input_successes: u64 = 0,
     replay_last_logits_fallbacks: u64 = 0,
+    prepared_token_successes: u64 = 0,
+    canonical_last_logits_calls: u64 = 0,
 };
 
 var decoder_runtime_debug_stats = DecoderRuntimeDebugStats{};
@@ -3472,6 +6222,68 @@ pub fn resetDecoderRuntimeDebugStats() void {
 
 pub fn getDecoderRuntimeDebugStats() DecoderRuntimeDebugStats {
     return decoder_runtime_debug_stats;
+}
+
+const PackedGrantProfileSnapshot = struct {
+    debug: DecoderRuntimeDebugStats,
+    decoder: decoder_gated_runtime.TimingStats,
+    frame_submits: u64,
+    frame_wait_ns: u128,
+    frame_gpu_ns: u128,
+    compute_encoders: u64,
+    blit_encoders: u64,
+    host_download_bytes: u64,
+    to_host_calls: u64,
+};
+
+const ResidentFfnPreparationDisposition = union(enum) { disabled, compiled_bypass, prepare: usize, reject };
+
+fn residentFfnPreparationDisposition(grant: NativeCheckpointOperatorGrant, native_checkpoint: bool, packed_storage: bool, backend: ops.BackendKind, exact_e4: bool, compiled_runtime_ready: bool) ResidentFfnPreparationDisposition {
+    if (!grant.execution.resident_gated_ffn_fusion) return .disabled;
+    if (backend != .metal or !exact_e4) return .reject;
+    if (grant.authority_kind == .candidate_profile and grant.arm == .attention_matching and native_checkpoint and
+        grant.training_policy == .private_train_challenge_hybrid_resident_v1 and grant.resident_hybrid_authority != null) return .{ .prepare = 1 };
+    if (grant.authority_kind == .staged_exact_baseline and !native_checkpoint) {
+        if (grant.arm == .packed_exact and packed_storage) return .{ .prepare = 512 };
+        if (grant.arm == .optimal_compiled_exact and !packed_storage and compiled_runtime_ready) return .compiled_bypass;
+    }
+    return .reject;
+}
+
+test "context resident FFN disposition prepares AM and packed, bypasses optimal compiled, and rejects malformed routes" {
+    var grant: NativeCheckpointOperatorGrant = undefined;
+    grant.execution = .{ .resident_gated_ffn_fusion = true };
+    grant.authority_kind = .candidate_profile;
+    grant.arm = .attention_matching;
+    grant.training_policy = .private_train_challenge_hybrid_resident_v1;
+    grant.resident_hybrid_authority = .{ .configuration_sha256 = @splat(1), .source_freeze_sha256 = @splat(2), .shape_authority_sha256 = @splat(3), .policy_module_sha256 = @splat(4) };
+    try std.testing.expect(std.meta.eql(ResidentFfnPreparationDisposition{ .prepare = 1 }, residentFfnPreparationDisposition(grant, true, false, .metal, true, false)));
+    grant.authority_kind = .staged_exact_baseline;
+    grant.training_policy = .primary_only;
+    grant.resident_hybrid_authority = null;
+    grant.arm = .packed_exact;
+    try std.testing.expect(std.meta.eql(ResidentFfnPreparationDisposition{ .prepare = 512 }, residentFfnPreparationDisposition(grant, false, true, .metal, true, false)));
+    grant.arm = .optimal_compiled_exact;
+    try std.testing.expect(std.meta.eql(ResidentFfnPreparationDisposition.compiled_bypass, residentFfnPreparationDisposition(grant, false, false, .metal, true, true)));
+    try std.testing.expect(std.meta.eql(ResidentFfnPreparationDisposition.reject, residentFfnPreparationDisposition(grant, false, false, .metal, true, false)));
+    try std.testing.expect(std.meta.eql(ResidentFfnPreparationDisposition.reject, residentFfnPreparationDisposition(grant, false, true, .metal, true, true)));
+    grant.arm = .attention_matching;
+    try std.testing.expect(std.meta.eql(ResidentFfnPreparationDisposition.reject, residentFfnPreparationDisposition(grant, false, false, .metal, true, true)));
+}
+
+fn packedGrantProfileSnapshot(pipeline: *NativeGenerationPipeline) PackedGrantProfileSnapshot {
+    const provider = pipeline.cb.debugTimingSnapshot().provider;
+    return .{
+        .debug = getDecoderRuntimeDebugStats(),
+        .decoder = decoder_gated_runtime.getTimingStats(),
+        .frame_submits = provider.decoder_runtime_frame_submits,
+        .frame_wait_ns = provider.decoder_runtime_frame_wait_nanos,
+        .frame_gpu_ns = provider.decoder_runtime_frame_gpu_nanos,
+        .compute_encoders = provider.metal_runtime_compute_encoder_count,
+        .blit_encoders = provider.metal_runtime_blit_encoder_count,
+        .host_download_bytes = provider.metal_tensor_host_mirror_download_bytes,
+        .to_host_calls = provider.metal_tensor_to_host_device_calls,
+    };
 }
 
 const SelectionQueryEntry = struct {
@@ -3562,6 +6374,7 @@ pub const NativeDecodeState = struct {
     last_context_metrics: ?runtime.kv.context_session.Metrics = null,
     last_context_split_decode_dispatches: u64 = 0,
     last_context_flash_prefill_dispatches: u64 = 0,
+    last_context_optimization_dispatches_available: bool = false,
     last_context_framed_attention_dispatches: u64 = 0,
     last_context_standalone_attention_dispatches: u64 = 0,
     last_context_device_allocation_start: runtime.kv.storage_runtime.DeviceAllocationSnapshot = .{},
@@ -3569,6 +6382,7 @@ pub const NativeDecodeState = struct {
     last_context_session_allocation_start: runtime.kv.host_allocation_tracker.Snapshot = .{},
     last_context_session_allocation_end: runtime.kv.host_allocation_tracker.Snapshot = .{},
     last_context_owner_committed: ?runtime.kv.host_allocation_tracker.Snapshot = null,
+    last_context_packed_singleton_seal: @import("../backends/packed_context_session.zig").Session.SingletonDecodeSealEvidence = .{},
     last_context_fault_before: if (@import("builtin").is_test) ?@import("../backends/packed_context_session.zig").FailureFingerprint else void = if (@import("builtin").is_test) null else {},
     last_context_fault_after: if (@import("builtin").is_test) ?@import("../backends/packed_context_session.zig").FailureFingerprint else void = if (@import("builtin").is_test) null else {},
     last_context_fault_partial: if (@import("builtin").is_test) ?@import("../backends/packed_context_session.zig").FailureFingerprint else void = if (@import("builtin").is_test) null else {},
@@ -3578,6 +6392,7 @@ pub const NativeDecodeState = struct {
     last_context_full_owner_physical_available: bool = false,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
+    kv_numerical_authority: RequestKvNumericalAuthority = .outer_storage,
     /// Optional external lock for shared paged KV metadata/storage. Batch
     /// generation wires every decode state in a group to the same manager and
     /// storage runtime, so admission reads and KV mutations must share this
@@ -4402,6 +7217,74 @@ pub const NativeDecodeState = struct {
         );
     }
 
+    pub fn qualificationOrdinaryExactInventory(
+        self: *NativeDecodeState,
+        allocator: std.mem.Allocator,
+        expected_prompt_tokens: usize,
+        layout: runtime.context_policy.Layout,
+    ) !backends.metal_kv_storage.MetalKvStorage.QualificationInventoryOwned {
+        if (comptime !builtin.is_test) return error.QualificationOnly;
+        if (self.quality_context_instance_id == 0) self.quality_context_instance_id = try allocateQualityContextInstance();
+        return self.ordinaryExactInventoryImpl(allocator, expected_prompt_tokens, layout, self.quality_context_instance_id, null);
+    }
+
+    /// Read-only production census of the current raw source. Its context
+    /// identity comes from the live request owner, and the device inventory
+    /// independently binds the authenticated token/shape/binary/freeze tuple.
+    pub fn ordinaryExactInventory(
+        self: *const NativeDecodeState,
+        allocator: std.mem.Allocator,
+        expected_prompt_tokens: usize,
+        layout: runtime.context_policy.Layout,
+        seal: backends.metal_kv_storage.MetalKvStorage.RawInventorySeal,
+    ) !backends.metal_kv_storage.MetalKvStorage.QualificationInventoryOwned {
+        try seal.validate();
+        const storage = self.kv_storage orelse return error.OrdinaryExactMetalKvRequired;
+        const tracker = storage.ownerAllocationTracker() orelse return error.ContextPhysicalAccountingUnavailable;
+        const owner = tracker.snapshot();
+        if (!owner.available or !owner.physical_available or owner.owner_identity == 0)
+            return error.ContextPhysicalAccountingUnavailable;
+        return self.ordinaryExactInventoryImpl(allocator, expected_prompt_tokens, layout, owner.owner_identity, seal);
+    }
+
+    fn ordinaryExactInventoryImpl(
+        self: *const NativeDecodeState,
+        allocator: std.mem.Allocator,
+        expected_prompt_tokens: usize,
+        layout: runtime.context_policy.Layout,
+        context_instance_id: u64,
+        seal: ?backends.metal_kv_storage.MetalKvStorage.RawInventorySeal,
+    ) !backends.metal_kv_storage.MetalKvStorage.QualificationInventoryOwned {
+        if (!build_options.enable_metal or self.context_session != null or self.kv_compacted or self.force_full_recompute)
+            return error.OrdinaryExactMetalKvRequired;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const storage = self.kv_storage orelse return error.OrdinaryExactMetalKvRequired;
+        const hook = storage.device_write_hook orelse return error.OrdinaryExactMetalKvRequired;
+        const view = self.kv_view orelse return error.InvalidQualificationFingerprint;
+        const logical_blocks = view.logical_blocks orelse return error.InvalidQualificationFingerprint;
+        if (expected_prompt_tokens == 0 or self.total_tokens != expected_prompt_tokens or view.token_count != expected_prompt_tokens or
+            self.sequence_id == null or view.sequence_id != self.sequence_id.? or layout.len == 0 or layout.len > gpt_mod.max_attention_layers)
+            return error.InvalidQualificationFingerprint;
+        var owner_layers: [gpt_mod.max_attention_layers]u32 = undefined;
+        var owner_count: usize = 0;
+        for (layout.layers[0..layout.len], 0..) |layer, index| if (layer.owner == index) {
+            owner_layers[owner_count] = @intCast(index);
+            owner_count += 1;
+        };
+        if (owner_count == 0) return error.InvalidQualificationFingerprint;
+        const request: backends.metal_kv_storage.MetalKvStorage.QualificationFingerprintRequest = .{
+            .context_instance_id = context_instance_id,
+            .sequence_id = view.sequence_id,
+            .logical_tokens = @intCast(expected_prompt_tokens),
+            .position_offset = @intCast(view.position_offset),
+            .logical_blocks = logical_blocks,
+            .owner_layers = owner_layers[0..owner_count],
+        };
+        if (seal) |authority| return backends.metal_kv_storage.MetalKvStorage.rawStructuralInventoryDeviceHook(hook, allocator, request, authority);
+        return backends.metal_kv_storage.MetalKvStorage.qualificationInventoryDeviceHook(hook, allocator, request);
+    }
+
     pub fn gptDecodeContext(self: *NativeDecodeState, seq_len: usize, query_seq_len: usize) gpt_arch.DecodeContext {
         if (self.context_session) |hook| return .{
             .context_session = hook,
@@ -5119,6 +8002,437 @@ pub const QwenVisionBatchHook = struct {
 };
 
 const ExecutionScope = @import("../ops/execution_scope.zig").Scope;
+const mirror_test_std = @import("std");
+
+pub fn e2bF16MirrorBackendCap(
+    backend_limit_bytes: u64,
+    combined_limit_bytes: u64,
+    host_total_bytes: u64,
+) ?u64 {
+    var cap: u64 = @as(u64, 8) * 1024 * 1024 * 1024;
+    if (backend_limit_bytes != 0) cap = @min(cap, backend_limit_bytes);
+    if (combined_limit_bytes != 0) {
+        if (host_total_bytes >= combined_limit_bytes) return null;
+        cap = @min(cap, combined_limit_bytes - host_total_bytes);
+    }
+    return if (cap == 0) null else cap;
+}
+
+const F16MirrorCohortSelection = struct { ops.DecoderRuntimeF16MirrorCohort, usize };
+pub fn f16MirrorCohortForConfig(config: gpt_mod.Config) ?F16MirrorCohortSelection {
+    if (config.family != .gemma) return null;
+    if (config.hidden_size == 1536 and config.num_hidden_layers == 35)
+        return .{ .e2b_full35_gate_up_down, 35 };
+    if (config.hidden_size == 2560 and config.num_hidden_layers == 42)
+        return .{ .e4b_prefix26_gate_up, 26 };
+    return null;
+}
+
+test "F16 mirror family builder selects only closed E2 and E4 cohorts" {
+    var config = gpt_mod.Config{ .family = .gemma, .hidden_size = 1536, .num_hidden_layers = 35 };
+    try std.testing.expectEqual(ops.DecoderRuntimeF16MirrorCohort.e2b_full35_gate_up_down, f16MirrorCohortForConfig(config).?[0]);
+    config.hidden_size = 2560;
+    config.num_hidden_layers = 42;
+    const e4 = f16MirrorCohortForConfig(config).?;
+    try std.testing.expectEqual(ops.DecoderRuntimeF16MirrorCohort.e4b_prefix26_gate_up, e4[0]);
+    try std.testing.expectEqual(@as(usize, 26), e4[1]);
+    config.num_hidden_layers = 41;
+    try std.testing.expect(f16MirrorCohortForConfig(config) == null);
+    config.num_hidden_layers = 42;
+    config.family = .llama;
+    try std.testing.expect(f16MirrorCohortForConfig(config) == null);
+}
+
+/// Maximum request-owned device scratch for two in-flight bounded PLE gathers:
+/// packed Q6_K rows, compact u32 ids, and F32 output for 512 rows.
+pub fn boundedPleQ6RequestScratchBytes(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+    enabled: bool,
+    disabled: bool,
+) !usize {
+    if (!enabled or disabled or backend != .metal or config.family != .gemma or !config.hasPle()) return 0;
+    const dim = std.math.mul(usize, config.ple_hidden_size, config.num_hidden_layers) catch
+        return error.ResourceLimitExceeded;
+    if (dim != 8960 and dim != 10752) return 0;
+    const rows: usize = 512;
+    const align_bytes: usize = 16 * 1024;
+    const blocks = dim / 256;
+    const packed_bytes = std.math.mul(usize, rows, std.math.mul(usize, blocks, 210) catch return error.ResourceLimitExceeded) catch
+        return error.ResourceLimitExceeded;
+    const ids = std.math.mul(usize, rows, @sizeOf(u32)) catch return error.ResourceLimitExceeded;
+    const output = std.math.mul(usize, std.math.mul(usize, rows, dim) catch return error.ResourceLimitExceeded, @sizeOf(f32)) catch
+        return error.ResourceLimitExceeded;
+    const one_frame = std.math.add(
+        usize,
+        std.mem.alignForward(usize, packed_bytes, align_bytes),
+        std.math.add(usize, std.mem.alignForward(usize, ids, align_bytes), std.mem.alignForward(usize, output, align_bytes)) catch return error.ResourceLimitExceeded,
+    ) catch return error.ResourceLimitExceeded;
+    return std.math.mul(usize, 2, one_frame) catch return error.ResourceLimitExceeded;
+}
+
+pub fn gemmaF16MirrorPrepareRequested(config: gpt_mod.Config, has_admission: bool) bool {
+    if (!has_admission or config.family != .gemma or config.usesMoe() or config.gemma4_mtp_assistant or !config.hasPle()) return false;
+    if (config.hidden_size == 1536 and config.num_hidden_layers == 35 and
+        config.intermediate_size == 6144 and config.num_attention_heads == 8 and
+        config.headDim() == 256 and config.global_head_dim == 512 and config.sliding_window == 512)
+    {
+        return platform.env.getenvBool("ANTFLY_GEMMA4_E2B_METAL_PREFILL_F16_MIRROR") and
+            !platform.env.getenvBool("ANTFLY_DISABLE_GEMMA4_E2B_METAL_PREFILL_F16_MIRROR");
+    }
+    if (config.hidden_size == 2560 and config.num_hidden_layers == 42 and
+        config.num_kv_shared_layers == 18 and config.intermediate_size == 10240 and
+        config.num_attention_heads == 8 and config.num_key_value_heads == 2 and
+        config.headDim() == 256 and config.global_head_dim == 512 and config.sliding_window == 512)
+    {
+        return platform.env.getenvBool("ANTFLY_GEMMA4_E4B_METAL_PREFILL_F16_GATE_UP_PREFIX26_MIRROR") and
+            !platform.env.getenvBool("ANTFLY_DISABLE_GEMMA4_E4B_METAL_PREFILL_F16_GATE_UP_PREFIX26_MIRROR");
+    }
+    return false;
+}
+
+pub const BoundedPleMirrorWeightPolicy = struct {
+    handoff_enabled: bool,
+    handoff_disabled: bool,
+    bounded_ple_enabled: bool,
+    bounded_ple_disabled: bool,
+    mirror_enabled: bool,
+    mirror_disabled: bool,
+    e2_down_enabled: bool = false,
+    e2_down_disabled: bool = false,
+};
+
+const BoundedPleMirrorWeightSizing = struct {
+    exact_mirror_bytes: usize,
+    prepaid_q6_ple_bytes: usize,
+    additional_backend_weight_bytes: usize,
+};
+
+fn e4Prefix26MirrorWeightSizing(config: gpt_mod.Config) !BoundedPleMirrorWeightSizing {
+    const mirror_weights = std.math.mul(
+        usize,
+        @as(usize, @intCast(config.hidden_size)),
+        std.math.mul(usize, @as(usize, @intCast(config.intermediate_size)), 2 * @sizeOf(u16) * 26) catch
+            return error.ResourceLimitExceeded,
+    ) catch return error.ResourceLimitExceeded;
+    const input_cast = std.math.mul(usize, 512, std.math.mul(usize, @as(usize, @intCast(config.hidden_size)), @sizeOf(u16)) catch
+        return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+    const exact_mirror_bytes = std.math.add(usize, mirror_weights, input_cast) catch
+        return error.ResourceLimitExceeded;
+    const prepaid_q6_ple_bytes = std.math.mul(
+        usize,
+        @as(usize, @intCast(config.vocab_size)),
+        std.math.mul(usize, @as(usize, @intCast(config.num_hidden_layers)), 210) catch return error.ResourceLimitExceeded,
+    ) catch return error.ResourceLimitExceeded;
+    return .{
+        .exact_mirror_bytes = exact_mirror_bytes,
+        .prepaid_q6_ple_bytes = prepaid_q6_ple_bytes,
+        .additional_backend_weight_bytes = exact_mirror_bytes -| prepaid_q6_ple_bytes,
+    };
+}
+
+fn hasUniformEffectiveIntermediateSize(config: gpt_mod.Config, expected: u32) bool {
+    if (config.shared_layer_intermediate_size != 0 and config.shared_layer_intermediate_size != expected) return false;
+    for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+        if (config.intermediateSize(layer) != expected) return false;
+    }
+    return true;
+}
+
+/// Request-owned F16 mirror weight bytes beyond the Q6 PLE artifact already
+/// prepaid by the resident model lease.
+pub fn boundedPleF16MirrorAdditionalBackendWeightBytes(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+    policy: BoundedPleMirrorWeightPolicy,
+) !usize {
+    if (backend != .metal or !policy.handoff_enabled or policy.handoff_disabled or
+        !policy.bounded_ple_enabled or policy.bounded_ple_disabled or
+        !policy.mirror_enabled or policy.mirror_disabled) return 0;
+
+    if (config.hidden_size == 1536 and config.num_hidden_layers == 35 and
+        config.vocab_size == 262144 and config.ple_hidden_size == 256 and
+        config.intermediate_size == 6144 and config.shared_layer_intermediate_size == 12288 and
+        config.num_kv_shared_layers == 20 and config.num_attention_heads == 8 and
+        config.num_key_value_heads == 1 and
+        config.headDim() == 256 and config.global_head_dim == 512 and config.sliding_window == 512)
+    {
+        return if (policy.e2_down_enabled and !policy.e2_down_disabled)
+            1_189_085_184
+        else
+            150_994_944;
+    }
+    if (config.hidden_size == 2560 and config.num_hidden_layers == 42 and
+        config.vocab_size == 262144 and config.ple_hidden_size == 256 and
+        config.num_kv_shared_layers == 18 and config.intermediate_size == 10240 and
+        hasUniformEffectiveIntermediateSize(config, 10240) and
+        config.num_attention_heads == 8 and config.num_key_value_heads == 2 and
+        config.headDim() == 256 and config.global_head_dim == 512 and config.sliding_window == 512)
+    {
+        return (try e4Prefix26MirrorWeightSizing(config)).additional_backend_weight_bytes;
+    }
+    return error.UnsupportedContextCombination;
+}
+
+pub fn boundedPleF16MirrorRequestWeightBytes(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+) !usize {
+    const cohort = f16MirrorCohortForConfig(config) orelse return 0;
+    const e2 = cohort[0] == .e2b_full35_gate_up_down;
+    return boundedPleF16MirrorAdditionalBackendWeightBytes(backend, config, .{
+        .handoff_enabled = platform.env.getenvBool("TERMITE_METAL_ENABLE_BOUNDED_PLE_PREFILL_DECODE_HANDOFF"),
+        .handoff_disabled = platform.env.getenvBool("TERMITE_METAL_DISABLE_BOUNDED_PLE_PREFILL_DECODE_HANDOFF"),
+        .bounded_ple_enabled = platform.env.getenvBool("TERMITE_METAL_ENABLE_BOUNDED_PLE_Q6_ROWS"),
+        .bounded_ple_disabled = platform.env.getenvBool("TERMITE_METAL_DISABLE_BOUNDED_PLE_Q6_ROWS"),
+        .mirror_enabled = if (e2)
+            platform.env.getenvBool("ANTFLY_GEMMA4_E2B_METAL_PREFILL_F16_MIRROR")
+        else
+            platform.env.getenvBool("ANTFLY_GEMMA4_E4B_METAL_PREFILL_F16_GATE_UP_PREFIX26_MIRROR"),
+        .mirror_disabled = if (e2)
+            platform.env.getenvBool("ANTFLY_DISABLE_GEMMA4_E2B_METAL_PREFILL_F16_MIRROR")
+        else
+            platform.env.getenvBool("ANTFLY_DISABLE_GEMMA4_E4B_METAL_PREFILL_F16_GATE_UP_PREFIX26_MIRROR"),
+        .e2_down_enabled = e2 and platform.env.getenvBool("ANTFLY_GEMMA4_E2B_METAL_PREFILL_F16_DOWN_MIRROR"),
+        .e2_down_disabled = platform.env.getenvBool("ANTFLY_DISABLE_GEMMA4_E2B_METAL_PREFILL_F16_DOWN_MIRROR"),
+    });
+}
+
+pub fn boundedPleF16MirrorPhaseRequested(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+) !bool {
+    return (try boundedPleF16MirrorRequestWeightBytes(backend, config)) != 0;
+}
+
+pub const E4TransientDownScratchPolicy = struct {
+    handoff_enabled: bool,
+    handoff_disabled: bool,
+    bounded_ple_enabled: bool,
+    bounded_ple_disabled: bool,
+    prefix26_mirror_enabled: bool,
+    prefix26_mirror_disabled: bool,
+    transient_down_enabled: bool,
+    transient_down_disabled: bool,
+};
+
+pub fn e4TransientDownAdditionalBackendScratchBytes(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+    policy: E4TransientDownScratchPolicy,
+) !usize {
+    if (backend != .metal or !policy.handoff_enabled or policy.handoff_disabled or
+        !policy.bounded_ple_enabled or policy.bounded_ple_disabled or
+        !policy.prefix26_mirror_enabled or policy.prefix26_mirror_disabled or
+        !policy.transient_down_enabled or policy.transient_down_disabled) return 0;
+    // Preserve the pre-existing transient-down admission contract exactly.
+    // The fused-half route uses the stronger immutable model authority, but
+    // must not silently tighten this already-qualified legacy feature.
+    if (config.family != .gemma or config.usesMoe() or config.gemma4_mtp_assistant or !config.hasPle() or
+        config.hidden_size != 2560 or config.num_hidden_layers != 42 or config.vocab_size != 262144 or
+        config.ple_hidden_size != 256 or config.num_kv_shared_layers != 18 or config.intermediate_size != 10240 or
+        !hasUniformEffectiveIntermediateSize(config, 10240) or config.num_attention_heads != 8 or
+        config.num_key_value_heads != 2 or config.headDim() != 256 or config.global_head_dim != 512 or
+        config.sliding_window != 512) return error.UnsupportedContextCombination;
+    const rhs_half = std.math.mul(usize, 2560, std.math.mul(usize, 10240, @sizeOf(u16)) catch
+        return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+    const lhs_half = std.math.mul(usize, 512, std.math.mul(usize, 10240, @sizeOf(u16)) catch
+        return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+    return std.math.add(usize, rhs_half, lhs_half) catch return error.ResourceLimitExceeded;
+}
+
+pub fn generationRequestAdditionalBackendScratchBytes(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+) !usize {
+    const bpl = try boundedPleQ6RequestScratchBytes(
+        backend,
+        config,
+        platform.env.getenvBool("TERMITE_METAL_ENABLE_BOUNDED_PLE_Q6_ROWS"),
+        platform.env.getenvBool("TERMITE_METAL_DISABLE_BOUNDED_PLE_Q6_ROWS"),
+    );
+    const transient = try generationRequestMetalE4TransientDownScratchBytes(backend, config);
+    return std.math.add(usize, bpl, transient) catch return error.ResourceLimitExceeded;
+}
+
+pub fn generationRequestMetalE4TransientDownScratchBytes(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+) !usize {
+    return e4TransientDownAdditionalBackendScratchBytes(backend, config, .{
+        .handoff_enabled = platform.env.getenvBool("TERMITE_METAL_ENABLE_BOUNDED_PLE_PREFILL_DECODE_HANDOFF"),
+        .handoff_disabled = platform.env.getenvBool("TERMITE_METAL_DISABLE_BOUNDED_PLE_PREFILL_DECODE_HANDOFF"),
+        .bounded_ple_enabled = platform.env.getenvBool("TERMITE_METAL_ENABLE_BOUNDED_PLE_Q6_ROWS"),
+        .bounded_ple_disabled = platform.env.getenvBool("TERMITE_METAL_DISABLE_BOUNDED_PLE_Q6_ROWS"),
+        .prefix26_mirror_enabled = platform.env.getenvBool("ANTFLY_GEMMA4_E4B_METAL_PREFILL_F16_GATE_UP_PREFIX26_MIRROR"),
+        .prefix26_mirror_disabled = platform.env.getenvBool("ANTFLY_DISABLE_GEMMA4_E4B_METAL_PREFILL_F16_GATE_UP_PREFIX26_MIRROR"),
+        .transient_down_enabled = platform.env.getenvBool("ANTFLY_GEMMA4_E4B_METAL_PREFILL_F16_TRANSIENT_DOWN"),
+        .transient_down_disabled = platform.env.getenvBool("ANTFLY_DISABLE_GEMMA4_E4B_METAL_PREFILL_F16_TRANSIENT_DOWN"),
+    });
+}
+
+test "E4 transient down scratch is exact phase scoped and disable wins" {
+    var cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_kv_shared_layers = 18,
+        .intermediate_size = 10240,
+        .shared_layer_intermediate_size = 0,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .vocab_size = 262144,
+        .ple_hidden_size = 256,
+        .position_encoding = .rope,
+    };
+    const enabled = E4TransientDownScratchPolicy{
+        .handoff_enabled = true,
+        .handoff_disabled = false,
+        .bounded_ple_enabled = true,
+        .bounded_ple_disabled = false,
+        .prefix26_mirror_enabled = true,
+        .prefix26_mirror_disabled = false,
+        .transient_down_enabled = true,
+        .transient_down_disabled = false,
+    };
+    try std.testing.expectEqual(@as(usize, 52_428_800 + 10_485_760), try e4TransientDownAdditionalBackendScratchBytes(.metal, cfg, enabled));
+    var policy = enabled;
+    policy.transient_down_enabled = false;
+    try std.testing.expectEqual(@as(usize, 0), try e4TransientDownAdditionalBackendScratchBytes(.metal, cfg, policy));
+    policy = enabled;
+    policy.transient_down_disabled = true;
+    try std.testing.expectEqual(@as(usize, 0), try e4TransientDownAdditionalBackendScratchBytes(.metal, cfg, policy));
+    policy = enabled;
+    policy.handoff_disabled = true;
+    try std.testing.expectEqual(@as(usize, 0), try e4TransientDownAdditionalBackendScratchBytes(.metal, cfg, policy));
+    try std.testing.expectEqual(@as(usize, 0), try e4TransientDownAdditionalBackendScratchBytes(.cuda, cfg, enabled));
+    cfg.shared_layer_intermediate_size = 10239;
+    try std.testing.expectError(error.UnsupportedContextCombination, e4TransientDownAdditionalBackendScratchBytes(.metal, cfg, enabled));
+}
+
+test "bounded PLE request scratch is scoped and charges two maximum frames" {
+    var cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 4,
+        .attention_head_dim = 256,
+        .vocab_size = 1,
+        .ple_hidden_size = 256,
+        .position_encoding = .rope,
+    };
+    try std.testing.expectEqual(@as(usize, 44_269_568), try boundedPleQ6RequestScratchBytes(.metal, cfg, true, false));
+    try std.testing.expectEqual(@as(usize, 0), try boundedPleQ6RequestScratchBytes(.metal, cfg, false, false));
+    try std.testing.expectEqual(@as(usize, 0), try boundedPleQ6RequestScratchBytes(.metal, cfg, true, true));
+    try std.testing.expectEqual(@as(usize, 0), try boundedPleQ6RequestScratchBytes(.cuda, cfg, true, false));
+    cfg.family = .llama;
+    try std.testing.expectEqual(@as(usize, 0), try boundedPleQ6RequestScratchBytes(.metal, cfg, true, false));
+    cfg.family = .gemma;
+    cfg.ple_hidden_size = 255;
+    try std.testing.expectEqual(@as(usize, 0), try boundedPleQ6RequestScratchBytes(.metal, cfg, true, false));
+    cfg.ple_hidden_size = 256;
+    cfg.hidden_size = 2560;
+    cfg.num_hidden_layers = 42;
+    try std.testing.expectEqual(@as(usize, 53_116_928), try boundedPleQ6RequestScratchBytes(.metal, cfg, true, false));
+}
+
+test "bounded PLE mirror backend weight is closed and disable wins" {
+    var cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .intermediate_size = 6144,
+        .shared_layer_intermediate_size = 12288,
+        .num_kv_shared_layers = 20,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .vocab_size = 262144,
+        .ple_hidden_size = 256,
+        .position_encoding = .rope,
+    };
+    const enabled = BoundedPleMirrorWeightPolicy{
+        .handoff_enabled = true,
+        .handoff_disabled = false,
+        .bounded_ple_enabled = true,
+        .bounded_ple_disabled = false,
+        .mirror_enabled = true,
+        .mirror_disabled = false,
+    };
+    try std.testing.expectEqual(@as(usize, 150_994_944), try boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, cfg, enabled));
+    var down = enabled;
+    down.e2_down_enabled = true;
+    try std.testing.expectEqual(@as(usize, 1_189_085_184), try boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, cfg, down));
+    down.e2_down_disabled = true;
+    try std.testing.expectEqual(@as(usize, 150_994_944), try boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, cfg, down));
+    var disabled = enabled;
+    disabled.handoff_disabled = true;
+    try std.testing.expectEqual(@as(usize, 0), try boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, cfg, disabled));
+    disabled = enabled;
+    disabled.bounded_ple_disabled = true;
+    try std.testing.expectEqual(@as(usize, 0), try boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, cfg, disabled));
+
+    var invalid = cfg;
+    invalid.vocab_size -= 1;
+    try std.testing.expectError(error.UnsupportedContextCombination, boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, invalid, enabled));
+    invalid = cfg;
+    invalid.ple_hidden_size += 1;
+    try std.testing.expectError(error.UnsupportedContextCombination, boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, invalid, enabled));
+    invalid = cfg;
+    invalid.num_kv_shared_layers -= 1;
+    try std.testing.expectError(error.UnsupportedContextCombination, boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, invalid, enabled));
+    invalid = cfg;
+    invalid.shared_layer_intermediate_size -= 1;
+    try std.testing.expectError(error.UnsupportedContextCombination, boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, invalid, enabled));
+    invalid = cfg;
+    invalid.num_key_value_heads += 1;
+    try std.testing.expectError(error.UnsupportedContextCombination, boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, invalid, enabled));
+
+    cfg.hidden_size = 2560;
+    cfg.num_hidden_layers = 42;
+    cfg.num_kv_shared_layers = 18;
+    cfg.intermediate_size = 10240;
+    cfg.shared_layer_intermediate_size = 0;
+    cfg.num_key_value_heads = 2;
+    cfg.ple_hidden_size = 256;
+    const e4_sizing = try e4Prefix26MirrorWeightSizing(cfg);
+    try std.testing.expectEqual(@as(usize, 2_728_919_040), e4_sizing.exact_mirror_bytes);
+    try std.testing.expectEqual(@as(usize, 2_312_110_080), e4_sizing.prepaid_q6_ple_bytes);
+    try std.testing.expectEqual(@as(usize, 416_808_960), e4_sizing.additional_backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 416_808_960), try boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, cfg, enabled));
+    cfg.shared_layer_intermediate_size = 10240;
+    try std.testing.expectEqual(@as(usize, 416_808_960), try boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, cfg, enabled));
+    cfg.shared_layer_intermediate_size = 10239;
+    try std.testing.expectError(error.UnsupportedContextCombination, boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, cfg, enabled));
+    cfg.shared_layer_intermediate_size = 10240;
+    cfg.num_kv_shared_layers = 17;
+    try std.testing.expectError(error.UnsupportedContextCombination, boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, cfg, enabled));
+    cfg.num_kv_shared_layers = 18;
+    cfg.num_hidden_layers = 41;
+    try std.testing.expectError(error.UnsupportedContextCombination, boundedPleF16MirrorAdditionalBackendWeightBytes(.metal, cfg, enabled));
+    try std.testing.expectEqual(@as(usize, 0), try boundedPleF16MirrorAdditionalBackendWeightBytes(.cuda, cfg, enabled));
+}
+
+test "E2B mirror backend cap uses combined residual and fails closed" {
+    const gib: u64 = 1024 * 1024 * 1024;
+    try mirror_test_std.testing.expectEqual(@as(?u64, 8 * gib), e2bF16MirrorBackendCap(0, 0, 0));
+    try mirror_test_std.testing.expectEqual(@as(?u64, 6 * gib), e2bF16MirrorBackendCap(6 * gib, 0, 0));
+    try mirror_test_std.testing.expectEqual(@as(?u64, 5 * gib), e2bF16MirrorBackendCap(0, 8 * gib, 3 * gib));
+    try mirror_test_std.testing.expectEqual(@as(?u64, 5 * gib), e2bF16MirrorBackendCap(7 * gib, 8 * gib, 3 * gib));
+    try mirror_test_std.testing.expectEqual(@as(?u64, 4 * gib), e2bF16MirrorBackendCap(4 * gib, 8 * gib, 3 * gib));
+    try mirror_test_std.testing.expectEqual(@as(?u64, 1), e2bF16MirrorBackendCap(0, 8 * gib, 8 * gib - 1));
+    try mirror_test_std.testing.expectEqual(@as(?u64, null), e2bF16MirrorBackendCap(0, 8 * gib, 8 * gib));
+    try mirror_test_std.testing.expectEqual(@as(?u64, null), e2bF16MirrorBackendCap(0, 8 * gib, 8 * gib + 1));
+    try mirror_test_std.testing.expectEqual(@as(?u64, null), e2bF16MirrorBackendCap(0, 1, 1));
+    try mirror_test_std.testing.expectEqual(@as(?u64, 1), e2bF16MirrorBackendCap(1, 0, 0));
+    try mirror_test_std.testing.expectEqual(@as(?u64, 8 * gib), e2bF16MirrorBackendCap(mirror_test_std.math.maxInt(u64), 0, 0));
+}
 
 pub const NativeGenerationPipeline = struct {
     /// Token publication is bounded; GPU steps reuse two frame/logit banks.
@@ -5137,8 +8451,8 @@ pub const NativeGenerationPipeline = struct {
     /// Qualification-only proof of the autoregressive KV boundary. A sampled
     /// token becomes logical/output state immediately, but its KV row is not
     /// materialized until the following forward consumes it.
-    metal_qualification_completion: if (builtin.is_test) ?MetalQualificationCompletion else void = if (builtin.is_test) null else {},
-    metal_qualification_binding_baseline: if (builtin.is_test) ?MetalQualificationBindingBaseline else void = if (builtin.is_test) null else {},
+    metal_qualification_completion: ?MetalQualificationCompletion = null,
+    metal_qualification_binding_baseline: ?MetalQualificationBindingBaseline = null,
     /// Borrowed invocation budget; portable video scratch is additional to the
     /// generation estimate and must also respect offline CLI memory limits.
     media_run_budget: ?*runtime.tier.memory.RunBudget = null,
@@ -5148,8 +8462,21 @@ pub const NativeGenerationPipeline = struct {
     explicit_scratch_limit: usize = 0,
     gpt_config: gpt_mod.Config,
     kv_dtype: ?runtime.kv.pool.KvDType = null,
+    e2b_f16_mirror_admission: ?ops.DecoderRuntimeE2bF16MirrorAdmission = null,
+    compiled_runtime_prepare_after_reset: bool = false,
+    compiled_runtime_prepare_token_hint: usize = 0,
+    bounded_ple_prefill_decode_handoff_required: bool = false,
+    qualification_matrix_compiled_source_authority: ?graph_mod.model_runtime.ExactPagedKvSourceAuthority = null,
+    /// Explicit development-only owner for compiled post-RoPE recent-query
+    /// capture. Null preserves every ordinary route. No serving profile or
+    /// candidate schema sets this field.
+    recent_prefill_query_capture: ?graph_mod.model_runtime.RecentPrefillQueryCaptureDescriptor = null,
     /// Content-bound identity of this loaded model generation.
     attention_match_identity: ?runtime.kv.attention_match_checkpoint.Identity = null,
+    /// Test-worker-only execution authority copied from the authenticated
+    /// staged candidate. Prepared-serving quality must not derive serving
+    /// flags from ambient diagnostic environment variables.
+    prepared_quality_execution: ?native_checkpoint_release.Execution = null,
     checkpoint_prepare: ?*NativeCheckpointPrepare = null,
     checkpoint_resume: ?*NativeCheckpointResume = null,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
@@ -5228,6 +8555,9 @@ pub const NativeGenerationPipeline = struct {
     /// the decode loop traces the forward pass once, caches the graph,
     /// and replays it through the interpreter on subsequent steps.
     graph_cache: ?*graph_mod.cache.GraphCache = null,
+    /// Dynamic request binding for a cached whole-model runtime. The runtime
+    /// must detach it before this request owner is released.
+    context_owner_binding: ?graph_mod.model_runtime.ContextOwnerBinding = null,
 
     /// Optional device mesh for multi-device inference. graphForward only
     /// dispatches through the multi-device executor when this is set and
@@ -5248,6 +8578,42 @@ pub const NativeGenerationPipeline = struct {
     pjrt_client: ?*anyopaque = null,
     pjrt_admission: ?*const @import("../graph/pjrt_admission.zig").Context = null,
     pjrt_plugin_path: ?[:0]const u8 = null,
+
+    const EagerQueryCompiledRouteSuspension = struct {
+        graph_cache: *?*graph_mod.cache.GraphCache,
+        compiled_backend: *?ops.BackendKind,
+        compiled_target: *graph_mod.compiled_backend.AttachmentTarget,
+        saved_graph_cache: ?*graph_mod.cache.GraphCache,
+        saved_compiled_backend: ?ops.BackendKind,
+        saved_compiled_target: graph_mod.compiled_backend.AttachmentTarget,
+
+        fn begin(
+            graph_cache: *?*graph_mod.cache.GraphCache,
+            compiled_backend: *?ops.BackendKind,
+            compiled_target: *graph_mod.compiled_backend.AttachmentTarget,
+            active: bool,
+        ) EagerQueryCompiledRouteSuspension {
+            const suspension: EagerQueryCompiledRouteSuspension = .{
+                .graph_cache = graph_cache,
+                .compiled_backend = compiled_backend,
+                .compiled_target = compiled_target,
+                .saved_graph_cache = graph_cache.*,
+                .saved_compiled_backend = compiled_backend.*,
+                .saved_compiled_target = compiled_target.*,
+            };
+            if (active) {
+                graph_cache.* = null;
+                compiled_backend.* = null;
+            }
+            return suspension;
+        }
+
+        fn deinit(self: *EagerQueryCompiledRouteSuspension) void {
+            self.graph_cache.* = self.saved_graph_cache;
+            self.compiled_backend.* = self.saved_compiled_backend;
+            self.compiled_target.* = self.saved_compiled_target;
+        }
+    };
 
     const AttentionMatchForwardFrame = struct {
         compute: *metal_compute.MetalCompute,
@@ -5302,6 +8668,28 @@ pub const NativeGenerationPipeline = struct {
         }
     };
 
+    /// A coalesced attention-match step must have exactly one frame owner.
+    /// The GPT forward path already finishes its owned frame before returning
+    /// host logits; an outer generation frame would turn that readback into an
+    /// unauthorized mid-transaction submit.
+    fn gptOwnsCoalescedAttentionMatchFrame(self: *NativeGenerationPipeline, batch: usize, dc: *const gpt_arch.DecodeContext) bool {
+        if (comptime !build_options.enable_metal) return false;
+        if (self.cb.kind() != .metal or batch != 1 or dc.query_sequence_len != 1 or dc.total_sequence_len == 0 or
+            self.gpt_config.family != .gemma or !self.gpt_config.hasPle() or !self.gpt_config.usesGemma4Channels()) return false;
+        if (dc.attention_mode != .paged_decode and dc.kv_sequence_len <= dc.query_sequence_len) return false;
+        const storage = dc.kv_storage orelse return false;
+        if (dc.kv_batch) |items| {
+            if (items.len != 1) return false;
+            const item = items[0];
+            const item_storage = item.kv_storage orelse item.kv_cache.kv_storage orelse return false;
+            if (item_storage != storage or
+                (item.per_item_query_len orelse dc.query_sequence_len) != 1 or
+                (item.per_item_total_len orelse dc.total_sequence_len) != dc.total_sequence_len) return false;
+        }
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        return compute.hasInstalledAttentionMatch(storage) and compute.attentionMatchExecution().coalesced_stage;
+    }
+
     const prefetch_drain_budget_per_step: usize = 4;
     const default_mtp_zero_match_fallback_rounds: usize = 16;
 
@@ -5353,6 +8741,77 @@ pub const NativeGenerationPipeline = struct {
         return scope;
     }
 
+    fn metalQualificationOwnerSnapshot(
+        state: *const NativeDecodeState,
+        phase: []const u8,
+        require_inner: bool,
+        tracker: *runtime.kv.host_allocation_tracker.HostAllocationTracker,
+    ) !runtime.kv.host_allocation_tracker.Snapshot {
+        const current = tracker.snapshot();
+        if (!std.mem.eql(u8, phase, "generation_committed")) return current;
+        if (state.last_context_owner_committed) |committed| {
+            if (!committed.available or committed.owner_identity == 0 or
+                committed.owner_identity != current.owner_identity or
+                !committed.physical_available or
+                !committed.tracked_combined_physical_available)
+                return error.ContextPhysicalAccountingUnavailable;
+            return committed;
+        }
+        if (require_inner) return error.ContextPhysicalAccountingUnavailable;
+        return current;
+    }
+
+    fn isFreshCompiledOwnerSnapshotBoundary(state: *const NativeDecodeState, phase: []const u8) bool {
+        return std.mem.eql(u8, phase, "prefill_started") and state.total_tokens == 0 and
+            state.context_session == null and state.last_context_owner_committed == null and
+            !state.last_context_session_released and !state.last_context_session_allocation_start.available and
+            !state.last_context_session_allocation_end.available;
+    }
+
+    /// Resolve the request-owned compiled participant before any outer Metal
+    /// queue is synchronized. Rejected or cancelled requests must not mutate a
+    /// cached runtime or GPU state. A fresh prefill may retire only an unbound
+    /// mutable session; GraphCache entries and their immutable executors remain.
+    fn prepareCompiledOwnerSnapshot(
+        binding: ?graph_mod.model_runtime.ContextOwnerBinding,
+        cache: ?*graph_mod.cache.GraphCache,
+        control: ?InferenceExecutionControl,
+        state: *const NativeDecodeState,
+        phase: []const u8,
+    ) !void {
+        if (control) |request_control| try request_control.check();
+        if (binding) |expected| {
+            try expected.validate();
+            const compiled_state = try expected.owner.compiledStorageState(expected.witness);
+            const compiled_runtime = if (cache) |available| available.getSessionCompiledModelRuntime(.metal, .whole_model) else null;
+            switch (compiled_state) {
+                .not_required => if (compiled_runtime != null) return error.ContextFrameOwnershipMismatch,
+                .required_unbound => {
+                    if (!isFreshCompiledOwnerSnapshotBoundary(state, phase))
+                        return error.ContextPhysicalAccountingUnavailable;
+                    if (compiled_runtime) |cached| {
+                        if (try cached.contextOwnerBindingState(expected) != .unbound)
+                            return error.ContextFrameOwnershipMismatch;
+                        const available = cache orelse unreachable;
+                        available.resetSessionCompiledModelRuntime();
+                        if (available.getSessionCompiledModelRuntime(.metal, .whole_model) != null)
+                            return error.CompiledModelRuntimeRetirementFailed;
+                    }
+                },
+                .bound_live => {
+                    const live = compiled_runtime orelse return error.MissingCompiledModelRuntime;
+                    if (try live.contextOwnerBindingState(expected) != .exact)
+                        return error.ContextFrameOwnershipMismatch;
+                    try live.drainContextOwnerSnapshot(expected);
+                },
+                .detached => if (compiled_runtime != null) return error.ContextFrameOwnershipMismatch,
+            }
+        } else if (cache) |available| {
+            if (available.getSessionCompiledModelRuntime(.metal, .whole_model) != null)
+                return error.ContextPhysicalAccountingUnavailable;
+        }
+    }
+
     /// Stable, owner-scoped machine evidence for the private Metal checkpoint
     /// qualification server. Process RSS and global device deltas are
     /// deliberately excluded: every byte below belongs to the request ledger.
@@ -5363,7 +8822,7 @@ pub const NativeGenerationPipeline = struct {
         phase: []const u8,
         timings: ?*const NativeCheckpointResume,
     ) !void {
-        if (comptime !builtin.is_test or !build_options.enable_metal) return;
+        if (comptime !build_options.enable_metal) return;
         if (!config.metal_native_checkpoint_qualification or
             config.metal_checkpoint_qualification_route == .none or
             config.metal_checkpoint_qualification_request == 0 or self.cb.kind() != .metal)
@@ -5371,9 +8830,15 @@ pub const NativeGenerationPipeline = struct {
         const storage = state.kv_storage orelse return error.ContextPhysicalAccountingUnavailable;
         const tracker = storage.ownerAllocationTracker() orelse return error.ContextPhysicalAccountingUnavailable;
         const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        try prepareCompiledOwnerSnapshot(self.context_owner_binding, self.graph_cache, self.execution_control, state, phase);
         try compute.synchronizeAttentionMatchKv();
         try storage.drainDeviceWritesForOwnerSnapshot();
-        const snapshot = tracker.snapshot();
+        const snapshot = try metalQualificationOwnerSnapshot(
+            state,
+            phase,
+            config.context_storage == .packed_exact or config.context_request != null,
+            tracker,
+        );
         const revision = try compute.attentionMatchRevision(storage);
         const activity = if (state.sequence_id) |sequence|
             try compute.installedAttentionMatchActivity(storage, sequence)
@@ -5400,20 +8865,64 @@ pub const NativeGenerationPipeline = struct {
                 .donor_appends = installed.donor_appends,
             };
         }
-        var line_storage: [8192]u8 = undefined;
+        const CheckpointIdentityHex = struct { weights: [64]u8, tokenizer: [64]u8, template: [64]u8, layout: [64]u8 };
+        var line_storage: [8704]u8 = undefined;
         var line_writer = std.Io.Writer.fixed(&line_storage);
         try std.json.Stringify.value(.{
             .schema = "antfly.metal-checkpoint-phase.v1",
             .phase = phase,
             .request = config.metal_checkpoint_qualification_request,
             .route = @tagName(config.metal_checkpoint_qualification_route),
+            .qualification_arm = if (config.native_checkpoint_operator_grant) |grant| @tagName(grant.arm) else "none",
+            .context_split_decode_requested = config.context_split_decode,
+            .context_flash_prefill_requested = config.context_flash_prefill,
+            .context_optimization_dispatches_available = state.last_context_optimization_dispatches_available,
+            .context_split_decode_dispatches = if (state.last_context_optimization_dispatches_available) state.last_context_split_decode_dispatches else null,
+            .context_flash_prefill_dispatches = if (state.last_context_optimization_dispatches_available) state.last_context_flash_prefill_dispatches else null,
+            .packed_split_decode_requested = config.context_storage == .packed_exact and config.context_split_decode,
+            .packed_flash_prefill_requested = config.context_storage == .packed_exact and config.context_flash_prefill,
+            .packed_split_decode_dispatches = state.last_context_split_decode_dispatches,
+            .packed_flash_prefill_dispatches = state.last_context_flash_prefill_dispatches,
+            .packed_singleton_seal_requested = state.last_context_packed_singleton_seal.requested,
+            .packed_singleton_seal_executed = state.last_context_packed_singleton_seal.executed,
+            .packed_singleton_seal_reduced = state.last_context_packed_singleton_seal.reduced,
+            .packed_singleton_capacity_rows_before = state.last_context_packed_singleton_seal.capacity_rows_before,
+            .packed_singleton_capacity_rows_after = state.last_context_packed_singleton_seal.capacity_rows_after,
+            .packed_singleton_physical_kv_bytes_before = state.last_context_packed_singleton_seal.physical_kv_bytes_before,
+            .packed_singleton_physical_kv_bytes_after = state.last_context_packed_singleton_seal.physical_kv_bytes_after,
+            .prompt_tokens_sha256 = if (config.native_checkpoint_operator_grant) |grant| std.fmt.bytesToHex(grant.prompt_tokens_sha256, .lower) else @as([64]u8, @splat('0')),
+            .prompt_tokens = if (config.native_checkpoint_operator_grant) |grant| grant.prompt_tokens else 0,
+            .restored_prefix_tokens = if (config.native_checkpoint_operator_grant) |grant| grant.restored_prefix_tokens else 0,
+            .appended_prompt_tokens = if (config.native_checkpoint_operator_grant) |grant| grant.appended_prompt_tokens else 0,
+            .reserved_output_tokens = if (config.native_checkpoint_operator_grant) |grant| grant.reserved_output_tokens else 0,
+            .binary_sha256 = if (config.native_checkpoint_operator_grant) |grant| std.fmt.bytesToHex(grant.binary_sha256, .lower) else @as([64]u8, @splat('0')),
+            .implementation_semantic_sha256 = if (config.native_checkpoint_operator_grant) |grant| std.fmt.bytesToHex(grant.implementation_semantic_sha256, .lower) else @as([64]u8, @splat('0')),
+            .profile_sha256 = if (config.native_checkpoint_operator_grant) |grant| if (grant.isPrivateProfile()) std.fmt.bytesToHex(grant.profile_sha256, .lower) else @as([64]u8, @splat('0')) else @as([64]u8, @splat('0')),
+            .profile_semantic_sha256 = if (config.native_checkpoint_operator_grant) |grant| if (grant.isPrivateProfile()) std.fmt.bytesToHex(grant.profile_semantic_sha256, .lower) else @as([64]u8, @splat('0')) else @as([64]u8, @splat('0')),
+            .authority_kind = if (config.native_checkpoint_operator_grant) |grant| @tagName(grant.authority_kind) else "none",
+            .baseline_authority_sha256 = if (config.native_checkpoint_operator_grant) |grant| std.fmt.bytesToHex(grant.baseline_authority_sha256, .lower) else @as([64]u8, @splat('0')),
+            .execution_sha256 = if (config.native_checkpoint_operator_grant) |grant| std.fmt.bytesToHex(grant.execution.fingerprint(), .lower) else @as([64]u8, @splat('0')),
+            .checkpoint_identity = if (config.native_checkpoint_operator_grant) |grant| CheckpointIdentityHex{
+                .weights = std.fmt.bytesToHex(grant.checkpoint_identity.weights, .lower),
+                .tokenizer = std.fmt.bytesToHex(grant.checkpoint_identity.tokenizer, .lower),
+                .template = std.fmt.bytesToHex(grant.checkpoint_identity.template, .lower),
+                .layout = std.fmt.bytesToHex(grant.checkpoint_identity.layout, .lower),
+            } else CheckpointIdentityHex{ .weights = @as([64]u8, @splat('0')), .tokenizer = @as([64]u8, @splat('0')), .template = @as([64]u8, @splat('0')), .layout = @as([64]u8, @splat('0')) },
+            .policy_sha256 = if (config.native_checkpoint_operator_grant) |grant| std.fmt.bytesToHex(grant.policy.digest(), .lower) else @as([64]u8, @splat('0')),
+            .policy_admission = if (config.native_checkpoint_operator_grant) |grant| @tagName(grant.policy.admission) else "none",
+            .policy_chunk_rows = if (config.native_checkpoint_operator_grant) |grant| grant.policy.chunk_rows else 0,
+            .policy_reject_exact_active_fixed_point = if (config.native_checkpoint_operator_grant) |grant| grant.policy.reject_exact_active_fixed_point else false,
+            .execution = if (config.native_checkpoint_operator_grant) |grant| grant.execution else native_checkpoint_release.Execution{},
             .owner_id = snapshot.owner_identity,
             .logical_tokens = state.total_tokens,
             .kv_materialized_tokens = kv_evidence.materialized_tokens,
             .pending_sampled_tokens = kv_evidence.pending_sampled_tokens,
             .kv_boundary_proven = true,
+            .compiled_partition = self.compiled_partition_backend != null,
+            .compiled_attachment_target = @tagName(self.compiled_attachment_target),
             .binding_attention_calls_per_materialized_token = kv_evidence.attention_calls_per_materialized_token,
             .binding_donor_appends_per_materialized_token = kv_evidence.donor_appends_per_materialized_token,
+            .exact_local_window_capacity = if (activity) |installed| installed.exact_local_window_capacity else false,
             .revision = revision,
             .owner_available = snapshot.available,
             .physical_available = snapshot.physical_available,
@@ -5448,6 +8957,274 @@ pub const NativeGenerationPipeline = struct {
         std.debug.print("metal_checkpoint_qualification {s}\n", .{line_writer.buffered()});
     }
 
+    fn checkpointArtifactDigest(
+        self: *NativeGenerationPipeline,
+        state: runtime.kv.attention_match_checkpoint.State,
+        encoding: runtime.kv.attention_match_checkpoint.Encoding,
+    ) ![32]u8 {
+        const Sink = struct {
+            pub fn writeAll(_: *@This(), _: []const u8) !void {}
+        };
+        var sink: Sink = .{};
+        const exported = try runtime.kv.attention_match_checkpoint.exportEncoded(
+            state,
+            runtime.kv.attention_match_checkpoint.serving_limits,
+            encoding,
+            &sink,
+            .{ .context = self, .check_fn = checkAttentionMatchQueryWork },
+        );
+        return exported.file_sha256;
+    }
+
+    fn logNativeCheckpointRequestPrivatePublish(
+        self: *NativeGenerationPipeline,
+        source: *const NativeDecodeState,
+        config: GenerationConfig,
+        request: *NativeCheckpointPrepare,
+    ) !void {
+        if (comptime !build_options.enable_metal) return;
+        const grant = config.native_checkpoint_operator_grant orelse return;
+        if (!config.metal_native_checkpoint_qualification or
+            config.metal_checkpoint_qualification_route == .none or
+            config.metal_checkpoint_qualification_request == 0 or self.cb.kind() != .metal or
+            grant.fit_strategy != .identity_chunk_coefficients_adaptive_v18)
+            return;
+        const result = if (request.result) |*value| value else return error.InvalidNativeCheckpointResult;
+        if (!try stagedPublishDisposition(result.outcome == .compacted, result.validation_complete, result.request_private_publish_complete)) return;
+        const artifact_sha256 = try result.payload.artifactDigest(request.encoding, .{ .context = self, .check_fn = checkAttentionMatchQueryWork });
+        const storage = source.kv_storage orelse return error.ContextPhysicalAccountingUnavailable;
+        const tracker = storage.ownerAllocationTracker() orelse return error.ContextPhysicalAccountingUnavailable;
+        const owner = tracker.snapshot();
+        if (!owner.available or !owner.physical_available or !owner.tracked_combined_physical_available or owner.owner_identity == 0)
+            return error.ContextPhysicalAccountingUnavailable;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const observed = try compute.provider_impl.nativeCheckpointObserved();
+        try observed.destination.validate();
+        if (std.mem.allEqual(u8, &observed.backend_environment_sha256, 0))
+            return error.UnqualifiedCompactionArtifact;
+        var line_storage: [8192]u8 = undefined;
+        var line_writer = std.Io.Writer.fixed(&line_storage);
+        try std.json.Stringify.value(.{
+            .schema = "antfly.metal-checkpoint-staged-publication.v1",
+            .phase = "request_private_publish",
+            .request = config.metal_checkpoint_qualification_request,
+            .qualification_arm = @tagName(grant.arm),
+            .fit_strategy = @tagName(grant.fit_strategy),
+            .training_policy = @tagName(grant.training_policy),
+            .training_policy_sha256 = std.fmt.bytesToHex(nativeCheckpointTrainingPolicyDigest(grant.training_policy, grant.resident_hybrid_authority), .lower),
+            .compiled_prefill_handoff = request.compiled_prefill_exact_kv_receipt != null,
+            .compiled_prefill_device_allocation_bound_bytes = if (request.compiled_prefill_exact_kv_receipt) |receipt| receipt.device_allocation_bound_bytes else 0,
+            .compiled_prefill_copied_bytes = if (request.compiled_prefill_exact_kv_receipt) |receipt| receipt.copied_bytes else 0,
+            .compiled_prefill_peak_host_staging_bytes = if (request.compiled_prefill_exact_kv_receipt) |receipt| receipt.peak_host_staging_bytes else 0,
+            .compiled_prefill_source_slots_released = if (request.compiled_prefill_exact_kv_receipt) |receipt| receipt.source_slots_released else 0,
+            .compiled_prefill_source_live_bytes_before = if (request.compiled_prefill_exact_kv_receipt) |receipt| receipt.source_live_bytes_before else 0,
+            .compiled_prefill_source_live_bytes_after = if (request.compiled_prefill_exact_kv_receipt) |receipt| receipt.source_live_bytes_after else 0,
+            .compiled_prefill_source_physically_released_bytes = if (request.compiled_prefill_exact_kv_receipt) |receipt| receipt.source_physically_released_bytes else 0,
+            .compiled_prefill_preparation_wall_ns = request.compiled_prefill_preparation_wall_ns,
+            .serving_training_binding_sha256 = std.fmt.bytesToHex(nativeCheckpointServingTrainingBindingDigest(), .lower),
+            .query_batch_rows = result.v18_query_batch_rows,
+            .cache_policy = "flat_exact_tier_a_mandatory",
+            .ordered_phases = [_][]const u8{ "query", "fit", "validate", "request_private_publish" },
+            .completed_before_first_visible_token = true,
+            .consumer_installation_complete = false,
+            .owner_id = owner.owner_identity,
+            .source_owner_id = owner.owner_identity,
+            .source_owner_physical_available = true,
+            .source_owner_logical_live_bytes = owner.logical_live_bytes,
+            .source_owner_physical_live_bytes = owner.physical_live_bytes,
+            .source_owner_shared_backing_live_bytes = owner.shared_backing_live_bytes,
+            .source_owner_private_device_live_bytes = owner.private_device_live_bytes,
+            .source_owner_tracked_combined_live_bytes = owner.tracked_combined_live_bytes,
+            .source_owner_tracked_combined_peak_bytes = owner.tracked_combined_peak_bytes,
+            .source_global_bytes = result.stats.source_global_bytes,
+            .candidate_global_bytes = result.stats.candidate_global_bytes,
+            .actual_global_savings_ratio = result.stats.actual_global_savings_ratio,
+            .minimum_global_savings_ratio = request.minimum_savings_ratio,
+            .actual_global_savings_gate_passed = result.stats.source_global_bytes > 0 and result.stats.candidate_global_bytes > 0 and result.stats.actual_global_savings_ratio >= request.minimum_savings_ratio,
+            .prompt_tokens_sha256 = std.fmt.bytesToHex(grant.prompt_tokens_sha256, .lower),
+            .prompt_tokens = grant.prompt_tokens,
+            .binary_sha256 = std.fmt.bytesToHex(grant.binary_sha256, .lower),
+            .implementation_semantic_sha256 = std.fmt.bytesToHex(grant.implementation_semantic_sha256, .lower),
+            .profile_sha256 = std.fmt.bytesToHex(grant.profile_sha256, .lower),
+            .profile_semantic_sha256 = std.fmt.bytesToHex(grant.profile_semantic_sha256, .lower),
+            .policy_sha256 = std.fmt.bytesToHex(grant.policy.digest(), .lower),
+            .artifact_sha256 = std.fmt.bytesToHex(artifact_sha256, .lower),
+            .checkpoint_identity = .{
+                .weights = std.fmt.bytesToHex(grant.checkpoint_identity.weights, .lower),
+                .tokenizer = std.fmt.bytesToHex(grant.checkpoint_identity.tokenizer, .lower),
+                .template = std.fmt.bytesToHex(grant.checkpoint_identity.template, .lower),
+                .layout = std.fmt.bytesToHex(grant.checkpoint_identity.layout, .lower),
+            },
+            .device_registry_id = observed.destination.device_registry_id,
+            .device_name_sha256 = std.fmt.bytesToHex(observed.destination.device_name_sha256, .lower),
+            .compiler_identity_sha256 = std.fmt.bytesToHex(observed.destination.compiler_identity_sha256, .lower),
+            .backend_environment_sha256 = std.fmt.bytesToHex(observed.backend_environment_sha256, .lower),
+            .query_ns = result.query_ns,
+            .fit_ns = result.fit_ns,
+            .fp8_heads = result.stats.fp8_heads,
+            .fp8_eligible_rows = result.stats.fp8_eligible_rows,
+            .fp8_encoded_rows = result.stats.fp8_encoded_rows,
+            .rotated4_heads = result.stats.rotated4_heads,
+            .rotated4_eligible_rows = result.stats.rotated4_eligible_rows,
+            .rotated4_compressed_rows = result.stats.rotated4_compressed_rows,
+            .fp64_validation_summary_calls = result.stats.fp64_validation_summary_calls,
+            .fp64_validation_dgemm_calls = result.stats.fp64_validation_dgemm_calls,
+            .incremental_gram_chooser_calls = result.stats.incremental_gram_chooser_calls,
+            .training_reduction_local_original_calls = result.stats.training_reduction_local_original_calls,
+            .training_reduction_rounded_harm_calls = result.stats.training_reduction_rounded_harm_calls,
+            .training_reduction_tiles = result.stats.training_reduction_tiles,
+            .training_reduction_backend_calls = result.stats.training_reduction_backend_calls,
+            .training_reduction_workspace_peak_bytes = result.stats.training_reduction_workspace_peak_bytes,
+            .v18_cache_ready_heads = result.v18_cache_ready_heads,
+            .v18_planned_exact_heads = result.v18_planned_exact_heads,
+            .v18_fallback_heads = result.v18_fallback_heads,
+            .v18_eligible_heads = result.v18_eligible_heads,
+            .v18_attempted_heads = result.v18_attempted_heads,
+            .v18_accepted_heads = result.v18_accepted_heads,
+            .v18_preserved_heads = result.v18_preserved_heads,
+            .v18_planned_head_workspace_bytes = result.v18_planned_head_workspace_bytes,
+            .v18_cache_phase_peak_bound_bytes = result.v18_cache_phase_peak_bound_bytes,
+            .v18_primary_budget_percent = result.v18_primary_budget_percent,
+            .v18_budget_fallback_heads = result.v18_budget_fallback_heads,
+            .v18_evidence_profile = @tagName(result.v18_evidence_profile),
+            .v18_evidence_profile_sha256 = std.fmt.bytesToHex(result.v18_evidence_profile_sha256, .lower),
+            .v18_codec_physical_profile = @tagName(result.v18_codec_physical_profile),
+            .v18_codec_physical_profile_sha256 = std.fmt.bytesToHex(result.v18_codec_physical_profile_sha256, .lower),
+            .v18_bounded_tsqr_policy_sha256 = std.fmt.bytesToHex(result.v18_bounded_tsqr_policy_sha256, .lower),
+            .v18_bounded_tsqr_heads = result.v18_bounded_tsqr_heads,
+            .v18_bounded_tsqr_calls = result.v18_bounded_tsqr_calls,
+            .v18_bounded_tsqr_workspace_peak_bytes = result.v18_bounded_tsqr_workspace_peak_bytes,
+            .v18_bounded_tsqr_cancellation_checks = result.v18_bounded_tsqr_cancellation_checks,
+            .private_dense512_query_rows = result.private_dense512_query_rows,
+            .private_query_live_bytes = result.private_query_live_bytes,
+            .planned_private_query_bytes = result.planned_private_query_bytes,
+            .primary_query_collection = result.primary_query_collection,
+            .dense512_query_collection = result.dense512_query_collection,
+            .query_collection_combined_before_fit_ns = result.query_collection_combined_before_fit_ns,
+            .future_training_authority = result.future_training_authority,
+            .v18_exact_f32_probability_heads = result.v18_exact_f32_probability_heads,
+            .v18_gram_heads = result.v18_gram_heads,
+            .v18_scored_reuse_heads = result.v18_scored_reuse_heads,
+            .v18_gram_backend_calls = result.v18_gram_backend_calls,
+            .v18_bounded_heads = result.v18_bounded_heads,
+            .v18_bounded_provider_calls = result.v18_bounded_provider_calls,
+            .v18_bounded_provider_rows = result.v18_bounded_provider_rows,
+            .v18_bounded_workspace_bound_bytes = result.v18_bounded_workspace_bound_bytes,
+            .v18_bounded_scoring_cache_prepares = result.v18_bounded_scoring_cache_prepares,
+            .v18_bounded_scoring_selection_hits = result.v18_bounded_scoring_selection_hits,
+            .v18_bounded_scoring_fit_hits = result.v18_bounded_scoring_fit_hits,
+            .v18_bounded_range_cache_prepares = result.v18_bounded_range_cache_prepares,
+            .v18_bounded_geometry_cache_requests = result.v18_bounded_geometry_cache_requests,
+            .v18_bounded_geometry_cache_hits = result.v18_bounded_geometry_cache_hits,
+            .v18_bounded_geometry_cache_loads = result.v18_bounded_geometry_cache_loads,
+            .v18_bounded_delta_heads = result.v18_bounded_delta_heads,
+            .v18_bounded_delta_tiles = result.v18_bounded_delta_tiles,
+            .v18_bounded_delta_backend_calls = result.v18_bounded_delta_backend_calls,
+            .v18_bounded_delta_packed_bytes_peak = result.v18_bounded_delta_packed_bytes_peak,
+            .v18_bounded_delta_staged_bytes_peak = result.v18_bounded_delta_staged_bytes_peak,
+            .v18_bounded_delta_fallbacks = result.v18_bounded_delta_fallbacks,
+            .v18_geometry_route_policy = @import("../runtime/kv/attention_match_joint_adaptive_quality.zig").boundedGeometryPolicyFor(result.v18_bounded_delta_heads > 0),
+            .v18_geometry_route_policy_sha256 = std.fmt.bytesToHex(@import("../runtime/kv/attention_match_joint_adaptive_quality.zig").boundedGeometryPolicyDigestFor(result.v18_bounded_delta_heads > 0), .lower),
+            .v18_numerical_policy = @tagName(result.v18_numerical_policy),
+            .v18_cache_prepare_ns = result.v18_cache_prepare_ns,
+            .v18_selection_freeze_ns = result.v18_selection_freeze_ns,
+            .v18_joint_value_fit_ns = result.v18_joint_value_fit_ns,
+            .v18_gram_construction_ns = result.v18_gram_construction_ns,
+            .v18_chooser_ns = result.v18_chooser_ns,
+            .v18_final_heldout_ns = result.v18_final_heldout_ns,
+        }, .{}, &line_writer);
+        std.debug.print("metal_checkpoint_qualification {s}\n", .{line_writer.buffered()});
+    }
+
+    /// Consumer-side closure emitted only after restore has installed and
+    /// validated the uploaded checkpoint in the request owner. Generation has
+    /// not returned a visible token at this boundary.
+    fn logNativeCheckpointConsumerInstall(
+        self: *NativeGenerationPipeline,
+        state: *const NativeDecodeState,
+        config: GenerationConfig,
+        request: *const NativeCheckpointResume,
+    ) !void {
+        if (comptime !build_options.enable_metal) return;
+        const grant = config.native_checkpoint_operator_grant orelse return;
+        if (grant.fit_strategy != .identity_chunk_coefficients_adaptive_v18) return;
+        if (!config.metal_native_checkpoint_qualification or
+            config.metal_checkpoint_qualification_route == .none or
+            config.metal_checkpoint_qualification_request == 0 or self.cb.kind() != .metal or
+            std.mem.allEqual(u8, &request.artifact_sha256, 0) or request.install_ns == 0)
+            return error.UnqualifiedCompactionArtifact;
+        const storage = state.kv_storage orelse return error.ContextPhysicalAccountingUnavailable;
+        const tracker = storage.ownerAllocationTracker() orelse return error.ContextPhysicalAccountingUnavailable;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        try compute.synchronizeAttentionMatchKv();
+        try storage.drainDeviceWritesForOwnerSnapshot();
+        const owner = tracker.snapshot();
+        const sequence = state.sequence_id orelse return error.InvalidKvCheckpoint;
+        const activity = (try compute.installedAttentionMatchActivity(storage, sequence)) orelse return error.InvalidKvCheckpoint;
+        const revision = try compute.attentionMatchRevision(storage);
+        const observed = try compute.provider_impl.nativeCheckpointObserved();
+        try observed.destination.validate();
+        if (!owner.available or !owner.physical_available or !owner.tracked_combined_physical_available or owner.owner_identity == 0 or
+            activity.invalid or activity.logical_tokens != state.total_tokens or revision == 0 or
+            !activity.global_physical_available or activity.global_allocated_bytes == 0 or
+            std.mem.allEqual(u8, &observed.backend_environment_sha256, 0))
+            return error.UnqualifiedCompactionArtifact;
+        var line_storage: [8192]u8 = undefined;
+        var line_writer = std.Io.Writer.fixed(&line_storage);
+        try std.json.Stringify.value(.{
+            .schema = "antfly.metal-checkpoint-staged-installation.v1",
+            .phase = "consumer_install_complete",
+            .request = config.metal_checkpoint_qualification_request,
+            .qualification_arm = @tagName(grant.arm),
+            .fit_strategy = @tagName(grant.fit_strategy),
+            .training_policy = @tagName(grant.training_policy),
+            .training_policy_sha256 = std.fmt.bytesToHex(nativeCheckpointTrainingPolicyDigest(grant.training_policy, grant.resident_hybrid_authority), .lower),
+            .serving_training_binding_sha256 = std.fmt.bytesToHex(nativeCheckpointServingTrainingBindingDigest(), .lower),
+            .completed_before_first_visible_token = true,
+            .producer_publication_required = true,
+            .artifact_sha256 = std.fmt.bytesToHex(request.artifact_sha256, .lower),
+            .owner_id = owner.owner_identity,
+            .revision = revision,
+            .logical_tokens = state.total_tokens,
+            .binding_representation = activity.representation(),
+            .binding_allocated_bytes = activity.allocated_bytes,
+            .binding_global_allocated_bytes = activity.global_allocated_bytes,
+            .binding_global_physical_available = activity.global_physical_available,
+            .binding_fp8_heads = activity.fp8_heads,
+            .binding_fp8_rows = activity.fp8_rows,
+            .binding_rotated4_heads = activity.rotated4_heads,
+            .binding_rotated4_rows = activity.rotated4_rows,
+            .prompt_tokens_sha256 = std.fmt.bytesToHex(grant.prompt_tokens_sha256, .lower),
+            .prompt_tokens = grant.prompt_tokens,
+            .binary_sha256 = std.fmt.bytesToHex(grant.binary_sha256, .lower),
+            .implementation_semantic_sha256 = std.fmt.bytesToHex(grant.implementation_semantic_sha256, .lower),
+            .profile_sha256 = std.fmt.bytesToHex(grant.profile_sha256, .lower),
+            .profile_semantic_sha256 = std.fmt.bytesToHex(grant.profile_semantic_sha256, .lower),
+            .policy_sha256 = std.fmt.bytesToHex(grant.policy.digest(), .lower),
+            .checkpoint_identity = .{
+                .weights = std.fmt.bytesToHex(grant.checkpoint_identity.weights, .lower),
+                .tokenizer = std.fmt.bytesToHex(grant.checkpoint_identity.tokenizer, .lower),
+                .template = std.fmt.bytesToHex(grant.checkpoint_identity.template, .lower),
+                .layout = std.fmt.bytesToHex(grant.checkpoint_identity.layout, .lower),
+            },
+            .device_registry_id = observed.destination.device_registry_id,
+            .device_name_sha256 = std.fmt.bytesToHex(observed.destination.device_name_sha256, .lower),
+            .compiler_identity_sha256 = std.fmt.bytesToHex(observed.destination.compiler_identity_sha256, .lower),
+            .backend_environment_sha256 = std.fmt.bytesToHex(observed.backend_environment_sha256, .lower),
+            .validation_ns = request.validation_ns,
+            .upload_ns = request.upload_ns,
+            .install_ns = request.install_ns,
+            .suffix_prefill_ns = request.suffix_prefill_ns,
+            .owner_logical_live_bytes = owner.logical_live_bytes,
+            .owner_physical_live_bytes = owner.physical_live_bytes,
+            .owner_shared_backing_live_bytes = owner.shared_backing_live_bytes,
+            .owner_private_device_live_bytes = owner.private_device_live_bytes,
+            .owner_tracked_combined_live_bytes = owner.tracked_combined_live_bytes,
+            .owner_tracked_combined_peak_bytes = owner.tracked_combined_peak_bytes,
+        }, .{}, &line_writer);
+        std.debug.print("metal_checkpoint_qualification {s}\n", .{line_writer.buffered()});
+    }
+
     pub const AttentionMatchQueryOptions = struct {
         prefix_mode: enum { clone, replay } = .clone,
         /// Exact and split repeat kernels are CUDA-only. Metal captures queries
@@ -5462,16 +9239,28 @@ pub const NativeGenerationPipeline = struct {
         max_repeat_tokens: ?usize = null,
         /// Select prefix-wide study passages within the same repeat budget.
         representative_repeat: bool = false,
+        /// Diagnostic-only second set of historical study passages. Zero keeps
+        /// the production calibration sequence unchanged.
+        study_pass: u8 = 0,
+        explicit_repeat_tokens: ?[]const i64 = null,
+        explicit_repeat_sha256: ?[32]u8 = null,
+        /// DEV-only exact offsets into `explicit_repeat_tokens`. Null preserves
+        /// the ordinary collector sampler.
+        explicit_sample_offsets: ?[]const u32 = null,
         max_source_tokens: usize = native_kv_checkpoint.max_context_tokens,
         /// Additional shadow KV capacity, including growth copies. Activations
         /// still use the backend's observed request allocation budget.
         max_shadow_kv_bytes: usize = 4 * 1024 * 1024 * 1024,
+        /// Authenticated private-prepare allocation observation. Zero preserves
+        /// all ordinary/query-diagnostic behavior and emits no component rows.
+        owner_component_diagnostic_request: u64 = 0,
     };
 
     pub const AttentionMatchQueryStats = struct {
         ragged_repeat_calls: usize = 0,
         prefix_ns: u64 = 0,
         repeat_ns: u64 = 0,
+        forward_calls: usize = 0,
         repeat_kernel_launches: usize = 0,
         split_kernel_launches: usize = 0,
         scratch_bytes: usize = 0,
@@ -5480,13 +9269,120 @@ pub const NativeGenerationPipeline = struct {
         cloned_bytes: usize = 0,
         shadow_allocation_bound_bytes: usize = 0,
         shadow_owner_id: u64 = 0,
+        shadow_scope_generation: u64 = 0,
         shadow_owner_peak_bytes: u64 = 0,
         shadow_scope_released: bool = false,
         shadow_scope_delta_bytes: ?u64 = null,
         shadow_uses_source_owner: bool = false,
         shadow_scope_before_bytes: u64 = 0,
         shadow_scope_after_bytes: u64 = 0,
+        shadow_scope_before_logical_bytes: u64 = 0,
+        shadow_scope_after_logical_bytes: u64 = 0,
+        shadow_scope_before_physical_bytes: u64 = 0,
+        shadow_scope_after_physical_bytes: u64 = 0,
+        shadow_scope_before_shared_bytes: u64 = 0,
+        shadow_scope_after_shared_bytes: u64 = 0,
+        shadow_scope_before_private_bytes: u64 = 0,
+        shadow_scope_after_private_bytes: u64 = 0,
+        /// The authoritative request owner may retain canonical collector
+        /// output or wrapper caches after the transient shadow has drained.
+        /// These diagnostics never redefine or subtract from owner totals.
+        parent_retained_before_bytes: u64 = 0,
+        parent_retained_after_bytes: u64 = 0,
+        parent_retained_delta_bytes: ?i64 = null,
+        parent_retained_before_logical_bytes: u64 = 0,
+        parent_retained_after_logical_bytes: u64 = 0,
+        parent_retained_before_physical_bytes: u64 = 0,
+        parent_retained_after_physical_bytes: u64 = 0,
+        parent_retained_before_shared_bytes: u64 = 0,
+        parent_retained_after_shared_bytes: u64 = 0,
+        parent_retained_before_private_bytes: u64 = 0,
+        parent_retained_after_private_bytes: u64 = 0,
     };
+
+    fn signedByteDelta(before: u64, after: u64) ?i64 {
+        if (after >= before) return std.math.cast(i64, after - before);
+        const magnitude = std.math.cast(i64, before - after) orelse return null;
+        return -magnitude;
+    }
+
+    fn validateAttentionMatchRepeatAuthority(options: AttentionMatchQueryOptions) !void {
+        if (options.owner_component_diagnostic_request != 0 and
+            (options.prefix_mode != .clone or options.repeat_mode != .reference or options.stats == null))
+            return error.UnsupportedCompactionQueryRoute;
+        if (options.study_pass != 0 and (!builtin.is_test or !options.representative_repeat))
+            return error.UnsupportedCompactionQueryRoute;
+        runtime.kv.attention_match_self_study_training.validateExplicitRepeatBinding(
+            options.explicit_repeat_tokens != null,
+            options.representative_repeat,
+            options.study_pass,
+            options.explicit_repeat_sha256 != null,
+        ) catch return error.UnsupportedCompactionQueryRoute;
+        if (options.explicit_sample_offsets != null and
+            (options.explicit_repeat_tokens == null or options.representative_repeat or options.study_pass != 0))
+            return error.UnsupportedCompactionQueryRoute;
+    }
+
+    fn dense512QueryOptions(
+        repeat_tokens: []const i64,
+        repeat_sha256: [32]u8,
+        offsets: []const u32,
+        stats: *AttentionMatchQueryStats,
+    ) AttentionMatchQueryOptions {
+        return .{
+            .prefix_mode = .clone,
+            .repeat_mode = .reference,
+            .collection = .{ .samples_per_consumer = runtime.kv.attention_match_reference_coverage.dense512_sample_count, .max_bytes = 80 * 1024 * 1024 },
+            .chunk_size = 256,
+            .max_repeat_tokens = NativeCheckpointPrepare.max_repeat_tokens,
+            .representative_repeat = false,
+            .explicit_repeat_tokens = repeat_tokens,
+            .explicit_repeat_sha256 = repeat_sha256,
+            .explicit_sample_offsets = offsets,
+            .stats = stats,
+        };
+    }
+
+    fn collectPrivateDenseTraining(
+        self: *NativeGenerationPipeline,
+        tokens: []const i64,
+        source: *const NativeDecodeState,
+        primary: *runtime.kv.attention_match_queries.Collector,
+        stats: *AttentionMatchQueryStats,
+    ) !PrivateDenseCollection {
+        const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
+        const storage = source.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const revision_before = try compute.attentionMatchRevision(storage);
+        const sequence_before = source.sequence_id orelse return error.UnsupportedAttentionMatchRoute;
+        var selection = try runtime.kv.attention_match_reference_coverage.selectDense512(self.allocator, tokens, NativeCheckpointPrepare.max_repeat_tokens, control);
+        errdefer selection.deinit();
+        const options = dense512QueryOptions(selection.repeat_tokens, selection.repeat_sha256, selection.offsets, stats);
+        try validateAttentionMatchRepeatAuthority(options);
+        var queries = try self.collectAttentionMatchQueries(tokens, source, options);
+        errdefer queries.deinit();
+        const diagnostic = queryDiagnostic(.dense512_reference, &queries, stats.*);
+        try diagnostic.validate();
+        if (diagnostic.samples != runtime.kv.attention_match_reference_coverage.dense512_sample_count)
+            return error.InvalidTrainingAugmentation;
+        if (source.total_tokens != tokens.len or source.sequence_id.? != sequence_before or try compute.attentionMatchRevision(storage) != revision_before)
+            return error.CompactionSourceChanged;
+        var training = try runtime.kv.attention_match_training_augmentation.mergeReferenceCoverageDense512(self.allocator, try queries.finish());
+        errdefer training.deinit();
+        for (training.batches) |batch| if (batch.train_positions.len != runtime.kv.attention_match_reference_coverage.dense512_sample_count or
+            batch.heldout.len != 0 or batch.heldout_positions.len != 0) return error.InvalidTrainingAugmentation;
+        const primary_batches = try primary.finish();
+        var merged = try mergePrivateDenseTraining(self.allocator, primary_batches, training.batches);
+        errdefer merged.deinit();
+        for (primary_batches, training.batches, merged.batches) |base, dense, combined|
+            if (combined.independent_train_split != base.train_positions.len or
+                combined.train_positions.len != try std.math.add(usize, base.train_positions.len, dense.train_positions.len) or
+                @intFromPtr(combined.heldout.ptr) != @intFromPtr(base.heldout.ptr) or
+                @intFromPtr(combined.heldout_positions.ptr) != @intFromPtr(base.heldout_positions.ptr))
+                return error.InvalidTrainingAugmentation;
+        const live_bytes = try privateDenseQueryLiveBytes(primary, &queries, &selection, &training, &merged);
+        return .{ .selection = selection, .queries = queries, .training = training, .merged = merged, .diagnostic = diagnostic, .live_bytes = live_bytes };
+    }
 
     /// Diagnostic sink deliberately cannot publish a checkpoint. The probe has
     /// no loader-authenticated artifact identity and must never produce an
@@ -5586,6 +9482,25 @@ pub const NativeGenerationPipeline = struct {
     }
 
     pub fn restoreAttentionMatchState(self: *NativeGenerationPipeline, saved: runtime.kv.attention_match_checkpoint.State, full_prompt: []const u32, max_new_tokens: usize, diagnostic_only: bool, destination: *NativeDecodeState, timings: ?*NativeCheckpointResume) ![]f32 {
+        const policy: NativeCheckpointLocalCapacityPolicy = if (timings) |request| request.local_capacity_policy else .legacy_spare512_v1;
+        return self.restoreAttentionMatchStateWithLocalCapacityPolicy(saved, full_prompt, max_new_tokens, diagnostic_only, destination, timings, policy);
+    }
+
+    /// Explicit internal seam for an already-authenticated prepared serving
+    /// candidate. Generic supplied/historical candidates must use the wrapper
+    /// above and therefore remain legacy. The prepared-quality caller may pass
+    /// exact only after its producer-authenticated closure core binds the same
+    /// policy bit.
+    pub fn restoreAttentionMatchStateWithLocalCapacityPolicy(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        full_prompt: []const u32,
+        max_new_tokens: usize,
+        diagnostic_only: bool,
+        destination: *NativeDecodeState,
+        timings: ?*NativeCheckpointResume,
+        local_capacity_policy: NativeCheckpointLocalCapacityPolicy,
+    ) ![]f32 {
         const checkpoint = runtime.kv.attention_match_checkpoint;
         if ((self.cb.kind() != .cuda and self.cb.kind() != .metal) or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
             !self.gpt_config.usesGemma4Channels() or self.gpt_config.gemma4_mtp_assistant or
@@ -5628,6 +9543,10 @@ pub const NativeGenerationPipeline = struct {
                 const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
                 const revision = try compute.attentionMatchRevision(storage);
                 const bound: usize = 18 * 1024 * 1024 * 1024;
+                try compute.configureAttentionMatchLocalCapacityPolicy(storage, switch (local_capacity_policy) {
+                    .legacy_spare512_v1 => .legacy_spare512_v1,
+                    .exact_window_causal_union_v1 => .exact_window_causal_union_v1,
+                });
                 const backend = try compute.attentionMatchStorageBackend(storage, self.allocator, limits, bound);
                 const upload_started = mtpProfileTimestamp(true, self.io);
                 var uploaded: ?metal_attention_storage.DeviceState = try backend.upload(saved, bound, control);
@@ -5700,10 +9619,10 @@ pub const NativeGenerationPipeline = struct {
             comparisons += 1;
             if (self.gpt_config.isEosToken(chosen)) break;
             const next: [1]i64 = .{@intCast(chosen)};
-            const next_clone = try self.appendAttentionMatchProbeTokens(&clone.state.?, &next);
+            const next_clone = try self.appendAttentionMatchProbeTokens(&clone.state.?, &next, null);
             self.allocator.free(clone_logits);
             clone_logits = next_clone;
-            const next_fresh = try self.appendAttentionMatchProbeTokens(&fresh.state.?, &next);
+            const next_fresh = try self.appendAttentionMatchProbeTokens(&fresh.state.?, &next, null);
             self.allocator.free(fresh_logits);
             fresh_logits = next_fresh;
             appended += 1;
@@ -5719,6 +9638,7 @@ pub const NativeGenerationPipeline = struct {
 
     fn resumeNativeCheckpoint(self: *NativeGenerationPipeline, request: *NativeCheckpointResume, tokens: []const i64, max_new_tokens: usize, state: *NativeDecodeState, config: GenerationConfig) !PrefillOutput {
         const saved = if (request.checkpoint) |owned| owned.state else return error.InvalidNativeCheckpointRequest;
+        const encoding = request.encoding orelse return error.InvalidNativeCheckpointRequest;
         if (tokens.len < saved.tokens.len) return error.KvCheckpointPrefixMismatch;
         const restored_tokens = saved.tokens.len;
         const appended_tokens = tokens.len - restored_tokens;
@@ -5745,6 +9665,7 @@ pub const NativeGenerationPipeline = struct {
             append_config.prefill_chunk_plan = append_plan.?;
             append_config.prefill_chunk_size = append_plan.?.max_chunk_rows;
         }
+        request.artifact_sha256 = try self.checkpointArtifactDigest(saved, encoding);
         const logits = try self.restoreAttentionMatchState(saved, ids, max_new_tokens, false, state, request);
         request.checkpoint.?.deinit();
         request.checkpoint = null;
@@ -5752,6 +9673,7 @@ pub const NativeGenerationPipeline = struct {
         request.appended_tokens = appended_tokens;
         if (appended_tokens == 0) {
             try self.logMetalCheckpointQualificationPhase(state, config, "resumed_ready", request);
+            try self.logNativeCheckpointConsumerInstall(state, config, request);
             return .{ .last_logits = logits };
         }
         self.allocator.free(logits);
@@ -5759,13 +9681,410 @@ pub const NativeGenerationPipeline = struct {
         const output = try self.executePrefill(tokens[restored_tokens..], tokens.len, restored_tokens, state, append_config, false, false, false);
         request.suffix_prefill_ns = mtpProfileElapsedNs(true, self.io, suffix_started);
         try self.logMetalCheckpointQualificationPhase(state, config, "resumed_ready", request);
+        try self.logNativeCheckpointConsumerInstall(state, config, request);
         return output;
     }
 
+    fn handoffPrivateCompiledPrefill(
+        self: *NativeGenerationPipeline,
+        request: *NativeCheckpointPrepare,
+        tokens: []const i64,
+        source: *const NativeDecodeState,
+        config: GenerationConfig,
+    ) !void {
+        const admission = request.compiled_prefill_exact_kv_handoff orelse return;
+        if (request.compiled_prefill_exact_kv_receipt != null) return error.InvalidNativeCheckpointRequest;
+        const grant = config.native_checkpoint_operator_grant orelse return error.UnqualifiedCompactionArtifact;
+        if (admission.max_copy_bytes == 0 or admission.max_host_staging_bytes == 0 or self.cb.kind() != .metal or self.kv_dtype != .f16 or
+            self.compiled_partition_backend != .metal or self.compiled_attachment_target != .whole_model or
+            request.quality_fit_strategy != .identity_chunk_coefficients_adaptive_v18 or
+            !request.staged_operator_strategy or !isPrivateAdaptiveTraining(request.training_policy) or
+            grant.arm != .attention_matching or grant.training_policy != request.training_policy or
+            !grant.isPrivateProfile() or tokens.len == 0 or
+            source.context_session != null or !source.isPaged() or source.total_tokens != tokens.len)
+            return error.UnsupportedExactPagedKvHandoff;
+        request.compiled_prefill_exact_kv_receipt = try self.handoffValidatedCompiledPrefill(
+            admission,
+            tokens,
+            source,
+            grant.profile_sha256,
+            grant.request_id,
+        );
+    }
+
+    /// Shared post-validation implementation used by production prepare and
+    /// the capture-only formal E2 issuer. Callers must authenticate their own
+    /// authority domain before entering this function.
+    fn handoffValidatedCompiledPrefill(
+        self: *NativeGenerationPipeline,
+        admission: NativeCheckpointPrepare.CompiledPrefillExactKvHandoff,
+        tokens: []const i64,
+        source: *const NativeDecodeState,
+        authority_sha256: [32]u8,
+        destination_owner_id: u64,
+    ) !NativeCheckpointPrepare.CompiledPrefillExactKvReceipt {
+        if (admission.max_copy_bytes == 0 or admission.max_host_staging_bytes == 0 or
+            std.mem.allEqual(u8, &authority_sha256, 0) or destination_owner_id == 0 or
+            self.cb.kind() != .metal or self.kv_dtype != .f16 or
+            self.compiled_partition_backend != .metal or self.compiled_attachment_target != .whole_model or
+            tokens.len == 0 or source.context_session != null or !source.isPaged() or source.total_tokens != tokens.len)
+            return error.UnsupportedExactPagedKvHandoff;
+        const cache = self.graph_cache orelse return error.MissingCompiledModelRuntime;
+        const view = source.kvView() orelse return error.InvalidExactPagedKvHandoff;
+        const storage = view.kv_storage orelse return error.InvalidExactPagedKvHandoff;
+        const destination_hook = storage.device_write_hook orelse return error.UnsupportedExactPagedKvHandoff;
+        const logical_blocks = view.logical_blocks orelse return error.InvalidExactPagedKvHandoff;
+        const page_size = source.kvPageSizeTokens() orelse return error.InvalidExactPagedKvHandoff;
+        if (page_size == 0 or page_size > std.math.maxInt(u16) or logical_blocks.len != view.logical_block_count)
+            return error.InvalidExactPagedKvHandoff;
+        const capacity_tokens = try std.math.mul(usize, logical_blocks.len, page_size);
+        if (capacity_tokens < tokens.len) return error.InvalidExactPagedKvHandoff;
+        const requires_full_history = admission.requiresUniformFullHistory(tokens.len);
+        if (requires_full_history and (view.allow_swa_ring or capacity_tokens < tokens.len))
+            return error.InvalidExactPagedKvHandoff;
+
+        var donors: [gpt_mod.max_attention_layers]graph_mod.model_runtime.ExactPagedKvDonor = undefined;
+        var donor_count: usize = 0;
+        const layer_count = std.math.cast(usize, self.gpt_config.num_hidden_layers) orelse return error.InvalidExactPagedKvHandoff;
+        if (layer_count == 0 or layer_count > donors.len) return error.InvalidExactPagedKvHandoff;
+        for (0..layer_count) |layer| {
+            if (!self.gpt_config.isKvDonorLayer(layer)) continue;
+            const geometry = try self.gpt_config.kvDonorGeometry(layer);
+            const donor_capacity = try compiledPrefillDonorCapacity(
+                capacity_tokens,
+                page_size,
+                self.gpt_config.sliding_window,
+                view.max_inflight_tokens,
+                geometry.sliding,
+                view.allow_swa_ring,
+            );
+            donors[donor_count] = .{
+                .layer = std.math.cast(u32, geometry.donor_layer) orelse return error.InvalidExactPagedKvHandoff,
+                .heads = geometry.num_kv_heads,
+                .dim = geometry.head_dim,
+                .capacity_rows = std.math.cast(u32, donor_capacity) orelse return error.InvalidExactPagedKvHandoff,
+                .host_staged_ring = geometry.sliding and view.allow_swa_ring,
+            };
+            if (requires_full_history and (donors[donor_count].host_staged_ring or donors[donor_count].capacity_rows != capacity_tokens))
+                return error.InvalidExactPagedKvHandoff;
+            donor_count += 1;
+        }
+        if (donor_count == 0) return error.InvalidExactPagedKvHandoff;
+
+        const authority = try graph_mod.execution.compiledModelExactPagedKvAuthority(self, cache);
+        const token_digest = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(tokens);
+        if (authority.logical_tokens != tokens.len or !std.mem.eql(u8, &authority.token_stream_sha256, &token_digest))
+            return error.InvalidExactPagedKvHandoffAuthority;
+        errdefer destination_hook.releaseSequence(view.sequence_id);
+        const receipt = try graph_mod.execution.handoffCompiledModelExactPagedKv(self, cache, .{
+            .authority_sha256 = authority_sha256,
+            .model_layout_sha256 = authority.model_identity_layout_sha256,
+            .token_stream_sha256 = token_digest,
+            .source_revision = authority.source_revision,
+            .destination_owner_id = destination_owner_id,
+            .logical_tokens = tokens.len,
+            .capacity_tokens = capacity_tokens,
+            .page_size_tokens = @intCast(page_size),
+            .max_copy_bytes = admission.max_copy_bytes,
+            .max_host_staging_bytes = admission.max_host_staging_bytes,
+            .full_history_exact = requires_full_history,
+            .donors = donors[0..donor_count],
+            .destination = .{
+                .sequence_id = view.sequence_id,
+                .pool_id = view.pool_id,
+                .logical_block_count = view.logical_block_count,
+                .tail_tokens = view.tail_tokens,
+                .position_offset = view.position_offset,
+                .max_inflight_tokens = view.max_inflight_tokens,
+                .allow_swa_ring = view.allow_swa_ring,
+                .logical_blocks = logical_blocks,
+                .kv_storage = storage,
+            },
+            .execution_control = self.execution_control,
+        });
+        if (receipt.allocation_bound_bytes > admission.max_copy_bytes or receipt.copied_bytes == 0 or
+            receipt.peak_host_staging_bytes > admission.max_host_staging_bytes)
+            return error.DeviceKvCloneBudgetExceeded;
+        const discarded = try graph_mod.execution.discardCompiledModelExactPagedKvSource(self, cache, .{
+            .authority_sha256 = authority_sha256,
+            .source_revision = authority.source_revision,
+            .source_sequence = authority.source_sequence,
+            .token_stream_sha256 = authority.token_stream_sha256,
+            .logical_tokens = authority.logical_tokens,
+            .expected_materialized_tokens = authority.logical_tokens,
+            .execution_control = self.execution_control,
+        });
+        if (discarded.live_bytes_after != 0 or discarded.physically_released_bytes == 0)
+            return error.InvalidExactPagedKvSourceDiscardReceipt;
+        return .{
+            .destination_storage_address = receipt.destination_storage_address,
+            .device_allocation_bound_bytes = receipt.allocation_bound_bytes,
+            .copied_bytes = receipt.copied_bytes,
+            .peak_host_staging_bytes = receipt.peak_host_staging_bytes,
+            .source_slots_released = discarded.slots,
+            .source_live_bytes_before = discarded.live_bytes_before,
+            .source_live_bytes_after = discarded.live_bytes_after,
+            .source_physically_released_bytes = discarded.physically_released_bytes,
+        };
+    }
+
+    pub const QualificationMatrixCompiledSourceDiscard = struct {
+        request_id: u64,
+        source_revision: u64,
+        source_sequence: u32,
+        slots: usize,
+        live_bytes_before: u64,
+        live_bytes_after: u64,
+        physically_released_bytes: u64,
+    };
+
+    pub fn discardQualificationMatrixCompiledSource(self: *NativeGenerationPipeline, config: GenerationConfig) !QualificationMatrixCompiledSourceDiscard {
+        const grant = config.native_checkpoint_operator_grant orelse return error.UnqualifiedCompactionArtifact;
+        if (grant.authority_kind != .staged_exact_baseline or grant.arm != .optimal_compiled_exact or grant.request_id == 0 or
+            std.mem.allEqual(u8, &grant.baseline_authority_sha256, 0)) return error.UnqualifiedCompactionArtifact;
+        const cache = self.graph_cache orelse return error.MissingCompiledModelRuntime;
+        const source = self.qualification_matrix_compiled_source_authority orelse return error.StaleExactPagedKvSource;
+        const completion = self.metal_qualification_completion orelse return error.InvalidKvCheckpoint;
+        if (completion.pending_sampled_tokens > 1 or completion.materialized_tokens < source.logical_tokens)
+            return error.InvalidKvCheckpoint;
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
+        const receipt = try graph_mod.execution.discardCompiledModelExactPagedKvSource(self, cache, .{
+            .authority_sha256 = grant.baseline_authority_sha256,
+            .source_revision = source.source_revision,
+            .source_sequence = source.source_sequence,
+            .token_stream_sha256 = source.token_stream_sha256,
+            .logical_tokens = source.logical_tokens,
+            .expected_materialized_tokens = completion.materialized_tokens,
+            .execution_control = self.execution_control,
+        });
+        if (receipt.live_bytes_after != 0 or receipt.physically_released_bytes == 0 or receipt.live_bytes_before != receipt.physically_released_bytes)
+            return error.InvalidExactPagedKvSourceDiscardReceipt;
+        self.qualification_matrix_compiled_source_authority = null;
+        return .{ .request_id = grant.request_id, .source_revision = receipt.source_revision, .source_sequence = receipt.source_sequence, .slots = receipt.slots, .live_bytes_before = receipt.live_bytes_before, .live_bytes_after = receipt.live_bytes_after, .physically_released_bytes = receipt.physically_released_bytes };
+    }
+
+    fn checkCompiledPackedPrefillBridge(raw: ?*anyopaque) !void {
+        const self: *NativeGenerationPipeline = @ptrCast(@alignCast(raw orelse return error.InvalidCallbackContext));
+        try self.checkPrefillRequest();
+    }
+
+    fn logOwnerComponent(
+        self: *NativeGenerationPipeline,
+        owner: runtime.kv.host_allocation_tracker.Snapshot,
+        request_id: u64,
+        phase: []const u8,
+        compiled_runtime_present: bool,
+    ) void {
+        if (comptime !build_options.enable_metal) return;
+        const provider = self.cb.debugTimingSnapshot().provider;
+        const wrapper = if (self.cb.kind() == .metal) blk: {
+            const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+            break :blk compute.weightCacheOwnershipSnapshot();
+        } else metal_compute.MetalCompute.WeightCacheOwnershipSnapshot{};
+        std.log.info(
+            "compiled_packed_owner_component request={d} phase={s} owner_id={d} host_logical={d} host_physical={d} shared={d} private_device={d} combined={d} peak={d} compiled_runtime_present={d} provider_quant_slots={d} provider_quant_raw={d} provider_quant_raw_owned={d} provider_quant_prepared={d} provider_runtime_prepared_slots={d} provider_runtime_prepared={d} provider_runtime_private_slots={d} provider_runtime_private={d} provider_runtime_mapped_slots={d} provider_runtime_mapped={d} provider_dense_host={d} provider_norm_host={d} tensor_host_mirror_live={d} tensor_device_owned_live={d}",
+            .{
+                request_id,
+                phase,
+                owner.owner_identity,
+                owner.logical_live_bytes,
+                owner.physical_live_bytes,
+                owner.shared_backing_live_bytes,
+                owner.private_device_live_bytes,
+                owner.tracked_combined_live_bytes,
+                owner.tracked_combined_peak_bytes,
+                @intFromBool(compiled_runtime_present),
+                provider.metal_provider_quantized_slots,
+                provider.metal_provider_quantized_raw_bytes,
+                provider.metal_provider_quantized_raw_owned_bytes,
+                provider.metal_provider_quantized_prepared_bytes,
+                provider.metal_provider_quantized_runtime_prepared_slots,
+                provider.metal_provider_quantized_runtime_prepared_bytes,
+                provider.metal_provider_quantized_runtime_private_slots,
+                provider.metal_provider_quantized_runtime_private_bytes,
+                provider.metal_provider_quantized_runtime_mapped_slots,
+                provider.metal_provider_quantized_runtime_mapped_bytes,
+                provider.metal_provider_dense_slot_host_bytes,
+                provider.metal_provider_norm_slot_host_bytes,
+                provider.metal_tensor_host_mirror_live_bytes,
+                provider.metal_tensor_device_owned_live_bytes,
+            },
+        );
+        std.log.info(
+            "compiled_packed_wrapper_component request={d} phase={s} owner_id={d} wrapper_dense_entries={d} wrapper_dense_capacity={d} wrapper_dense_f32_owned={d} wrapper_dense_native_owned={d} wrapper_dense_native_borrowed={d} wrapper_dense_shape={d} wrapper_dense_names={d} wrapper_dense_lazy_pins={d} wrapper_dense_runtime_quant_raw={d} wrapper_dense_runtime_quant_prepared={d} wrapper_handle_entries={d} wrapper_handle_capacity={d} wrapper_handle_names={d} wrapper_handle_refs={d}",
+            .{
+                request_id,
+                phase,
+                owner.owner_identity,
+                wrapper.dense_entries,
+                wrapper.dense_capacity,
+                wrapper.dense_f32_owned_bytes,
+                wrapper.dense_native_owned_bytes,
+                wrapper.dense_native_borrowed_bytes,
+                wrapper.dense_shape_bytes,
+                wrapper.dense_name_bytes,
+                wrapper.dense_lazy_pins,
+                wrapper.dense_runtime_quant_raw_bytes,
+                wrapper.dense_runtime_quant_prepared_bytes,
+                wrapper.weight_handle_entries,
+                wrapper.weight_handle_capacity,
+                wrapper.weight_handle_name_bytes,
+                wrapper.weight_handle_live_refs,
+            },
+        );
+    }
+
+    fn bridgeCompiledPrefillIntoPacked(self: *NativeGenerationPipeline, packed_session: *@import("../backends/packed_context_session.zig").Session, tokens: []const i64, config: GenerationConfig) !void {
+        const admission = config.compiled_packed_prefill_bridge orelse return;
+        const cache = self.graph_cache orelse return error.MissingCompiledModelRuntime;
+        var compiled_runtime_retired = false;
+        // This bridge runs only after compiled prefill has installed mutable
+        // request state. Every failure or cancellation from this point must
+        // retire that state without replacing the primary error. GraphCache
+        // reset is infallible and is a no-op if a deeper failure already
+        // retired the runtime.
+        errdefer if (!compiled_runtime_retired) cache.resetSessionCompiledModelRuntime();
+        try admission.validate();
+        const grant = config.native_checkpoint_operator_grant orelse return error.UnqualifiedCompactionArtifact;
+        const grant_capability = grant.compiled_packed_prefill_bridge orelse return error.UnqualifiedCompactionArtifact;
+        if (grant.authority_kind != .staged_exact_baseline or grant.arm != .packed_exact or grant.request_id == 0 or
+            !std.meta.eql(grant_capability, admission) or
+            std.mem.allEqual(u8, &grant.baseline_authority_sha256, 0) or config.context_storage != .packed_exact or
+            self.cb.kind() != .metal or self.kv_dtype != .f16 or self.compiled_partition_backend != .metal or
+            self.compiled_attachment_target != .whole_model or tokens.len == 0 or tokens.len > admission.max_logical_tokens)
+            return error.UnqualifiedCompactionArtifact;
+        const source = try graph_mod.execution.compiledModelExactPagedKvAuthority(self, cache);
+        const token_sha256 = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(tokens);
+        if (source.logical_tokens != tokens.len or !std.mem.eql(u8, &source.token_stream_sha256, &token_sha256) or
+            !std.mem.eql(u8, &source.model_weights_sha256, &grant.checkpoint_identity.weights) or
+            !std.mem.eql(u8, &source.model_identity_layout_sha256, &grant.checkpoint_identity.layout))
+            return error.InvalidExactPagedKvHandoffAuthority;
+        self.logOwnerComponent(packed_session.ownerAllocationSnapshot().allocation, grant.request_id, "before_import", true);
+        const exporter = try graph_mod.execution.compiledModelExactPagedKvRangeExporter(self, cache);
+        const imported = try packed_session.importCompiledExact(.{
+            .source = exporter,
+            .source_authority = .{ .model_weights_sha256 = source.model_weights_sha256, .model_identity_layout_sha256 = source.model_identity_layout_sha256, .context_layout_sha256 = source.context_layout_sha256, .token_stream_sha256 = source.token_stream_sha256, .source_revision = source.source_revision, .source_sequence = source.source_sequence, .logical_tokens = source.logical_tokens },
+            .expected_tokens = std.math.cast(u32, tokens.len) orelse return error.InvalidCompiledExactImportAuthority,
+            .model_sha256 = grant.checkpoint_identity.weights,
+            .layout_sha256 = grant.checkpoint_identity.layout,
+            .token_sha256 = token_sha256,
+            .max_copy_bytes = admission.max_copy_bytes,
+            .max_host_staging_bytes = admission.max_host_staging_bytes,
+            .check_ctx = self,
+            .check_fn = checkCompiledPackedPrefillBridge,
+        });
+        const observed_host_staging = imported.peak_host_staging_bytes orelse return error.CompiledExactImportHostStagingUnobserved;
+        if (!imported.source_unchanged or !imported.fenced or imported.logical_tokens != tokens.len or
+            imported.copied_bytes == 0 or observed_host_staging > admission.max_host_staging_bytes)
+            return error.InvalidCompiledExactImportReceipt;
+        self.logOwnerComponent(packed_session.ownerAllocationSnapshot().allocation, grant.request_id, "after_import", true);
+        const discarded = try graph_mod.execution.discardCompiledModelExactPagedKvSource(self, cache, .{
+            .authority_sha256 = grant.baseline_authority_sha256,
+            .source_revision = source.source_revision,
+            .source_sequence = source.source_sequence,
+            .token_stream_sha256 = source.token_stream_sha256,
+            .logical_tokens = source.logical_tokens,
+            .expected_materialized_tokens = source.logical_tokens,
+            .execution_control = self.execution_control,
+        });
+        if (discarded.live_bytes_after != 0 or discarded.physically_released_bytes == 0 or discarded.live_bytes_before != discarded.physically_released_bytes)
+            return error.InvalidExactPagedKvSourceDiscardReceipt;
+        self.logOwnerComponent(packed_session.ownerAllocationSnapshot().allocation, grant.request_id, "after_source_discard", true);
+        // KV-slot discard is narrower than whole-request retirement. The
+        // compiled runtime may still own prefill activations and workspaces;
+        // destroy it after the fenced import while retaining cached compiled
+        // executors and immutable model weight bindings.
+        try graph_mod.execution.retireCompiledModelSessionRuntime(self, cache);
+        compiled_runtime_retired = true;
+        self.logOwnerComponent(packed_session.ownerAllocationSnapshot().allocation, grant.request_id, "after_runtime_retire", false);
+        try packed_session.sealForSingletonDecode();
+        self.logOwnerComponent(packed_session.ownerAllocationSnapshot().allocation, grant.request_id, "after_singleton_seal", false);
+        self.compiled_partition_backend = null;
+        self.compiled_attachment_target = .partitioned;
+        self.graph_cache = null;
+        std.log.info("compiled_packed_prefill_bridge request={d} observation={x} source_revision={d} logical_tokens={d} copied_bytes={d} peak_host_staging_bytes={d} source_kv_released_bytes={d} compiled_session_runtime_retired=1 singleton_sealed=1", .{ grant.request_id, admission.observation_sha256, source.source_revision, tokens.len, imported.copied_bytes, observed_host_staging, discarded.physically_released_bytes });
+    }
+
     fn prepareNativeCheckpoint(self: *NativeGenerationPipeline, request: *NativeCheckpointPrepare, tokens: []const i64, logits: []const f32, source: *const NativeDecodeState, config: GenerationConfig) !void {
+        const resident_cohort: ResidentHybridCohort = if (request.resident_hybrid_authority) |authority| authority.cohort else .e4_8128_v1;
+        const resident_geometry = residentDomainGeometry(resident_cohort);
+        if (request.training_policy == .private_train_challenge_hybrid_resident_v1) {
+            const grant = config.native_checkpoint_operator_grant orelse return error.UnqualifiedCompactionArtifact;
+            try grant.validate(grant.checkpoint_identity, grant.policy, grant.profile_sha256, grant.profile_semantic_sha256);
+            if (!std.meta.eql(request.resident_hybrid_authority, grant.resident_hybrid_authority))
+                return error.UnqualifiedCompactionArtifact;
+            request.producer_binary_sha256 = grant.binary_sha256;
+            if (request.resident_hybrid_authority.?.e2_formal_owner_inventory) |inventory| {
+                if (!native_kv_checkpoint.Identity.eql(inventory.native_identity, grant.checkpoint_identity) or
+                    !std.mem.eql(u8, &inventory.context.binary_sha256, &grant.binary_sha256) or
+                    !std.mem.eql(u8, &inventory.context.hardware_sha256, &grant.profile_sha256))
+                    return error.UnqualifiedCompactionArtifact;
+            }
+            const cohort_matches_model = switch (resident_cohort) {
+                .e4_8128_v1 => @import("../architectures/gemma4_runtime.zig").isExactE4bDenseRuntimeConfig(self.gpt_config),
+                .e2_8128_v1 => @import("../architectures/gemma4_runtime.zig").isExactE2bDenseRuntimeConfig(self.gpt_config),
+                .e4_formal_7936_256_v1, .e4_formal_32512_256_v1 => @import("../architectures/gemma4_runtime.zig").isExactE4bDenseRuntimeConfig(self.gpt_config),
+            };
+            if (!cohort_matches_model) return error.UnqualifiedCompactionArtifact;
+            if (resident_cohort == .e2_8128_v1) try validateE2ResidentConsumerGeometry(self.gpt_config);
+        } else if (request.resident_hybrid_authority != null) return error.UnqualifiedCompactionArtifact;
+        if (request.prepared_quality_closure_requested) {
+            const grant = config.native_checkpoint_operator_grant orelse return error.UnqualifiedCompactionArtifact;
+            if (grant.authority_kind != .candidate_profile or grant.arm != .attention_matching or
+                grant.prompt_tokens != tokens.len or request.prepared_quality_source_sink == null or
+                (request.training_policy == .private_train_challenge_hybrid_resident_v1 and request.prepared_quality_heldout_sink == null))
+                return error.UnqualifiedCompactionArtifact;
+            request.prepared_quality_prompt_sha256 = grant.prompt_tokens_sha256;
+            request.prepared_quality_prompt_tokens = grant.prompt_tokens;
+        }
         if (request.result != null or !std.math.isFinite(request.minimum_savings_ratio) or request.minimum_savings_ratio <= 1 or request.minimum_savings_ratio > 4 or request.validation_workers != 1)
             return error.InvalidNativeCheckpointRequest;
-        const plan = try NativeCheckpointPrepare.hostPlan(self.gpt_config, tokens.len, request.encoding, self.cb.kind() == .metal);
+        if (request.quality_fit_strategy == .identity_chunk_coefficients_adaptive_v18 and
+            (!request.staged_operator_strategy or request.admission != .cumulative_ladder_4_3_2 or request.chunk_rows != 256 or !request.reject_exact_active_fixed_point or self.cb.kind() != .metal))
+            return error.InvalidNativeCheckpointRequest;
+        if (request.private_capture_summary != request.private_incremental_budget or
+            (request.private_capture_summary and (request.compiled_prefill_exact_kv_handoff == null or
+                !request.compiled_prefill_exact_kv_handoff.?.allows(request.encoding, tokens.len) or
+                !isPrivateAdaptiveTraining(request.training_policy))))
+            return error.InvalidNativeCheckpointRequest;
+        if (request.private_training_reduction and (!request.private_capture_summary or !request.private_incremental_budget))
+            return error.InvalidNativeCheckpointRequest;
+        if (request.private_capture_gram_batch256_diagnostic and
+            (!builtin.is_test or !request.private_training_reduction or !request.private_capture_summary or
+                request.training_policy == .primary_only or tokens.len == 0 or tokens.len > 8192 or
+                request.chunk_rows != 256 or request.admission != .cumulative_ladder_4_3_2 or
+                request.quality_fit_strategy != .identity_chunk_coefficients_adaptive_v18 or self.cb.kind() != .metal))
+            return error.InvalidNativeCheckpointRequest;
+        if (request.private_bounded_tsqr_value_backend and
+            (request.compiled_prefill_exact_kv_handoff == null or request.compiled_prefill_exact_kv_handoff.?.max_logical_tokens != 32768 or tokens.len <= 8192))
+            return error.InvalidNativeCheckpointRequest;
+        if (request.quality_fit_strategy == .legacy and request.staged_operator_strategy)
+            return error.InvalidNativeCheckpointRequest;
+        if (request.bounded_delta_accelerated and
+            (!request.staged_operator_strategy or request.quality_fit_strategy != .identity_chunk_coefficients_adaptive_v18 or
+                !isPrivateAdaptiveTraining(request.training_policy) or request.encoding != .f16))
+            return error.InvalidNativeCheckpointRequest;
+        if (request.compiled_prefill_exact_kv_handoff != null and
+            (request.quality_fit_strategy != .identity_chunk_coefficients_adaptive_v18 or
+                !request.staged_operator_strategy or !isPrivateAdaptiveTraining(request.training_policy) or
+                !request.compiled_prefill_exact_kv_handoff.?.allows(request.encoding, tokens.len)))
+            return error.InvalidNativeCheckpointRequest;
+        const fit_policy = request.fitPolicy();
+        try fit_policy.validate(request.encoding, self.cb.kind() == .metal);
+        var plan = try NativeCheckpointPrepare.hostPlanWithQualityPolicy(self.gpt_config, tokens.len, request.encoding, self.cb.kind() == .metal, request.admission, request.chunk_rows, request.reject_exact_active_fixed_point);
+        if (request.quality_fit_strategy == .identity_chunk_coefficients_adaptive_v18) {
+            const head_workspace_bytes: usize = if (request.training_policy == .private_train_challenge_hybrid_resident_v1)
+                2 * 1024 * 1024 * 1024
+            else if (isPrivateAdaptiveTraining(request.training_policy))
+                1024 * 1024 * 1024
+            else
+                512 * 1024 * 1024;
+            plan = try NativeCheckpointPrepare.v18ParallelPlanWithWorkspaceProfile(plan.source_bytes, try NativeCheckpointPrepare.v18EligibleHeadCount(self.gpt_config), head_workspace_bytes, if (request.training_policy == .private_train_challenge_hybrid_resident_v1) .resident_native_hybrid_2g_v1 else .standard);
+            if (request.training_policy == .private_train_challenge_hybrid_resident_v1 and plan.workers != 1)
+                return error.CompactionWorkspaceLimit;
+        }
+        try NativeCheckpointPrepare.validatePlanAdmission(plan, request.admission, request.chunk_rows, request.reject_exact_active_fixed_point);
         if (request.planned_fit_host_bytes) |admitted| {
             if (admitted != plan.fit_bytes) return error.InvalidNativeCheckpointRequest;
         }
@@ -5778,19 +10097,201 @@ pub const NativeGenerationPipeline = struct {
             if (admitted != plan.head_workspace_bytes) return error.InvalidNativeCheckpointRequest;
         }
         request.planned_fit_head_workspace_bytes = plan.head_workspace_bytes;
+        if (request.planned_private_query_bytes) |admitted| {
+            if (admitted != plan.query_reserve_bytes) return error.InvalidNativeCheckpointRequest;
+        }
+        request.planned_private_query_bytes = plan.query_reserve_bytes;
+        // The source-phase owner snapshot must drain the still-bound compiled
+        // runtime before the eager query collector temporarily hides the graph
+        // route. Missing compiled state here is an ownership failure, never an
+        // authorization to skip the snapshot gate.
         try self.logMetalCheckpointQualificationPhase(source, config, "checkpoint_source", null);
+        var eager_query_route = EagerQueryCompiledRouteSuspension.begin(
+            &self.graph_cache,
+            &self.compiled_partition_backend,
+            &self.compiled_attachment_target,
+            request.compiled_prefill_exact_kv_handoff != null,
+        );
+        defer eager_query_route.deinit();
         const started = mtpProfileTimestamp(true, self.io);
+        var primary_query_stats: AttentionMatchQueryStats = .{};
+        var dense_query_stats: AttentionMatchQueryStats = .{};
+        const export_request = request.whole_fit_input;
+        if (export_request != null and (!request.capture_quality_evidence or (export_request.?.samples != 320 and export_request.?.samples != 512))) return error.InvalidWholeFitInputBinding;
+        const collection = if (export_request) |binding| runtime.kv.attention_match_queries.Options{
+            .samples_per_consumer = binding.samples,
+            .max_bytes = if (binding.samples == 512) 80 * 1024 * 1024 else 64 * 1024 * 1024,
+        } else NativeCheckpointPrepare.collection_options;
+        if (request.private_training_batches != null) return error.InvalidNativeCheckpointRequest;
+        if (request.qualification_phase_telemetry) |*owned| {
+            const now = platform.time.monotonicNs();
+            try owned.observer().emit(.compiled_handoff, .end, now);
+            try owned.observer().emit(.query_collection, .begin, now);
+        }
+        std.log.info("native_checkpoint_query_collection phase=primary_started policy={s}", .{@tagName(request.training_policy)});
+        const query_component_request = if (request.training_policy == .private_train_challenge_hybrid_resident_v1)
+            (config.native_checkpoint_operator_grant orelse return error.UnqualifiedCompactionArtifact).request_id
+        else
+            0;
         var queries = try self.collectAttentionMatchQueries(tokens, source, .{
             .prefix_mode = .clone,
             .repeat_mode = if (self.cb.kind() == .metal) .reference else .exact_split,
-            .collection = NativeCheckpointPrepare.collection_options,
+            .collection = collection,
             .chunk_size = 256,
             .max_repeat_tokens = NativeCheckpointPrepare.max_repeat_tokens,
             .representative_repeat = true,
+            .stats = &primary_query_stats,
+            .owner_component_diagnostic_request = query_component_request,
         });
         defer queries.deinit();
+        if (query_component_request != 0) {
+            const source_tracker = (source.kv_storage orelse return error.ContextPhysicalAccountingUnavailable).ownerAllocationTracker() orelse
+                return error.ContextPhysicalAccountingUnavailable;
+            self.logOwnerComponent(source_tracker.snapshot(), query_component_request, "outer_after_collection", false);
+            std.debug.print("native_checkpoint_query_scope_attribution request={} owner_id={} child_generation={} child_complete={} child_final_logical={} child_final_physical={} child_final_shared={} child_final_private={} child_final_combined={} parent_before_logical={} parent_after_logical={} parent_delta_logical={?} parent_before_physical={} parent_after_physical={} parent_delta_physical={?} parent_before_shared={} parent_after_shared={} parent_delta_shared={?} parent_before_private={} parent_after_private={} parent_delta_private={?} parent_before_combined={} parent_after_combined={} parent_delta_combined={?}\n", .{
+                query_component_request,
+                primary_query_stats.shadow_owner_id,
+                primary_query_stats.shadow_scope_generation,
+                primary_query_stats.shadow_scope_released,
+                primary_query_stats.shadow_scope_after_logical_bytes,
+                primary_query_stats.shadow_scope_after_physical_bytes,
+                primary_query_stats.shadow_scope_after_shared_bytes,
+                primary_query_stats.shadow_scope_after_private_bytes,
+                primary_query_stats.shadow_scope_after_bytes,
+                primary_query_stats.parent_retained_before_logical_bytes,
+                primary_query_stats.parent_retained_after_logical_bytes,
+                signedByteDelta(primary_query_stats.parent_retained_before_logical_bytes, primary_query_stats.parent_retained_after_logical_bytes),
+                primary_query_stats.parent_retained_before_physical_bytes,
+                primary_query_stats.parent_retained_after_physical_bytes,
+                signedByteDelta(primary_query_stats.parent_retained_before_physical_bytes, primary_query_stats.parent_retained_after_physical_bytes),
+                primary_query_stats.parent_retained_before_shared_bytes,
+                primary_query_stats.parent_retained_after_shared_bytes,
+                signedByteDelta(primary_query_stats.parent_retained_before_shared_bytes, primary_query_stats.parent_retained_after_shared_bytes),
+                primary_query_stats.parent_retained_before_private_bytes,
+                primary_query_stats.parent_retained_after_private_bytes,
+                signedByteDelta(primary_query_stats.parent_retained_before_private_bytes, primary_query_stats.parent_retained_after_private_bytes),
+                primary_query_stats.parent_retained_before_bytes,
+                primary_query_stats.parent_retained_after_bytes,
+                primary_query_stats.parent_retained_delta_bytes,
+            });
+        }
+        request.primary_query_collection = queryDiagnostic(.primary_reference, &queries, primary_query_stats);
+        request.primary_query_collection.validate() catch |err| {
+            std.debug.print("native_checkpoint_query_collection_validation_failure phase=primary samples={} consumers={} repeat_rows={} query_bytes={} forward_calls={} ragged_attention_calls={} scope_released={} scope_delta_bytes={?} owner_id={} owner_peak_bytes={} uses_source_owner={} before_logical={} after_logical={} before_physical={} after_physical={} before_shared={} after_shared={} before_private={} after_private={} before_combined={} after_combined={} error={s}\n", .{
+                request.primary_query_collection.samples,
+                request.primary_query_collection.consumers,
+                request.primary_query_collection.repeat_rows,
+                request.primary_query_collection.query_bytes,
+                request.primary_query_collection.forward_calls,
+                request.primary_query_collection.ragged_attention_calls,
+                primary_query_stats.shadow_scope_released,
+                primary_query_stats.shadow_scope_delta_bytes,
+                primary_query_stats.shadow_owner_id,
+                primary_query_stats.shadow_owner_peak_bytes,
+                primary_query_stats.shadow_uses_source_owner,
+                primary_query_stats.shadow_scope_before_logical_bytes,
+                primary_query_stats.shadow_scope_after_logical_bytes,
+                primary_query_stats.shadow_scope_before_physical_bytes,
+                primary_query_stats.shadow_scope_after_physical_bytes,
+                primary_query_stats.shadow_scope_before_shared_bytes,
+                primary_query_stats.shadow_scope_after_shared_bytes,
+                primary_query_stats.shadow_scope_before_private_bytes,
+                primary_query_stats.shadow_scope_after_private_bytes,
+                primary_query_stats.shadow_scope_before_bytes,
+                primary_query_stats.shadow_scope_after_bytes,
+                @errorName(err),
+            });
+            return err;
+        };
+        std.log.info("native_checkpoint_query_collection phase=primary_completed policy={s} samples={d}", .{
+            @tagName(request.training_policy), request.primary_query_collection.samples,
+        });
+        var dense_collection: ?PrivateDenseCollection = null;
+        defer if (dense_collection) |*owned| owned.deinit();
+        // The resident bridge borrows the future collector through the fit.
+        // Keep its owner beside the dense owner, outside the private-policy
+        // block, so neither borrowed slice can expire before the probe returns.
+        var future_capture: ?NativeCheckpointPrepare.FutureDecodeTrainingCapture = null;
+        defer if (future_capture) |*owned| owned.deinit();
+        var resident_future_training: ?runtime.kv.attention_match_training_augmentation.OwnedTraining = null;
+        defer if (resident_future_training) |*owned| owned.deinit();
+        defer {
+            request.private_training_batches = null;
+            request.private_dense_training = null;
+            request.private_future_training_batches = null;
+            request.private_collector_source_length = 0;
+            request.private_collector_repeat_length = 0;
+            request.private_collector_required_bytes = 0;
+            request.private_collector_manifest_sha256 = @splat(0);
+        }
+        if (isPrivateAdaptiveTraining(request.training_policy)) {
+            if (request.quality_fit_strategy != .identity_chunk_coefficients_adaptive_v18 or !request.staged_operator_strategy)
+                return error.InvalidNativeCheckpointRequest;
+            if (request.training_policy == .private_future_decode_mix_v1 and
+                !std.mem.eql(u8, &request.future_decode_training_policy_sha256, &runtime.kv.attention_match_future_decode_training.policyDigest()))
+                return error.InvalidNativeCheckpointRequest;
+            std.log.info("native_checkpoint_query_collection phase=dense_started policy={s}", .{@tagName(request.training_policy)});
+            dense_collection = self.collectPrivateDenseTraining(tokens, source, &queries, &dense_query_stats) catch |err| {
+                std.log.err("native_checkpoint_query_collection phase=dense_failed policy={s} error={s}", .{
+                    @tagName(request.training_policy), @errorName(err),
+                });
+                return err;
+            };
+            request.dense512_query_collection = dense_collection.?.diagnostic;
+            std.log.info("native_checkpoint_query_collection phase=dense_completed policy={s} samples={d}", .{
+                @tagName(request.training_policy), request.dense512_query_collection.samples,
+            });
+            request.private_dense512_query_rows = dense_collection.?.training.positions.len;
+            if (request.training_policy == .private_future_decode_mix_v1 or request.training_policy == .private_train_challenge_hybrid_resident_v1) {
+                dense_collection.?.merged.clear();
+                future_capture = try self.captureFutureDecodeTraining(tokens, source, logits, request.compiled_prefill_exact_kv_handoff.?.max_copy_bytes, config.context_fault_controller);
+                const future_batches = try future_capture.?.queries.finish();
+                if (request.training_policy == .private_future_decode_mix_v1) {
+                    const merged = try mergePrivateFutureDecodeTraining(self.allocator, try queries.finish(), dense_collection.?.training.batches, future_batches, future_capture.?, .{ .context = self, .check_fn = checkAttentionMatchQueryWork });
+                    request.future_training_authority = merged.authority;
+                    dense_collection.?.merged = merged.training;
+                    dense_collection.?.live_bytes = try privateDenseQueryLiveBytes(&queries, &dense_collection.?.queries, &dense_collection.?.selection, &dense_collection.?.training, &dense_collection.?.merged);
+                    request.private_dense512_query_rows = dense_collection.?.merged.positions.len;
+                } else {
+                    resident_future_training = try normalizeResidentFutureTraining(self.allocator, future_batches, .{ .context = self, .check_fn = checkAttentionMatchQueryWork });
+                    try validateResidentFutureHeldoutIndependence(try queries.finish(), resident_future_training.?.batches, resident_geometry.batch_count);
+                    request.future_training_authority = futureCaptureAuthorityForPolicy(
+                        future_capture.?,
+                        residentFuturePolicyDigest(resident_cohort),
+                    );
+                    request.private_dense_training = &dense_collection.?.training;
+                    request.private_future_training_batches = resident_future_training.?.batches;
+                    const collector_seal = try dense_collection.?.queries.seal(.{ .context = self, .check_fn = checkAttentionMatchQueryWork });
+                    request.private_collector_source_length = collector_seal.source_length;
+                    request.private_collector_repeat_length = collector_seal.repeat_length;
+                    request.private_collector_manifest_sha256 = collector_seal.sha256;
+                }
+                dense_collection.?.live_bytes = try std.math.add(usize, dense_collection.?.live_bytes, future_capture.?.queries.peak_bytes);
+                dense_collection.?.live_bytes = try std.math.add(usize, dense_collection.?.live_bytes, try std.math.mul(usize, future_capture.?.generated_ids.len, @sizeOf(i64)));
+                if (resident_future_training) |owned| {
+                    dense_collection.?.live_bytes = try std.math.add(usize, dense_collection.?.live_bytes, try std.math.mul(usize, owned.batches.len, @sizeOf(runtime.kv.attention_match_engine.ReferenceBatch)));
+                    dense_collection.?.live_bytes = try std.math.add(usize, dense_collection.?.live_bytes, try std.math.add(usize, try std.math.mul(usize, owned.values.len, @sizeOf(f32)), try std.math.mul(usize, owned.positions.len, @sizeOf(u64))));
+                }
+            }
+            if (dense_collection.?.live_bytes > (request.planned_private_query_bytes orelse return error.InvalidNativeCheckpointRequest))
+                return error.CompactionWorkspaceLimit;
+            request.private_query_live_bytes = dense_collection.?.live_bytes;
+            request.private_collector_required_bytes = dense_collection.?.queries.peak_bytes;
+            request.private_training_batches = if (request.training_policy == .private_train_challenge_hybrid_resident_v1) null else dense_collection.?.merged.batches;
+        } else if (request.training_policy != .primary_only) return error.InvalidNativeCheckpointRequest;
+        if (request.qualification_phase_telemetry) |*owned| {
+            const now = platform.time.monotonicNs();
+            try owned.observer().emit(.query_collection, .end, now);
+            try owned.observer().emit(.fit_validation, .begin, now);
+        }
         const query_ns = mtpProfileElapsedNs(true, self.io, started);
+        request.query_collection_combined_before_fit_ns = query_ns;
         _ = try self.probeAttentionMatchFit(tokens, logits, source, &queries, query_ns, .{ .prepare_request = request });
+        if (request.qualification_phase_telemetry) |*owned| {
+            const now = platform.time.monotonicNs();
+            try owned.observer().emit(.fit_validation, .end, now);
+            try owned.observer().emit(.export_prepare, .begin, now);
+        }
         if (request.result == null) return error.InvalidNativeCheckpointResult;
     }
 
@@ -5812,6 +10313,34 @@ pub const NativeGenerationPipeline = struct {
             return error.UnsupportedMetalKvCheckpointEncoding;
         if (request.validation_workers != 1)
             return error.InvalidNativeCheckpointRequest;
+        // The fit lock is intentionally non-reentrant.  Capture the optional
+        // diagnostic pass-1 queries before entering the fit/snapshot critical
+        // section, then retain their owned buffers until the locked exporter
+        // has serialized them.  Ordinary and non-test preparation never take
+        // this branch.
+        var augmentation_queries: ?runtime.kv.attention_match_queries.Collector = null;
+        defer if (augmentation_queries) |*owned| owned.deinit();
+        if (comptime builtin.is_test) {
+            if (request.whole_fit_input) |export_binding| {
+                try export_binding.validateAugmentation();
+                if (export_binding.augmentation_output_dir) |augmentation_dir| {
+                    if (!request.capture_quality_evidence or augmentation_dir.len == 0 or !std.fs.path.isAbsolute(augmentation_dir)) return error.InvalidTrainingAugmentationBinding;
+                    const dense_reference = if (export_binding.reference_coverage) |capture| capture.policy == .dense512 and export_binding.augmentation_samples == runtime.kv.attention_match_training_augmentation.dense_reference_samples_per_stratum else false;
+                    if ((!augmentationSamplesAllowed(export_binding.augmentation_samples, dense_reference)) or
+                        (export_binding.augmentation_samples != runtime.kv.attention_match_training_augmentation.legacy_samples_per_stratum and export_binding.self_study != null))
+                        return error.InvalidTrainingAugmentationBinding;
+                    if (export_binding.self_study == null and export_binding.reference_coverage == null) augmentation_queries = try self.collectAttentionMatchQueries(tokens, source, .{
+                        .prefix_mode = .clone,
+                        .repeat_mode = .reference,
+                        .collection = .{ .samples_per_consumer = export_binding.augmentation_samples, .max_bytes = 64 * 1024 * 1024 },
+                        .chunk_size = 256,
+                        .max_repeat_tokens = NativeCheckpointPrepare.max_repeat_tokens,
+                        .representative_repeat = true,
+                        .study_pass = 1,
+                    });
+                }
+            }
+        }
         var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
         defer if (execution_scope) |*scope| scope.deinit();
         const checkpoint = runtime.kv.attention_match_checkpoint;
@@ -5820,6 +10349,27 @@ pub const NativeGenerationPipeline = struct {
         const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
         const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
         const source_storage = source.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
+        if (request.prepare_host_owner_profile != .none) {
+            const tracker = source_storage.ownerAllocationTracker() orelse return error.InvalidBoundedPrepareOwner;
+            try tracker.verifyBoundedPrepare(request.prepare_host_owner_identity);
+            if (self.allocator.ptr != @as(*anyopaque, @ptrCast(tracker)) or
+                request.training_policy != .private_train_challenge_hybrid_resident_v1 or
+                request.resident_hybrid_authority == null or
+                request.planned_fit_workers != 1)
+                return error.InvalidBoundedPrepareOwner;
+            const allowed_owner_encoding = if (request.prepare_host_owner_profile == .bounded_page_e4_formal_1152m_v1)
+                request.encoding == .f16 or request.encoding == .fp8 or request.encoding == .rotated4
+            else
+                request.encoding == .f16;
+            if (!allowed_owner_encoding) return error.InvalidBoundedPrepareOwner;
+            if (request.prepare_host_owner_profile == .bounded_page_e4_resident_1152m_v1 and request.resident_hybrid_authority.?.cohort != .e4_8128_v1)
+                return error.InvalidBoundedPrepareOwner;
+            if (request.prepare_host_owner_profile == .bounded_page_e4_formal_1152m_v1) {
+                const formal = request.resident_hybrid_authority.?.e4_formal_authority orelse return error.InvalidBoundedPrepareOwner;
+                try formal.validate();
+                if (tokens.len != formal.shape.source_rows) return error.InvalidBoundedPrepareOwner;
+            }
+        } else if (request.prepare_host_owner_identity != 0) return error.InvalidBoundedPrepareOwner;
         const source_revision = try compute.attentionMatchRevision(source_storage);
         const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
         var phase: []const u8 = "snapshot";
@@ -5831,19 +10381,256 @@ pub const NativeGenerationPipeline = struct {
         const ids = try self.allocator.alloc(u32, tokens.len);
         defer self.allocator.free(ids);
         for (tokens, ids) |token, *id| id.* = std.math.cast(u32, token) orelse return error.InvalidCompactionQueries;
+        if (request.resident_hybrid_authority) |authority| if (authority.cohort == .e4_formal_32512_256_v1) {
+            if (std.mem.allEqual(u8, &request.producer_binary_sha256, 0))
+                return error.UnqualifiedCompactionArtifact;
+            var actual_prompt_sha256: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(ids), &actual_prompt_sha256, .{});
+            const wide = (authority.e4_formal_authority orelse return error.UnqualifiedCompactionArtifact).wide_32512 orelse return error.UnqualifiedCompactionArtifact;
+            try wide.validate();
+            if (request.whole_fit_input != null or request.capture_quality_evidence or request.private_dense_training == null or
+                request.private_future_training_batches == null)
+                return error.InvalidNativeCheckpointRequest;
+            if (request.prepared_quality_closure_requested and
+                (request.prepared_quality_prompt_tokens != tokens.len or
+                    std.mem.allEqual(u8, &request.prepared_quality_prompt_sha256, 0) or
+                    request.prepared_quality_source_sink == null or request.prepared_quality_heldout_sink == null))
+                return error.UnqualifiedCompactionArtifact;
+            const primary = try queries.finish();
+            const layer_count = self.gpt_config.num_hidden_layers;
+            if (layer_count == 0 or layer_count > 256) return error.UnsupportedKvSnapshotLayout;
+            var donors: [256]runtime.kv.attention_match_snapshot.Donor = undefined;
+            var layer_donors: [256]u32 = undefined;
+            var donor_count: usize = 0;
+            for (0..layer_count) |layer| {
+                const geometry = try self.gpt_config.kvDonorGeometry(layer);
+                if (self.gpt_config.isKvDonorLayer(layer)) {
+                    donors[donor_count] = .{ .layer = @intCast(layer), .window = if (self.gpt_config.layerUsesSlidingAttention(layer)) self.gpt_config.sliding_window else 0, .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
+                    donor_count += 1;
+                }
+                var index: ?u32 = null;
+                for (donors[0..donor_count], 0..) |donor, i| {
+                    if (donor.layer == geometry.donor_layer) {
+                        index = @intCast(i);
+                        break;
+                    }
+                }
+                layer_donors[layer] = index orelse return error.UnsupportedKvSnapshotLayout;
+            }
+            const raw_view = source.kv_view orelse return error.UnsupportedAttentionMatchRoute;
+            const raw_logical_blocks = raw_view.logical_blocks orelse return error.UnsupportedAttentionMatchRoute;
+            var raw_owner_layers: [256]u32 = undefined;
+            for (donors[0..donor_count], 0..) |donor, index| raw_owner_layers[index] = @intCast(donor.layer);
+            const tracker = source_storage.ownerAllocationTracker() orelse return error.InvalidBoundedPrepareOwner;
+            var query_heads: [256]u32 = undefined;
+            @memset(query_heads[0..layer_count], self.gpt_config.num_attention_heads);
+            var scales: [256]f64 = undefined;
+            var caps: [256]f64 = undefined;
+            for (donors[0..donor_count], 0..) |donor, donor_index| {
+                scales[donor_index] = 1.0 / @sqrt(@as(f64, @floatFromInt(donor.dim)));
+                caps[donor_index] = 0;
+            }
+            const layout: engine.Layout = .{ .query_heads_by_layer = query_heads[0..layer_count], .scales_by_donor = scales[0..donor_count], .softcaps_by_donor = caps[0..donor_count] };
+            var fitter = try Fitter.initWorker(self.allocator, tracker, @intCast(wide.combined_cap_bytes), @intCast(wide.combined_cap_bytes));
+            defer request.fp64_accelerated_value_solves +|= fitter.deinitAndTakeValueSolves();
+            try fitter.setQueryBatchRows(64);
+            var options = NativeCheckpointPrepare.fittingOptionsForQualityPolicy(request.admission, request.chunk_rows, request.reject_exact_active_fixed_point);
+            options.fit_strategy = .identity_chunk_coefficients_adaptive_v18;
+            options.staged_operator_strategy = true;
+            options.adaptive_v18_fn = @import("../runtime/kv/attention_match_joint_adaptive_quality.zig").engineCallback;
+            options.adaptive_v18_numerical_policy = .accepted_f32_gram_reuse_v1;
+            options.adaptive_v18_geometry_route = .bounded_page_over_96;
+            options.adaptive_v18_bounded_tile_queries = 64;
+            options.adaptive_v18_bounded_builder_transient_bytes = 256 * 1024 * 1024;
+            options.adaptive_v18_bounded_delta_accelerated = true;
+            options.adaptive_v18_bounded_tsqr_value_backend = true;
+            options.adaptive_v18_bounded_score_policy = if (platform.env.getenvBoolDefault("ANTFLY_METAL_ATTENTION_MATCH_ACCELERATE_BOUNDED_SCORE", false)) .accelerate_fp64_tiled_v1 else .scalar_reference;
+            options.adaptive_v18_critical_core_policy = .train_probability_gte_0_025_no_top1_v1;
+            options.adaptive_v18_postfit_policy = .train_global_residual_range_mass_l2_exact_f32_cache_v1;
+            options.geometry_chooser_policy = .incremental_gram_v1;
+            options.independent_validation_policy = .accelerate_fp64_summary_v1;
+            options.private_performance_policy = .owned_capture_summary_incremental_reduction_critical025_v1;
+            options.v18_reference_summary_cache_policy = .exact_original_train_hho_v1;
+            options.max_queries_per_consumer = 768;
+            options.adaptive_v18_primary_budget_percent = 91;
+            options.adaptive_v18_fallback_budget_percent = 95;
+            options.adaptive_v18_max_budget_fallbacks = 3;
+            options.adaptive_v18_workspace_profile = .resident_e4_32512_bounded_2g_v1;
+            options.independent_fp64_publication = true;
+            options.fp8_checkpoint = request.encoding == .fp8;
+            options.rotated4_checkpoint = request.encoding == .rotated4;
+            options.stats = &stats;
+            options.fit.control = control;
+            options.fit.backend = fitter.backend();
+            options.fit.max_workspace_bytes = @intCast(wide.combined_cap_bytes);
+            options.max_parallel_validations = 1;
+            options.max_transient_host_bytes = @intCast(wide.owner_cap_bytes);
+            options.min_global_savings_ratio = request.minimum_savings_ratio;
+            options.rejected_head_policy = .preserve_original;
+            options.source_has_metadata = false;
+            const shape_binding: @import("../runtime/kv/attention_match_e4_32512_shape_authority.zig").Binding = .{
+                .source_freeze_sha256 = wide.source_freeze_sha256,
+                .configuration_sha256 = wide.configuration_sha256,
+                .pressure_policy_sha256 = wide.pressure_policy_sha256,
+                .packed_source_policy_sha256 = wide.packed_source_policy_sha256,
+                .expected_digest = wide.shape_authority_sha256,
+            };
+            var validation_context: @import("../ops/metal_attention_match_validation.zig").Context = .{};
+            const native_device_live = std.math.cast(usize, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_live_bytes) orelse return error.CompactionWorkspaceLimit;
+            const PreparedObserver = struct {
+                request: *NativeCheckpointPrepare,
+                primary: []const engine.ReferenceBatch,
+                geometry: ResidentDomainGeometry,
+                fn write(raw: *anyopaque, final: []const engine.ReferenceBatch, observed_layout: engine.Layout) !void {
+                    const observer: *@This() = @ptrCast(@alignCast(raw));
+                    try validateResidentFinalTrainingDomains(final, observer.primary, observer.request.private_future_training_batches.?, observer.geometry);
+                    var observed_authority = observer.request.future_training_authority orelse return error.InvalidFutureAugmentation;
+                    if (!std.mem.eql(u8, &observed_authority.generation_contract_sha256, &residentFuturePolicyDigest(.e4_formal_32512_256_v1)))
+                        return error.InvalidFutureAugmentation;
+                    try bindResidentFinalDomainDigests(&observed_authority, final, observer.geometry);
+                    var sink = observer.request.prepared_quality_heldout_sink orelse return error.InvalidNativeQualityPublication;
+                    try sink.write(final, observed_authority, observed_layout);
+                    observer.request.future_training_authority = observed_authority;
+                }
+            };
+            var prepared_observer: PreparedObserver = .{ .request = request, .primary = primary, .geometry = residentDomainGeometry(.e4_formal_32512_256_v1) };
+            const source_sink = request.prepared_quality_source_sink;
+            const constructor_binding: @import("../runtime/kv/attention_match_e4_32512_device_constructor.zig").Binding = .{
+                .bridge_binding = .{
+                    .source_length = request.private_collector_source_length,
+                    .repeat_length = request.private_collector_repeat_length,
+                    .source_freeze_sha256 = wide.source_freeze_sha256,
+                    .config_authority_sha256 = wide.configuration_sha256,
+                    .expected_shape_sha256 = wide.shape_authority_sha256,
+                    .collector_required_bytes = request.private_collector_required_bytes,
+                    .collector_manifest_sha256 = request.private_collector_manifest_sha256,
+                    .external_live_bytes = request.private_query_live_bytes,
+                    .actual_native_device_bytes = native_device_live,
+                    .combined_cap = @intCast(wide.combined_cap_bytes),
+                    .reference_summary_cache_policy = .exact_original_train_hho_v1,
+                    .wide_cache_authority = try @import("../runtime/kv/attention_match_native_resident_hybrid_bridge.zig").wideCacheAuthority(tracker, request.prepare_host_owner_identity),
+                    .shape = .{ .e4_32512 = shape_binding },
+                },
+                .engine_options = options,
+                .candidate_device_max_bytes = @intCast(wide.candidate_device_max_bytes),
+                .retained_query_bytes = request.private_query_live_bytes,
+                .maximum_current_head_bytes = @intCast(wide.maximum_head_download_bytes),
+                .source_export_context = if (source_sink) |sink| sink.context else null,
+                .source_export_write_fn = if (source_sink) |sink| sink.write_all_fn else null,
+                .source_export_sha256_out = if (request.prepared_quality_closure_requested) &request.quality_source_sha256 else null,
+                .final_training_context = if (request.prepared_quality_closure_requested) &prepared_observer else null,
+                .final_training_fn = if (request.prepared_quality_closure_requested) PreparedObserver.write else null,
+            };
+            var constructed = try @import("../runtime/kv/attention_match_e4_32512_device_constructor.zig").prepareInstalled(
+                self.allocator,
+                .{
+                    .source_kind = .raw_prefill,
+                    .compute = compute,
+                    .storage = source_storage,
+                    .sequence = source.sequence_id orelse return error.UnsupportedAttentionMatchRoute,
+                    .tracker = tracker,
+                    .identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity,
+                    .tokens = ids,
+                    .logits = logits,
+                    .layer_donors = layer_donors[0..layer_count],
+                    .token_sha256 = actual_prompt_sha256,
+                    .binary_sha256 = request.producer_binary_sha256,
+                    .source_freeze_sha256 = authority.source_freeze_sha256,
+                    .shape_authority_sha256 = authority.shape_authority_sha256,
+                    .owner_identity = request.prepare_host_owner_identity,
+                    .maximum_head_download_bytes = @intCast(wide.maximum_head_download_bytes),
+                    .candidate_device_max_bytes = @intCast(wide.candidate_device_max_bytes),
+                    .constructor = constructor_binding,
+                    .raw_logical_blocks = raw_logical_blocks,
+                    .raw_owner_layers = raw_owner_layers[0..donor_count],
+                },
+                layout,
+                primary,
+                request.private_dense_training.?,
+                request.private_future_training_batches.?,
+                options.fit,
+                @import("../ops/metal_attention_match_validation.zig").backend(&validation_context),
+            );
+            defer constructed.deinit();
+            if (request.prepared_quality_closure_requested and
+                std.mem.allEqual(u8, &request.quality_source_sha256, 0))
+                return error.InvalidNativeQualityPublication;
+            stats.source_global_bytes = constructed.source_global_storage_bytes;
+            stats.candidate_global_bytes = constructed.evidence.candidate_global_bytes;
+            stats.fitted_global_bytes = constructed.evidence.candidate_global_bytes;
+            stats.fitted_global_savings_ratio = constructed.evidence.fitted_global_savings_ratio;
+            stats.actual_global_savings_ratio = constructed.evidence.fitted_global_savings_ratio;
+            if (stats.fitted_global_savings_ratio < request.minimum_savings_ratio)
+                return error.CompactionSavingsInsufficient;
+            const evidence_profile = residentEvidenceProfile(stats, .e4_formal_32512_256_v1, false, request.encoding);
+            const expected_evidence_profile: quality_mod.V18EvidenceProfile = switch (request.encoding) {
+                .f16 => .resident_e4_32512_f16_page_tsqr_v1,
+                .fp8 => .resident_e4_32512_fp8_page_tsqr_v1,
+                .rotated4 => .resident_e4_32512_rotated4_page_tsqr_v1,
+                else => return error.UnqualifiedCompactionArtifact,
+            };
+            if (evidence_profile != expected_evidence_profile)
+                return error.UnqualifiedCompactionArtifact;
+            const transferred = constructed.take();
+            request.result = .{
+                .payload = .{ .device = .{
+                    .allocator = transferred.allocator,
+                    .device = transferred.device,
+                    .metadata = transferred.metadata,
+                    .maximum_head_download_bytes = transferred.maximum_head_download_bytes,
+                } },
+                .source_revision = source_revision,
+                .outcome = .compacted,
+                .stats = stats,
+                .source_host_bytes = transferred.source_census_physical_bytes,
+                .query_ns = query_ns,
+                .snapshot_ns = 0,
+                .fit_ns = mtpProfileElapsedNs(true, self.io, started),
+                .quality_fit_strategy = request.quality_fit_strategy,
+                .v18_evidence_profile = evidence_profile,
+                .v18_evidence_profile_sha256 = quality_mod.v18EvidenceProfileDigest(evidence_profile),
+                .v18_bounded_tsqr_policy_sha256 = quality_mod.boundedTsqrValuePolicyDigest(),
+                .v18_bounded_tsqr_heads = stats.v18_bounded_tsqr_heads,
+                .v18_bounded_tsqr_calls = stats.v18_bounded_tsqr_calls,
+                .v18_bounded_tsqr_workspace_peak_bytes = stats.v18_bounded_tsqr_workspace_peak_bytes,
+                .v18_bounded_tsqr_cancellation_checks = stats.v18_bounded_tsqr_cancellation_checks,
+                .training_policy = request.training_policy,
+                .private_dense512_query_rows = request.private_dense512_query_rows,
+                .private_query_live_bytes = request.private_query_live_bytes,
+                .planned_private_query_bytes = request.private_query_live_bytes,
+                .primary_query_collection = request.primary_query_collection,
+                .dense512_query_collection = request.dense512_query_collection,
+                .query_collection_combined_before_fit_ns = request.query_collection_combined_before_fit_ns,
+                .validation_complete = true,
+                .request_private_publish_complete = true,
+                .future_training_authority = request.future_training_authority,
+                .prompt_tokens_sha256 = request.prepared_quality_prompt_sha256,
+                .prompt_tokens = request.prepared_quality_prompt_tokens,
+                .source_checkpoint_sha256 = request.quality_source_sha256,
+            };
+            return stats;
+        };
         const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
         var original = try self.snapshotAttentionMatchState(ids, logits, source, identity, limits, 2 * 1024 * 1024 * 1024);
         var original_live = true;
         defer if (original_live) original.deinit();
         const source_host_bytes = try original.state.residentBytes();
-        if (comptime builtin.is_test) {
-            if (request.capture_quality_evidence) {
+        if (request.capture_quality_evidence or request.prepared_quality_closure_requested) {
+            if (request.prepared_quality_closure_requested and
+                (request.prepared_quality_prompt_tokens != tokens.len or
+                    std.mem.allEqual(u8, &request.prepared_quality_prompt_sha256, 0)))
+                return error.UnqualifiedCompactionArtifact;
+            if (request.prepared_quality_closure_requested) {
+                var sink = request.prepared_quality_source_sink orelse return error.InvalidNativeQualityPublication;
+                const source_seal = try checkpoint.exportEncoded(original.state, limits, .f16, &sink, control);
+                request.quality_source_sha256 = source_seal.file_sha256;
+            } else if (comptime builtin.is_test) {
                 var sink: AttentionMatchProbeSink = .{};
                 const source_seal = try checkpoint.exportEncoded(original.state, limits, .f16, &sink, control);
                 if (sink.bytes != source_seal.bytes) return error.InvalidNativeQualityPublication;
                 request.quality_source_sha256 = source_seal.file_sha256;
-                request.quality_calibration = try queries.seal(control);
             }
+            if (request.capture_quality_evidence) request.quality_calibration = try queries.seal(control);
         }
         const snapshot_ns = mtpProfileElapsedNs(true, self.io, started);
 
@@ -5854,6 +10641,119 @@ pub const NativeGenerationPipeline = struct {
         for (original.state.donors, 0..) |donor, i| {
             scales[i] = 1.0 / @sqrt(@as(f64, @floatFromInt(donor.heads[0].dim)));
             caps[i] = 0;
+        }
+        if (request.whole_fit_input) |export_binding| {
+            if (comptime !builtin.is_test) return error.UnsupportedWholeFitInputExport;
+            if (!request.capture_quality_evidence or self.io == null or export_binding.output_dir.len == 0 or !std.fs.path.isAbsolute(export_binding.output_dir)) return error.InvalidWholeFitInputBinding;
+            const fit_queries = try queries.finish();
+            const layout: engine.Layout = .{ .query_heads_by_layer = query_heads[0..original.state.layer_donors.len], .scales_by_donor = scales[0..original.state.donors.len], .softcaps_by_donor = caps[0..original.state.donors.len] };
+            var export_options = NativeCheckpointPrepare.fittingOptions();
+            export_options.independent_fp64_publication = true;
+            export_options.min_global_savings_ratio = request.minimum_savings_ratio;
+            export_options.rejected_head_policy = .preserve_original;
+            const source_has_metadata = (try compute.installedAttentionMatchActivity(source_storage, source.sequence_id orelse return error.UnsupportedAttentionMatchRoute)) != null;
+            export_options.source_has_metadata = source_has_metadata;
+            const whole = runtime.kv.attention_match_whole_fit_input;
+            const fit: whole.FitConfig = .{
+                .prefix_rows = export_options.prefix_rows,
+                .recent_rows = export_options.recent_rows,
+                .chunk_rows = export_options.chunk_rows,
+                .retention_divisor = export_options.retention_divisor,
+                .min_retention_divisor = export_options.min_retention_divisor orelse export_options.retention_divisor,
+                .max_relative_mass_error = export_options.fit.max_relative_mass_error,
+                .max_relative_output_rmse = export_options.fit.max_relative_output_rmse,
+                .max_sweeps = export_options.fit.max_sweeps,
+                .nnls_tolerance = export_options.fit.nnls_tolerance,
+                .min_weight = export_options.fit.min_weight,
+                .selection = .residual_omp,
+                .mass_solver = .active_set,
+                .validation = .whole_head,
+                .rejected_head_policy = .preserve_original,
+                .storage_precision = .f16,
+                .independent_fp64_publication = true,
+            };
+            const config_json = try std.json.Stringify.valueAlloc(self.allocator, .{ .schema = "antfly.attention-match-whole-fit-config.v1", .fit = fit, .query_samples = export_binding.samples, .method = @tagName(export_binding.method) }, .{});
+            defer self.allocator.free(config_json);
+            var config_sha256: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(config_json, &config_sha256, .{});
+            var writer = try whole.Writer.init(self.allocator, self.io.?, .{ .output_dir = export_binding.output_dir, .identity = identity, .config_sha256 = config_sha256, .source_freeze_sha256 = export_binding.source_freeze_sha256, .binary_sha256 = export_binding.binary_sha256, .exporter_sha256 = export_binding.exporter_sha256, .limits = limits });
+            const original_global_device_bytes = try engine.globalStorageBytes(original.state, .f16, source_has_metadata);
+            const result = try writer.write(.{ .source = original.state, .batches = fit_queries, .layout = layout, .query_samples = export_binding.samples, .method = export_binding.method, .fit = fit, .source_has_metadata = source_has_metadata, .original_global_device_bytes = original_global_device_bytes, .control = control });
+            std.debug.print("attention_match_whole_fit_input committed=1 diagnostic_only=1 quality_credit=0 bytes={d} checkpoint_bytes={d}\n", .{ result.required_bytes, result.checkpoint_bytes });
+            if (request.future_mix_output_dir) |future_output_dir| {
+                const authority = request.future_training_authority orelse return error.InvalidFutureAugmentation;
+                const evidence = request.future_training_capture orelse return error.InvalidFutureAugmentation;
+                const merged_batches = request.private_training_batches orelse return error.InvalidFutureAugmentation;
+                const parent_manifest_path = try std.fs.path.join(self.allocator, &.{ export_binding.output_dir, "manifest.json" });
+                defer self.allocator.free(parent_manifest_path);
+                const parent_manifest = try std.Io.Dir.cwd().readFileAlloc(self.io.?, parent_manifest_path, self.allocator, .limited(64 * 1024));
+                defer self.allocator.free(parent_manifest);
+                var parent_manifest_sha256: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(parent_manifest, &parent_manifest_sha256, .{});
+                const exported = try runtime.kv.attention_match_future_augmentation.writeComplete(self.allocator, self.io.?, .{ .output_dir = future_output_dir, .primary_parent_manifest_sha256 = parent_manifest_sha256, .identity = identity, .source_freeze_sha256 = export_binding.source_freeze_sha256, .binary_sha256 = export_binding.binary_sha256, .exporter_sha256 = export_binding.exporter_sha256 }, .{ .capture = evidence, .authority = authority, .batches = merged_batches, .consumers = queries.consumers, .source_length = evidence.source_before.logical_tokens, .control = control, .historical_study_tokens_sha256 = request.future_historical_study_tokens_sha256 });
+                std.debug.print("attention_match_complete_future_mix committed=1 diagnostic_only=1 quality_credit=0 primary=256 historical=256 future=256 heldout=64 manifest_sha256={s} historical_manifest_sha256={s} future_manifest_sha256={s}\n", .{ std.fmt.bytesToHex(exported.manifest_sha256, .lower), std.fmt.bytesToHex(exported.historical_manifest_sha256, .lower), std.fmt.bytesToHex(exported.future_manifest_sha256, .lower) });
+            }
+            if (export_binding.augmentation_output_dir) |augmentation_dir| {
+                const augmentation_module = runtime.kv.attention_match_training_augmentation;
+                const parent_manifest_path = try std.fs.path.join(self.allocator, &.{ export_binding.output_dir, "manifest.json" });
+                defer self.allocator.free(parent_manifest_path);
+                const parent_manifest = try std.Io.Dir.cwd().readFileAlloc(self.io.?, parent_manifest_path, self.allocator, .limited(64 * 1024));
+                defer self.allocator.free(parent_manifest);
+                var parent_manifest_sha256: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(parent_manifest, &parent_manifest_sha256, .{});
+                const parent_study_tokens = try runtime.kv.attention_match_queries.studyTokensPass(self.allocator, tokens, NativeCheckpointPrepare.max_repeat_tokens, 0);
+                defer self.allocator.free(parent_study_tokens);
+                const augmentation_study_tokens = if (export_binding.self_study == null and export_binding.reference_coverage == null) try runtime.kv.attention_match_queries.studyTokensPass(self.allocator, tokens, NativeCheckpointPrepare.max_repeat_tokens, 1) else null;
+                defer if (augmentation_study_tokens) |owned| self.allocator.free(owned);
+                var parent_study_tokens_sha256: [32]u8 = undefined;
+                var study_tokens_sha256: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(parent_study_tokens), &parent_study_tokens_sha256, .{});
+                if (export_binding.self_study) |capture| study_tokens_sha256 = capture.complete_repeat_sha256 else if (export_binding.reference_coverage) |capture| study_tokens_sha256 = capture.selection.repeat_sha256 else std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(augmentation_study_tokens.?), &study_tokens_sha256, .{});
+                if (std.mem.eql(u8, &parent_study_tokens_sha256, &study_tokens_sha256)) return error.InvalidTrainingAugmentation;
+                const second = if (export_binding.self_study) |capture| &capture.queries else if (export_binding.reference_coverage) |capture| &capture.queries else if (augmentation_queries) |*owned| owned else return error.InvalidTrainingAugmentation;
+                const second_split = try second.finish();
+                const dense_reference = if (export_binding.reference_coverage) |capture| capture.policy == .dense512 else false;
+                var training = if (dense_reference)
+                    try augmentation_module.mergeReferenceCoverageDense512(self.allocator, second_split)
+                else
+                    try augmentation_module.mergeCollectorBatchesExact(self.allocator, second_split, export_binding.augmentation_samples);
+                defer training.deinit();
+                const self_study_output = export_binding.self_study;
+                const reference_coverage_output = export_binding.reference_coverage;
+                const has_outer = self_study_output != null or reference_coverage_output != null;
+                const nested_augmentation_dir = if (has_outer) try std.fs.path.join(self.allocator, &.{ augmentation_dir, "training" }) else try self.allocator.dupe(u8, augmentation_dir);
+                defer self.allocator.free(nested_augmentation_dir);
+                if (has_outer) try std.Io.Dir.createDirAbsolute(self.io.?, augmentation_dir, std.Io.File.Permissions.fromMode(0o700));
+                const nested_binding: augmentation_module.Binding = .{
+                    .output_dir = nested_augmentation_dir,
+                    .max_bytes = if (has_outer) runtime.kv.attention_match_self_study_training.maximum_bytes - 64 * 1024 else augmentation_module.maximum_bytes,
+                    .parent_manifest_sha256 = parent_manifest_sha256,
+                    .identity = identity,
+                    .source_freeze_sha256 = export_binding.source_freeze_sha256,
+                    .binary_sha256 = export_binding.binary_sha256,
+                    .exporter_sha256 = export_binding.exporter_sha256,
+                    .parent_study_tokens_sha256 = parent_study_tokens_sha256,
+                    .study_tokens_sha256 = study_tokens_sha256,
+                    .samples_per_stratum = export_binding.augmentation_samples,
+                };
+                const nested_view: augmentation_module.View = .{ .batches = training.batches, .consumers = second.consumers, .source_length = second.source_length, .repeat_length = second.repeat_length, .samples_per_stratum = export_binding.augmentation_samples, .parent_study_tokens_sha256 = parent_study_tokens_sha256, .study_tokens_sha256 = study_tokens_sha256 };
+                const augmentation_result = if (dense_reference)
+                    try runtime.kv.attention_match_reference_coverage_training.writeNestedDense512(self.allocator, self.io.?, nested_binding, nested_view)
+                else
+                    try augmentation_module.write(self.allocator, self.io.?, nested_binding, nested_view);
+                std.debug.print("attention_match_training_augmentation committed=1 diagnostic_only=1 quality_credit=0 bytes={d} study_pass=1 samples_per_stratum={d} manifest_sha256={s}\n", .{ augmentation_result.required_bytes, export_binding.augmentation_samples, std.fmt.bytesToHex(augmentation_result.manifest_sha256, .lower) });
+                if (self_study_output) |capture| {
+                    const outer = try runtime.kv.attention_match_self_study_training.writeProvenance(self.allocator, self.io.?, .{ .output_dir = augmentation_dir, .primary_parent_manifest_sha256 = capture.primary_parent_manifest_sha256, .source_freeze_sha256 = export_binding.source_freeze_sha256, .binary_sha256 = export_binding.binary_sha256, .exporter_sha256 = export_binding.exporter_sha256 }, .{ .before = capture.source_before, .after = capture.source_after, .study = .{ .kind = .fit, .prompt_tokens = capture.prompt_tokens, .prompt_tokens_sha256 = capture.prompt_tokens_sha256, .rendered_suffix_sha256 = capture.rendered_suffix_sha256, .generation_contract_sha256 = capture.generation_contract_sha256, .generated_ids = capture.generated_ids, .generated_ids_sha256 = capture.generated_ids_sha256, .complete_repeat_sha256 = capture.complete_repeat_sha256 }, .batches = second_split, .consumers = second.consumers }, augmentation_result.manifest_sha256, augmentation_result.required_bytes);
+                    std.debug.print("attention_match_self_study_training committed=1 diagnostic_only=1 quality_credit=0 query_bytes={d} manifest_sha256={s}\n", .{ outer.query_bytes, std.fmt.bytesToHex(outer.manifest_sha256, .lower) });
+                } else if (reference_coverage_output) |capture| {
+                    const outer = try runtime.kv.attention_match_reference_coverage_training.writeProvenance(self.allocator, self.io.?, .{ .output_dir = augmentation_dir, .retained_primary_manifest_sha256 = capture.primary_parent_manifest_sha256, .source_freeze_sha256 = export_binding.source_freeze_sha256, .binary_sha256 = export_binding.binary_sha256, .exporter_sha256 = export_binding.exporter_sha256 }, .{ .before = capture.source_before, .after = capture.source_after, .source_tokens = tokens, .selection = &capture.selection, .batches = second_split, .consumers = second.consumers, .policy = switch (capture.policy) {
+                        .coverage320 => .coverage320,
+                        .dense512 => .dense512,
+                    } }, augmentation_result.manifest_sha256, augmentation_result.required_bytes, control);
+                    std.debug.print("attention_match_reference_coverage_training committed=1 diagnostic_only=1 quality_credit=0 query_bytes={d} manifest_sha256={s}\n", .{ outer.query_bytes, std.fmt.bytesToHex(outer.manifest_sha256, .lower) });
+                }
+            }
+            return error.WholeFitInputExported;
         }
         const fit_started = mtpProfileTimestamp(true, self.io);
         const fit_host_bytes = request.planned_fit_host_bytes orelse return error.InvalidNativeCheckpointRequest;
@@ -5892,11 +10792,44 @@ pub const NativeGenerationPipeline = struct {
                     fit_host_bytes,
                     head_workspace_bytes,
                 );
+                if (request.quality_fit_strategy == .identity_chunk_coefficients_adaptive_v18) try fitter.setQueryBatchRows(64);
                 metal_fitter_count += 1;
                 backend.* = fitter.backend();
             }
         }
-        var options = NativeCheckpointPrepare.fittingOptions();
+        var options = NativeCheckpointPrepare.fittingOptionsForQualityPolicy(request.admission, request.chunk_rows, request.reject_exact_active_fixed_point);
+        var final_wide_cache_authority: ?@import("../runtime/kv/attention_match_wide_cache_authority.zig").Authority = null;
+        var physical_budget_context: @import("../runtime/kv/attention_match_joint_adaptive_quality.zig").PhysicalBudgetContext = .{};
+        var planned_exact_context: @import("../runtime/kv/attention_match_planned_exact_context.zig").Context = .{ .enabled = false, .donor_layer = 0, .head_index = 0 };
+        options.fit_strategy = switch (request.quality_fit_strategy) {
+            .legacy => .legacy,
+            .identity_chunk_coefficients_adaptive_v18 => .identity_chunk_coefficients_adaptive_v18,
+        };
+        options.staged_operator_strategy = request.staged_operator_strategy;
+        if (isPrivateAdaptiveTraining(request.training_policy)) {
+            // Primary 320 splits into 256 TRAIN / 64 heldout. The independent
+            // Dense512 domain is converted wholly to TRAIN, yielding 768
+            // training rows while the original 64 heldout rows stay unchanged.
+            options.max_queries_per_consumer = 768;
+        }
+        if (request.quality_fit_strategy == .identity_chunk_coefficients_adaptive_v18) {
+            options.adaptive_v18_fn = @import("../runtime/kv/attention_match_joint_adaptive_quality.zig").engineCallback;
+            options.adaptive_v18_context = null;
+            options.adaptive_v18_numerical_policy = if (isPrivateAdaptiveTraining(request.training_policy))
+                .accepted_f32_gram_reuse_v1
+            else
+                .legacy_dense_f64;
+            if (isPrivateAdaptiveTraining(request.training_policy)) {
+                // The 8K route remains flat/per-query-Gram. Heads whose 256-row
+                // range bank exceeds the 96-candidate Gram authority switch to
+                // the predeclared 32K page-backed route and fail closed.
+                options.adaptive_v18_geometry_route = .bounded_page_over_96;
+                options.adaptive_v18_bounded_tile_queries = if (request.bounded_delta_accelerated) 64 else 8;
+                options.adaptive_v18_bounded_builder_transient_bytes = 256 * 1024 * 1024;
+                options.adaptive_v18_bounded_delta_accelerated = request.bounded_delta_accelerated;
+                options.adaptive_v18_bounded_tsqr_value_backend = request.private_bounded_tsqr_value_backend;
+            }
+        }
         options.independent_fp64_publication = true;
         options.fp8_checkpoint = request.encoding == .fp8;
         options.rotated4_checkpoint = request.encoding == .rotated4;
@@ -5912,21 +10845,340 @@ pub const NativeGenerationPipeline = struct {
             source.sequence_id orelse return error.UnsupportedAttentionMatchRoute,
         )) != null;
         options.source_has_metadata = source_has_metadata;
+        if (request.staged_operator_strategy and
+            isPrivateAdaptiveTraining(request.training_policy) and
+            request.encoding == .rotated4 and !source_has_metadata)
+        {
+            options.rotated4_risk_retention = .half_v2;
+            std.log.info("attention_match_private_rotated4_risk_retention retention=half_v2 fresh=1 staged=1", .{});
+        }
+        var flat_candidate_count: usize = 0;
+        if (isPrivateAdaptiveTraining(request.training_policy) and !source_has_metadata) {
+            // The sealed private profile requires the same physical geometry
+            // budget for every fresh encoding. Codec quality and post-codec
+            // physical publication remain independent gates. Later metadata
+            // cycles and >96-candidate heads retain the established route.
+            var budget_rows: usize = 0;
+            var budget_dim: usize = 0;
+            var budget_heads: usize = 0;
+            var uniform = true;
+            const fixed = try std.math.add(usize, options.prefix_rows, options.recent_rows);
+            const physical_budget = @import("../runtime/kv/attention_match_physical_budget.zig");
+            for (original.state.donors) |donor| if (donor.window == 0) for (donor.heads) |head| {
+                if (!physical_budget.freshContiguousHead(head)) uniform = false;
+                if ((budget_rows != 0 and budget_rows != head.positions.len) or (budget_dim != 0 and budget_dim != head.dim)) uniform = false;
+                const head_plan = (try engine.headPlan(original.state.logical_length, head, options)) orelse {
+                    uniform = false;
+                    continue;
+                };
+                if (head_plan.old_rows != head.positions.len - options.recent_rows or head_plan.prefix_rows != options.prefix_rows) uniform = false;
+                const fit_ranges = try engine.headFitRanges(self.allocator, head, head_plan, 256);
+                defer self.allocator.free(fit_ranges);
+                const candidates = try std.math.mul(usize, fit_ranges.len, 3);
+                if (flat_candidate_count != 0 and flat_candidate_count != candidates) uniform = false;
+                budget_rows = head.positions.len;
+                budget_dim = head.dim;
+                budget_heads = try std.math.add(usize, budget_heads, 1);
+                flat_candidate_count = candidates;
+            };
+            if (uniform and physical_budget.eligibleFreshPhysicalEncoding(request.encoding, source_has_metadata, flat_candidate_count)) {
+                if (try physical_budget.deriveUniformIfFeasible(budget_rows, budget_dim, budget_heads, fixed, 3)) |physical| {
+                    options.adaptive_v18_primary_budget_percent = physical.primary_percent;
+                    options.adaptive_v18_fallback_budget_percent = physical.fallback_percent;
+                    options.adaptive_v18_max_budget_fallbacks = physical.maximum_fallbacks;
+                    options.adaptive_v18_context = &physical_budget_context;
+                }
+            }
+        }
+        if (request.private_capture_summary) {
+            if (!isPrivateAdaptiveTraining(request.training_policy) or source_has_metadata or
+                flat_candidate_count == 0 or flat_candidate_count > 96)
+                return error.InvalidFitConfig;
+            options.adaptive_v18_geometry_route = .flat_gram_only;
+            options.independent_validation_policy = .accelerate_fp64_summary_v1;
+            options.private_performance_policy = if (request.private_capture_gram_batch256_diagnostic)
+                .diagnostic_capture_gram_batch256_v1
+            else if (request.private_training_reduction)
+                .owned_capture_summary_incremental_reduction_v1
+            else if (request.private_incremental_budget)
+                .owned_capture_summary_incremental_v1
+            else
+                .owned_capture_summary_v1;
+            options.geometry_chooser_policy = if (request.private_incremental_budget) .incremental_gram_v1 else .legacy_full_scan;
+        } else if (request.private_incremental_budget) {
+            return error.InvalidFitConfig;
+        }
+        if (request.training_policy == .private_train_challenge_hybrid_resident_v1) {
+            const fit_resident_cohort: ResidentHybridCohort = request.resident_hybrid_authority.?.cohort;
+            if (source_has_metadata or flat_candidate_count == 0 or
+                (fit_resident_cohort == .e4_8128_v1 and flat_candidate_count > 96) or
+                head_workspace_bytes != 2 * 1024 * 1024 * 1024 or fit_workers != 1)
+                return error.InvalidFitConfig;
+            options.adaptive_v18_geometry_route = residentHybridGeometryRoute(fit_resident_cohort);
+            options.adaptive_v18_numerical_policy = .accepted_f32_gram_reuse_v1;
+            options.adaptive_v18_critical_core_policy = .train_probability_gte_0_025_no_top1_v1;
+            options.adaptive_v18_postfit_policy = .train_global_residual_range_mass_l2_exact_f32_cache_v1;
+            options.geometry_chooser_policy = .incremental_gram_v1;
+            options.independent_validation_policy = .accelerate_fp64_summary_v1;
+            options.private_performance_policy = if (request.private_capture_gram_batch256_diagnostic)
+                .diagnostic_capture_gram_batch256_v1
+            else
+                .owned_capture_summary_incremental_reduction_critical025_v1;
+            options.max_queries_per_consumer = 768;
+            // Each typed cohort owns a distinct fixed physical policy. Never
+            // derive E2 from the E4 generic 8128 proposal.
+            options.adaptive_v18_primary_budget_percent = if (fit_resident_cohort == .e2_8128_v1) 60 else 91;
+            options.adaptive_v18_fallback_budget_percent = if (fit_resident_cohort == .e2_8128_v1) 0 else 95;
+            options.adaptive_v18_max_budget_fallbacks = if (fit_resident_cohort == .e2_8128_v1) 0 else 3;
+            options.adaptive_v18_workspace_profile = if (fit_resident_cohort == .e2_8128_v1)
+                .resident_e2_formal_2g_p60_no_fallback_v1
+            else
+                .resident_native_hybrid_2g_v1;
+            options.adaptive_v18_bounded_score_policy = if (platform.env.getenvBoolDefault("ANTFLY_METAL_ATTENTION_MATCH_ACCELERATE_BOUNDED_SCORE", false))
+                .accelerate_fp64_tiled_v1
+            else
+                .scalar_reference;
+            options.fit.max_workspace_bytes = @import("../runtime/kv/attention_match_resident_native_hybrid_profile.zig").head_workspace_bytes;
+        }
+        if (isPrivateAdaptiveTraining(request.training_policy) and
+            options.fit_strategy == .identity_chunk_coefficients_adaptive_v18 and
+            options.private_performance_policy == .legacy and !options.component_ab_diagnostic)
+        {
+            // This prospective algorithm is bound by the staged profile's
+            // exact compiled implementation and source archive. Performance
+            // diagnostic tuples preserve their explicitly selected algorithm.
+            options.adaptive_v18_critical_core_policy = .train_probability_gte_0_025_no_top1_v1;
+        }
+        const rejected_fixture = @import("../runtime/kv/attention_match_rejected_fixture.zig");
+        var rejected_head_binding: ?rejected_fixture.Binding = null;
+        var rejected_head_writer: ?rejected_fixture.Writer = null;
+        defer if (rejected_head_writer) |*writer| writer.deinit();
+        if (comptime builtin.is_test) if (request.capture_quality_evidence) {
+            if (platform.env.getenv("ANTFLY_METAL_QUALITY_REJECTED_HEAD_FIXTURE_DIR")) |output_dir| {
+                if (self.io == null or output_dir.len == 0 or !std.fs.path.isAbsolute(output_dir))
+                    return error.InvalidRejectedHeadFixtureBinding;
+                const config_json = try std.json.Stringify.valueAlloc(self.allocator, .{
+                    .schema = "antfly.source61-rejected-head-fit-config.v1",
+                    .logical_length = original.state.logical_length,
+                    .prefix_rows = options.prefix_rows,
+                    .recent_rows = options.recent_rows,
+                    .chunk_rows = options.chunk_rows,
+                    .retention_divisor = options.retention_divisor,
+                    .minimum_retention_divisor = options.min_retention_divisor,
+                    .storage_precision = @tagName(options.storage_precision),
+                    .validation = @tagName(options.validation),
+                    .selection = @tagName(options.fit.selection),
+                    .mass_solver = @tagName(options.fit.mass_solver),
+                    .max_sweeps = options.fit.max_sweeps,
+                    .nnls_tolerance = options.fit.nnls_tolerance,
+                    .ridge = options.fit.ridge,
+                    .min_weight = options.fit.min_weight,
+                    .max_relative_mass_error = options.fit.max_relative_mass_error,
+                    .max_relative_output_rmse = options.fit.max_relative_output_rmse,
+                    .independent_fp64_publication = options.independent_fp64_publication,
+                }, .{});
+                defer self.allocator.free(config_json);
+                var config_sha256: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(config_json, &config_sha256, .{});
+                rejected_head_binding = .{ .output_dir = output_dir, .identity = identity, .config_sha256 = config_sha256 };
+                rejected_head_writer = try rejected_fixture.Writer.init(
+                    self.allocator,
+                    self.io.?,
+                    rejected_head_binding.?,
+                );
+                options.rejected_head_capture = rejected_head_writer.?.callback();
+            }
+        };
         const layout: engine.Layout = .{
             .query_heads_by_layer = query_heads[0..original.state.layer_donors.len],
             .scales_by_donor = scales[0..original.state.donors.len],
             .softcaps_by_donor = caps[0..original.state.donors.len],
         };
-        const fit_queries = try queries.finish();
+        var resident_hybrid: ?@import("../runtime/kv/attention_match_native_resident_hybrid_bridge.zig").Result = null;
+        defer if (resident_hybrid) |*owned| owned.deinit();
+        var resident_hybrid_e2: ?@import("../runtime/kv/attention_match_e2_native_resident_hybrid_bridge.zig").Result = null;
+        defer if (resident_hybrid_e2) |*owned| owned.deinit();
+        var resident_validation_context: @import("../ops/metal_attention_match_validation.zig").Context = .{};
+        const live_resident_cohort: ResidentHybridCohort = if (request.resident_hybrid_authority) |authority| authority.cohort else .e4_8128_v1;
+        const live_resident_geometry = residentDomainGeometry(live_resident_cohort);
+        if (request.training_policy == .private_train_challenge_hybrid_resident_v1) {
+            if (source_has_metadata or metal_fitter_count != 1 or head_workspace_bytes != 2 * 1024 * 1024 * 1024 or
+                request.private_dense_training == null or request.private_future_training_batches == null or options.fit.backend == null or
+                request.private_collector_source_length == 0 or request.private_collector_repeat_length == 0 or
+                request.private_collector_required_bytes == 0 or std.mem.allEqual(u8, &request.private_collector_manifest_sha256, 0) or
+                request.resident_hybrid_authority == null)
+                return error.InvalidNativeCheckpointRequest;
+            try request.resident_hybrid_authority.?.validate();
+            const primary_batches = try queries.finish();
+            const retained = try std.math.add(usize, source_host_bytes, request.private_query_live_bytes);
+            const native_device_live = std.math.cast(usize, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_live_bytes) orelse
+                return error.CompactionWorkspaceLimit;
+            if (live_resident_cohort == .e4_8128_v1 or live_resident_cohort == .e4_formal_7936_256_v1) {
+                const resident_profile = @import("../runtime/kv/attention_match_resident_native_hybrid_profile.zig");
+                const admission: resident_profile.Admission = .{
+                    .retained_host_source_bytes = source_host_bytes,
+                    .retained_native_device_bytes = native_device_live,
+                    .dense_backing_bytes = 0,
+                    .request_owner_bytes = request.private_query_live_bytes,
+                    .maximum_head_clone_bytes = 0,
+                    .fitter_workspace_bytes = options.fit.max_workspace_bytes,
+                };
+                try admission.validate();
+                if (try admission.fitWorkers() != 1) return error.CompactionWorkspaceLimit;
+                const bridge = @import("../runtime/kv/attention_match_native_resident_hybrid_bridge.zig");
+                final_wide_cache_authority = try residentWideCacheAuthority(
+                    request.prepare_host_owner_profile,
+                    source_storage.ownerAllocationTracker(),
+                    request.prepare_host_owner_identity,
+                );
+                options.adaptive_v18_wide_cache_authority = if (final_wide_cache_authority != null) &final_wide_cache_authority.? else null;
+                resident_hybrid = try bridge.prepare(
+                    self.allocator,
+                    original.state,
+                    layout,
+                    primary_batches,
+                    request.private_dense_training.?,
+                    request.private_future_training_batches.?,
+                    options.fit,
+                    @import("../ops/metal_attention_match_validation.zig").backend(&resident_validation_context),
+                    .{
+                        .source_length = request.private_collector_source_length,
+                        .repeat_length = request.private_collector_repeat_length,
+                        .source_freeze_sha256 = request.resident_hybrid_authority.?.source_freeze_sha256,
+                        .config_authority_sha256 = request.resident_hybrid_authority.?.configuration_sha256,
+                        .expected_shape_sha256 = request.resident_hybrid_authority.?.shape_authority_sha256,
+                        .collector_required_bytes = request.private_collector_required_bytes,
+                        .collector_manifest_sha256 = request.private_collector_manifest_sha256,
+                        .external_live_bytes = retained,
+                        .actual_native_device_bytes = native_device_live,
+                        .combined_cap = options.fit.max_workspace_bytes,
+                        .diagnostic_query_batch_rows = if (request.private_capture_gram_batch256_diagnostic) 256 else 64,
+                        .accelerate_bounded_score = platform.env.getenvBoolDefault("ANTFLY_METAL_ATTENTION_MATCH_ACCELERATE_BOUNDED_SCORE", false),
+                        .wide_cache_authority = final_wide_cache_authority,
+                        .shape = if (live_resident_cohort == .e4_formal_7936_256_v1) blk: {
+                            const formal = request.resident_hybrid_authority.?.e4_formal_authority orelse return error.UnqualifiedCompactionArtifact;
+                            var flat = @import("../runtime/kv/attention_match_flat_shape_authority.zig").Shape.sealed7936(formal.source_freeze_sha256);
+                            flat.source_rows = formal.shape.source_rows;
+                            break :blk .{ .flat = flat };
+                        } else null,
+                    },
+                );
+            } else {
+                const e2_shape = @import("../runtime/kv/attention_match_e2_flat_shape_authority.zig");
+                const e2_profile = @import("../runtime/kv/attention_match_e2_resident_authority.zig");
+                if (!e2GuardedDevelopmentTrial(request.resident_hybrid_authority.?)) return error.CompactionWorkspaceLimit;
+                const shape: e2_shape.Shape = .{ .source_rows = request.resident_hybrid_authority.?.e2_fit_source_rows, .authority_sha256 = request.resident_hybrid_authority.?.source_freeze_sha256 };
+                const shape_binding: @import("../runtime/kv/attention_match_e2_flat8128_pressure_profile.zig").Binding = .{
+                    .shape = shape,
+                    .expected_shape_sha256 = request.resident_hybrid_authority.?.shape_authority_sha256,
+                };
+                const bridge = @import("../runtime/kv/attention_match_e2_native_resident_hybrid_bridge.zig");
+                try (e2_profile.Admission{
+                    .shape_binding = shape_binding,
+                    .retained_host_bytes = source_host_bytes,
+                    .retained_device_bytes = native_device_live,
+                    .request_owner_bytes = request.private_query_live_bytes,
+                    .maximum_head_clone_bytes = try bridge.denseCloneBytes(request.private_dense_training.?, request.private_collector_source_length, request.private_collector_repeat_length),
+                    .fitter_workspace_bytes = options.fit.max_workspace_bytes,
+                }).validate();
+                var current_raw_owned: ?backends.metal_kv_storage.MetalKvStorage.QualificationInventoryOwned = null;
+                defer if (current_raw_owned) |*owned| owned.deinit();
+                var current_raw_entries: [gpt_mod.max_attention_layers]@import("../runtime/kv/attention_match_e2_formal_owner_inventory.zig").RawEntry = undefined;
+                var current_raw_inventory: ?@import("../runtime/kv/attention_match_e2_formal_owner_inventory.zig").RawInventory = null;
+                if (shape.source_rows != 8_128) {
+                    var raw_token_sha256: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(ids), &raw_token_sha256, .{});
+                    current_raw_owned = try source.ordinaryExactInventory(self.allocator, shape.source_rows, runtime.context_policy.Layout.init(self.gpt_config) catch return error.NativeCoverageShapeUnsupported, .{
+                        .token_sha256 = raw_token_sha256,
+                        .shape_sha256 = request.resident_hybrid_authority.?.shape_authority_sha256,
+                        .binary_sha256 = request.producer_binary_sha256,
+                        .source_freeze_sha256 = request.resident_hybrid_authority.?.source_freeze_sha256,
+                    });
+                    const owned = &current_raw_owned.?;
+                    if (owned.entries.len > current_raw_entries.len) return error.NativeCoverageShapeUnsupported;
+                    for (owned.entries, current_raw_entries[0..owned.entries.len]) |entry, *out| out.* = .{ .layer = entry.layer, .window = entry.window, .rows = entry.rows, .capacity_rows = entry.capacity_rows, .kv_heads = entry.kv_heads, .head_dim = entry.head_dim, .key_row_bytes = entry.key_row_bytes, .value_row_bytes = entry.value_row_bytes, .key_capacity_bytes = entry.key_capacity_bytes, .value_capacity_bytes = entry.value_capacity_bytes, .installed_physical_bytes = entry.installed_physical_bytes };
+                    current_raw_inventory = .{ .context_instance_id = owned.context_instance_id, .sequence_id = owned.sequence_id, .source_revision = owned.source_revision, .logical_tokens = owned.logical_tokens, .entries = current_raw_entries[0..owned.entries.len], .installed_physical_bytes = owned.installed_physical_bytes, .descriptor_sha256 = owned.descriptor_sha256 };
+                }
+                resident_hybrid_e2 = try bridge.prepare(
+                    self.allocator,
+                    original.state,
+                    layout,
+                    primary_batches,
+                    request.private_dense_training.?,
+                    request.private_future_training_batches.?,
+                    options.fit,
+                    @import("../ops/metal_attention_match_validation.zig").backend(&resident_validation_context),
+                    .{
+                        .expected_source_rows = request.resident_hybrid_authority.?.e2_fit_source_rows,
+                        .formal_owner_inventory_sha256 = request.resident_hybrid_authority.?.e2_formal_owner_inventory_sha256,
+                        .formal_owner_inventory = request.resident_hybrid_authority.?.e2_formal_owner_inventory,
+                        .current_raw_inventory = current_raw_inventory,
+                        .current_hardware_sha256 = if (shape.source_rows == 8_128) @splat(0) else (try metal_runtime.nativeCheckpointDestination()).fingerprint(),
+                        .source_length = request.private_collector_source_length,
+                        .repeat_length = request.private_collector_repeat_length,
+                        .source_freeze_sha256 = request.resident_hybrid_authority.?.source_freeze_sha256,
+                        .config_authority_sha256 = request.resident_hybrid_authority.?.configuration_sha256,
+                        .expected_shape_sha256 = request.resident_hybrid_authority.?.shape_authority_sha256,
+                        .collector_required_bytes = request.private_collector_required_bytes,
+                        .collector_manifest_sha256 = request.private_collector_manifest_sha256,
+                        .external_live_bytes = retained,
+                        .actual_native_device_bytes = native_device_live,
+                        .combined_cap = options.fit.max_workspace_bytes,
+                        .diagnostic_query_batch_rows = if (request.private_capture_gram_batch256_diagnostic) 256 else 64,
+                    },
+                );
+            }
+            const final_batches = if (resident_hybrid) |*owned| owned.final_training.batches else resident_hybrid_e2.?.final_training.batches;
+            try validateResidentFinalTrainingDomains(
+                final_batches,
+                primary_batches,
+                request.private_future_training_batches.?,
+                live_resident_geometry,
+            );
+            var resident_future_authority = request.future_training_authority orelse return error.InvalidFutureAugmentation;
+            if (!std.mem.eql(
+                u8,
+                &resident_future_authority.generation_contract_sha256,
+                &residentFuturePolicyDigest(live_resident_cohort),
+            )) return error.InvalidFutureAugmentation;
+            try bindResidentFinalDomainDigests(&resident_future_authority, final_batches, live_resident_geometry);
+            if (request.prepared_quality_closure_requested) {
+                var sink = request.prepared_quality_heldout_sink orelse return error.InvalidNativeQualityPublication;
+                try sink.write(final_batches, resident_future_authority, layout);
+            }
+            request.future_training_authority = resident_future_authority;
+            planned_exact_context.enabled = true;
+            planned_exact_context.donor_layer = if (resident_hybrid) |owned| owned.planned_exact_donor_layer else resident_hybrid_e2.?.planned_exact_donor_layer;
+            planned_exact_context.head_index = if (resident_hybrid) |owned| owned.planned_exact_head_index else resident_hybrid_e2.?.planned_exact_head_index;
+            options.adaptive_v18_fn = @import("../runtime/kv/attention_match_planned_exact_context.zig").Context.callback;
+            options.adaptive_v18_context = &planned_exact_context;
+            options.adaptive_v18_primary_budget_percent = if (live_resident_cohort == .e2_8128_v1) 60 else 91;
+            options.adaptive_v18_fallback_budget_percent = if (live_resident_cohort == .e2_8128_v1) 0 else 95;
+            options.adaptive_v18_max_budget_fallbacks = if (live_resident_cohort == .e2_8128_v1) 0 else 3;
+        }
+        const fit_queries = if (resident_hybrid) |*owned| owned.final_training.batches else if (resident_hybrid_e2) |*owned| owned.final_training.batches else request.private_training_batches orelse try queries.finish();
+        if (request.prepare_host_owner_profile != .none) {
+            if (metal_fitter_count != 1) return error.InvalidBoundedPrepareOwner;
+            const tracker = source_storage.ownerAllocationTracker() orelse return error.InvalidBoundedPrepareOwner;
+            try tracker.verifyBoundedPrepare(request.prepare_host_owner_identity);
+            if (self.allocator.ptr != @as(*anyopaque, @ptrCast(tracker))) return error.InvalidBoundedPrepareOwner;
+        }
         phase = "fit";
         var candidate = (if (metal_fitter_count > 1)
             engine.prepareParallel(original.state, fit_queries, layout, options, fit_backends[0..metal_fitter_count])
         else
             engine.prepare(self.allocator, original.state, fit_queries, layout, options)) catch |err| {
             if (err == error.CompactionSavingsInsufficient) {
+                if (rejected_head_writer) |*writer| {
+                    const fixture = try writer.finish();
+                    if (!fixture.committed or fixture.required_bytes == 0)
+                        return error.InvalidRejectedHeadFixture;
+                    std.debug.print("attention_match_rejected_head_fixture committed=1 diagnostic_only=1 quality_credit=0 bytes={d}\n", .{fixture.required_bytes});
+                }
                 try control.check();
                 request.result = .{
-                    .checkpoint = original,
+                    .payload = .{ .host = original },
+                    .source_revision = source_revision,
                     .outcome = .unchanged_insufficient_savings,
                     .stats = stats,
                     .source_host_bytes = source_host_bytes,
@@ -5940,6 +11192,15 @@ pub const NativeGenerationPipeline = struct {
             std.log.err("attention_match_fit_error backend=metal error={s}", .{@errorName(err)});
             return err;
         };
+        if (request.training_policy == .private_train_challenge_hybrid_resident_v1) {
+            stats.v18_planned_exact_heads = planned_exact_context.planned_exact_heads.load(.acquire);
+        }
+        if (rejected_head_writer) |*writer| {
+            const fixture = try writer.finish();
+            if (!fixture.committed or fixture.required_bytes == 0)
+                return error.InvalidRejectedHeadFixture;
+            std.debug.print("attention_match_rejected_head_fixture committed=1 diagnostic_only=1 quality_credit=0 bytes={d}\n", .{fixture.required_bytes});
+        }
         // All Metal calls are synchronous. Retire the independent runtimes and
         // their tracked dummy buffers before physical savings validation and
         // candidate publication; error paths retain the defer above.
@@ -5972,7 +11233,8 @@ pub const NativeGenerationPipeline = struct {
             candidate_live = false;
             try control.check();
             request.result = .{
-                .checkpoint = original,
+                .payload = .{ .host = original },
+                .source_revision = source_revision,
                 .outcome = .unchanged_insufficient_savings,
                 .stats = stats,
                 .source_host_bytes = source_host_bytes,
@@ -5989,13 +11251,132 @@ pub const NativeGenerationPipeline = struct {
         original_live = false;
         try control.check();
         request.result = .{
-            .checkpoint = candidate,
+            .payload = .{ .host = candidate },
+            .source_revision = source_revision,
             .outcome = .compacted,
             .stats = stats,
             .source_host_bytes = source_host_bytes,
             .query_ns = query_ns,
             .snapshot_ns = snapshot_ns,
             .fit_ns = mtpProfileElapsedNs(true, self.io, fit_started),
+            .quality_fit_strategy = request.quality_fit_strategy,
+            .v18_policy_sha256 = @import("../runtime/kv/metal_checkpoint_quality.zig").fitStrategyConfigurationFingerprint(@splat(0), request.quality_fit_strategy),
+            .v18_eligible_heads = stats.v18_eligible_heads,
+            .v18_attempted_heads = stats.v18_attempted_heads,
+            .v18_accepted_heads = stats.v18_accepted_heads,
+            .v18_preserved_heads = stats.v18_preserved_heads,
+            .v18_fallback_heads = stats.v18_fallback_heads,
+            .v18_cache_ready_heads = stats.v18_cache_ready_heads,
+            .v18_planned_exact_heads = stats.v18_planned_exact_heads,
+            .incremental_gram_chooser_calls = stats.incremental_gram_chooser_calls,
+            .v18_query_batch_rows = stats.v18_query_batch_rows,
+            .v18_planned_head_workspace_bytes = stats.v18_planned_head_workspace_bytes,
+            .v18_cache_phase_peak_bound_bytes = stats.v18_cache_phase_peak_bound_bytes,
+            .v18_bounded_heads = stats.v18_bounded_heads,
+            .v18_bounded_delta_heads = stats.v18_bounded_delta_heads,
+            .v18_bounded_delta_tiles = stats.v18_bounded_delta_tiles,
+            .v18_bounded_delta_backend_calls = stats.v18_bounded_delta_backend_calls,
+            .v18_bounded_delta_packed_bytes_peak = stats.v18_bounded_delta_packed_bytes_peak,
+            .v18_bounded_delta_staged_bytes_peak = stats.v18_bounded_delta_staged_bytes_peak,
+            .v18_bounded_delta_fallbacks = stats.v18_bounded_delta_fallbacks,
+            .v18_bounded_tsqr_heads = stats.v18_bounded_tsqr_heads,
+            .v18_bounded_tsqr_calls = stats.v18_bounded_tsqr_calls,
+            .v18_bounded_tsqr_workspace_peak_bytes = stats.v18_bounded_tsqr_workspace_peak_bytes,
+            .v18_bounded_tsqr_cancellation_checks = stats.v18_bounded_tsqr_cancellation_checks,
+            .v18_primary_budget_percent = stats.v18_primary_budget_percent,
+            .v18_budget_fallback_heads = stats.v18_budget_fallback_heads,
+            .v18_evidence_profile = if (request.quality_fit_strategy == .legacy)
+                .none
+            else if (request.training_policy == .private_train_challenge_hybrid_resident_v1 and
+                !request.private_capture_gram_batch256_diagnostic)
+                residentEvidenceProfile(stats, live_resident_cohort, request.resident_hybrid_authority.?.e2_formal_owner_inventory != null, request.encoding)
+            else if (stats.v18_bounded_delta_heads > 0 and stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                .private_hybrid_bounded_accelerated_batch64_workspace1gib
+            else if (stats.v18_bounded_heads > 0 and stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                .private_hybrid_bounded_batch64_workspace1gib
+            else if (stats.v18_primary_budget_percent != 0)
+                switch (request.encoding) {
+                    .f16 => .private_physical_budget_batch64_workspace1gib,
+                    .fp8 => .private_fp8_physical_budget_batch64_workspace1gib,
+                    .rotated4 => .private_rotated4_physical_budget_batch64_workspace1gib,
+                    else => .none,
+                }
+            else if (stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                .private_budget95_batch64_workspace1gib
+            else
+                .legacy_batch16_workspace512mib,
+            .v18_evidence_profile_sha256 = if (request.quality_fit_strategy == .legacy)
+                @splat(0)
+            else if (request.training_policy == .private_train_challenge_hybrid_resident_v1 and
+                !request.private_capture_gram_batch256_diagnostic)
+                quality_mod.v18EvidenceProfileDigest(residentEvidenceProfile(stats, live_resident_cohort, request.resident_hybrid_authority.?.e2_formal_owner_inventory != null, request.encoding))
+            else if (stats.v18_bounded_delta_heads > 0 and stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                quality_mod.v18EvidenceProfileDigest(.private_hybrid_bounded_accelerated_batch64_workspace1gib)
+            else if (stats.v18_bounded_heads > 0 and stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                quality_mod.v18EvidenceProfileDigest(.private_hybrid_bounded_batch64_workspace1gib)
+            else if (stats.v18_primary_budget_percent != 0)
+                quality_mod.v18EvidenceProfileDigest(switch (request.encoding) {
+                    .f16 => .private_physical_budget_batch64_workspace1gib,
+                    .fp8 => .private_fp8_physical_budget_batch64_workspace1gib,
+                    .rotated4 => .private_rotated4_physical_budget_batch64_workspace1gib,
+                    else => .none,
+                })
+            else if (stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                quality_mod.v18EvidenceProfileDigest(.private_budget95_batch64_workspace1gib)
+            else
+                quality_mod.v18EvidenceProfileDigest(.legacy_batch16_workspace512mib),
+            .v18_codec_physical_profile = if (stats.v18_bounded_heads > 0) switch (request.encoding) {
+                .f16 => .bounded_f16_codec_physical_v1,
+                .fp8 => .bounded_fp8_codec_physical_v1,
+                .rotated4 => .bounded_rotated4_codec_physical_v1,
+                else => .none,
+            } else .none,
+            .v18_codec_physical_profile_sha256 = if (stats.v18_bounded_heads > 0) quality_mod.v18EvidenceProfileDigest(switch (request.encoding) {
+                .f16 => .bounded_f16_codec_physical_v1,
+                .fp8 => .bounded_fp8_codec_physical_v1,
+                .rotated4 => .bounded_rotated4_codec_physical_v1,
+                else => .none,
+            }) else @splat(0),
+            .v18_bounded_tsqr_policy_sha256 = if (stats.v18_bounded_tsqr_heads > 0) quality_mod.boundedTsqrValuePolicyDigest() else @splat(0),
+            .v18_exact_f32_probability_heads = stats.v18_exact_f32_probability_heads,
+            .v18_gram_heads = stats.v18_gram_heads,
+            .v18_scored_reuse_heads = stats.v18_scored_reuse_heads,
+            .v18_gram_backend_calls = stats.v18_gram_backend_calls,
+            .v18_bounded_provider_calls = stats.v18_bounded_provider_calls,
+            .v18_bounded_provider_rows = stats.v18_bounded_provider_rows,
+            .v18_bounded_workspace_bound_bytes = stats.v18_bounded_workspace_bound_bytes,
+            .v18_bounded_scoring_cache_prepares = stats.v18_bounded_scoring_cache_prepares,
+            .v18_bounded_scoring_selection_hits = stats.v18_bounded_scoring_selection_hits,
+            .v18_bounded_scoring_fit_hits = stats.v18_bounded_scoring_fit_hits,
+            .v18_bounded_range_cache_prepares = stats.v18_bounded_range_cache_prepares,
+            .v18_bounded_geometry_cache_requests = stats.v18_bounded_geometry_cache_requests,
+            .v18_bounded_geometry_cache_hits = stats.v18_bounded_geometry_cache_hits,
+            .v18_bounded_geometry_cache_loads = stats.v18_bounded_geometry_cache_loads,
+            .v18_numerical_policy = options.adaptive_v18_numerical_policy,
+            .v18_cache_prepare_ns = stats.v18_cache_prepare_ns,
+            .v18_selection_freeze_ns = stats.v18_selection_freeze_ns,
+            .v18_joint_value_fit_ns = stats.v18_joint_value_fit_ns,
+            .v18_gram_construction_ns = stats.v18_gram_construction_ns,
+            .v18_chooser_ns = stats.v18_chooser_ns,
+            .v18_final_heldout_ns = stats.v18_final_heldout_ns,
+            .training_reduction_local_original_calls = stats.training_reduction_local_original_calls,
+            .training_reduction_rounded_harm_calls = stats.training_reduction_rounded_harm_calls,
+            .training_reduction_tiles = stats.training_reduction_tiles,
+            .training_reduction_backend_calls = stats.training_reduction_backend_calls,
+            .training_reduction_workspace_peak_bytes = stats.training_reduction_workspace_peak_bytes,
+            .training_policy = request.training_policy,
+            .future_training_authority = request.future_training_authority,
+            .private_dense512_query_rows = request.private_dense512_query_rows,
+            .private_query_live_bytes = request.private_query_live_bytes,
+            .planned_private_query_bytes = request.planned_private_query_bytes orelse 0,
+            .primary_query_collection = request.primary_query_collection,
+            .dense512_query_collection = request.dense512_query_collection,
+            .query_collection_combined_before_fit_ns = request.query_collection_combined_before_fit_ns,
+            .validation_complete = true,
+            .request_private_publish_complete = true,
+            .prompt_tokens_sha256 = request.prepared_quality_prompt_sha256,
+            .prompt_tokens = request.prepared_quality_prompt_tokens,
+            .source_checkpoint_sha256 = request.quality_source_sha256,
         };
         candidate_live = false;
         return stats;
@@ -6133,7 +11514,8 @@ pub const NativeGenerationPipeline = struct {
                 if (probe_options.prepare_request) |request| {
                     try control.check();
                     request.result = .{
-                        .checkpoint = original,
+                        .payload = .{ .host = original },
+                        .source_revision = source_revision,
                         .outcome = .unchanged_insufficient_savings,
                         .stats = stats,
                         .source_host_bytes = source_host_bytes,
@@ -6176,7 +11558,8 @@ pub const NativeGenerationPipeline = struct {
         if (probe_options.prepare_request) |request| {
             try control.check();
             request.result = .{
-                .checkpoint = candidate,
+                .payload = .{ .host = candidate },
+                .source_revision = source_revision,
                 .outcome = .compacted,
                 .stats = stats,
                 .source_host_bytes = source_host_bytes,
@@ -6326,10 +11709,14 @@ pub const NativeGenerationPipeline = struct {
         }
 
         fn init(self: *@This(), pipeline: *NativeGenerationPipeline, source: *const NativeDecodeState, capacity: usize) !void {
-            return self.initAllocated(pipeline, source, capacity, pipeline.allocator, null);
+            return self.initAllocatedBounded(pipeline, source, capacity, pipeline.allocator, null, 4 * 1024 * 1024 * 1024);
         }
 
         fn initAllocated(self: *@This(), pipeline: *NativeGenerationPipeline, source: *const NativeDecodeState, capacity: usize, allocator: std.mem.Allocator, tracker: ?*runtime.kv.host_allocation_tracker.HostAllocationTracker) !void {
+            return self.initAllocatedBounded(pipeline, source, capacity, allocator, tracker, 4 * 1024 * 1024 * 1024);
+        }
+
+        fn initAllocatedBounded(self: *@This(), pipeline: *NativeGenerationPipeline, source: *const NativeDecodeState, capacity: usize, allocator: std.mem.Allocator, tracker: ?*runtime.kv.host_allocation_tracker.HostAllocationTracker, max_clone_bytes: usize) !void {
             if (self.manager != null or self.storage != null or self.state != null) return error.InvalidCompactionProbe;
             const dtype = pipeline.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
             if ((pipeline.cb.kind() != .cuda and pipeline.cb.kind() != .metal) or dtype != .f16 or !source.isPaged() or source.isKvCompacted()) return error.UnsupportedCompactionQueryRoute;
@@ -6369,8 +11756,9 @@ pub const NativeGenerationPipeline = struct {
                 .page_size = config.page_size_tokens,
                 .source_blocks = view.logical_blocks orelse return error.UnsupportedDeviceKvCloneLayout,
                 .destination_blocks = self.state.?.kv_block_ids.items,
+                .logical_block_policy = if (pipeline.cb.kind() == .metal) .metal_sequence_slot_owned else .identity_only,
                 .donors = donors[0..donor_count],
-                .max_bytes = 4 * 1024 * 1024 * 1024,
+                .max_bytes = max_clone_bytes,
                 .check_ctx = pipeline,
                 .check_fn = checkAttentionMatchQueryWork,
             };
@@ -6396,10 +11784,239 @@ pub const NativeGenerationPipeline = struct {
         }
     };
 
+    /// Owns the transient future-generation shadow and, on Metal, a concrete
+    /// forwarding attribution ledger rooted in the authoritative source
+    /// request owner. The child must remain at this stable address until the
+    /// provisioned hook and every shadow allocation have been destroyed.
+    const FutureDecodeBranchOwnerScope = struct {
+        const CleanupReceipt = struct {
+            forwarding: runtime.kv.host_allocation_tracker.HostAllocationTracker.ForwardingScopeReceipt,
+            parent_before: runtime.kv.host_allocation_tracker.Snapshot,
+            parent_tracker: *runtime.kv.host_allocation_tracker.HostAllocationTracker,
+        };
+
+        forwarding: ?runtime.kv.host_allocation_tracker.HostAllocationTracker = null,
+        shadow: AttentionMatchProbeShadow = .{},
+        generation: u64 = 0,
+        parent_before: runtime.kv.host_allocation_tracker.Snapshot = .{},
+        parent_tracker: ?*runtime.kv.host_allocation_tracker.HostAllocationTracker = null,
+
+        fn requiresSourceTracker(kind: ops.BackendKind) bool {
+            return kind == .metal;
+        }
+
+        fn init(
+            self: *@This(),
+            pipeline: *NativeGenerationPipeline,
+            source: *const NativeDecodeState,
+            capacity: usize,
+            max_shadow: usize,
+        ) !void {
+            if (self.forwarding != null or self.shadow.storage != null) return error.InvalidCompactionProbe;
+            if (!requiresSourceTracker(pipeline.cb.kind()))
+                return self.shadow.initAllocatedBounded(pipeline, source, capacity, pipeline.allocator, null, max_shadow);
+            const source_storage = source.kv_storage orelse return error.ContextPhysicalAccountingUnavailable;
+            const parent = source_storage.ownerAllocationTracker() orelse return error.ContextPhysicalAccountingUnavailable;
+            self.parent_before = parent.snapshot();
+            self.parent_tracker = parent;
+            self.forwarding = try runtime.kv.host_allocation_tracker.HostAllocationTracker.initForwardingScope(parent);
+            const child = &self.forwarding.?;
+            self.generation = child.forwarding_generation;
+            errdefer {
+                self.shadow.deinit();
+                _ = child.closeForwardingScope(self.generation) catch
+                    @panic("future decode forwarding scope retained allocation during failed initialization");
+                self.forwarding = null;
+                self.generation = 0;
+                self.parent_before = .{};
+                self.parent_tracker = null;
+            }
+            try self.shadow.initAllocatedBounded(pipeline, source, capacity, child.allocator(), child, max_shadow);
+        }
+
+        fn deinit(self: *@This()) void {
+            _ = self.closeWithReceipt();
+        }
+
+        fn closeWithReceipt(self: *@This()) ?CleanupReceipt {
+            self.shadow.deinit();
+            var result: ?CleanupReceipt = null;
+            if (self.forwarding) |*child| {
+                const receipt = child.closeForwardingScope(self.generation) catch
+                    @panic("future decode forwarding scope retained live allocation");
+                if (!receipt.completed or receipt.child.logical_live_bytes != 0 or receipt.child.physical_live_bytes != 0 or
+                    receipt.child.shared_backing_live_bytes != 0 or receipt.child.private_device_live_bytes != 0)
+                    @panic("future decode forwarding scope incomplete cleanup");
+                result = .{ .forwarding = receipt, .parent_before = self.parent_before, .parent_tracker = self.parent_tracker.? };
+            }
+            self.* = .{};
+            return result;
+        }
+    };
+
+    test "future decode branch owner policy requires Metal source tracker and preserves CUDA policy" {
+        const Backend = struct {
+            kind: ops.BackendKind,
+            fn backendKind(raw: *anyopaque) ops.BackendKind {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.kind;
+            }
+            fn deinitBackend(_: *anyopaque) void {}
+            fn freeTensor(_: *anyopaque, _: ops.CT) void {}
+            const vtable: ops.ComputeBackend.VTable = blk: {
+                var table = @import("../ops/native_compute.zig").vtable_impl;
+                table.backendKind = backendKind;
+                table.deinitBackend = deinitBackend;
+                table.freeTensor = freeTensor;
+                break :blk table;
+            };
+            fn cb(self: *@This()) ops.ComputeBackend {
+                return .{ .ptr = self, .vtable = &vtable };
+            }
+        };
+        var backend: Backend = .{ .kind = .metal };
+        var pipeline: NativeGenerationPipeline = undefined;
+        pipeline.cb = backend.cb();
+        var source: NativeDecodeState = undefined;
+        source.kv_storage = null;
+        var scope: FutureDecodeBranchOwnerScope = .{};
+        try std.testing.expectError(error.ContextPhysicalAccountingUnavailable, scope.init(&pipeline, &source, 1, 1));
+        try std.testing.expect(scope.forwarding == null and scope.shadow.storage == null);
+
+        backend.kind = .cuda;
+        pipeline.cb = backend.cb();
+        pipeline.kv_dtype = null;
+        try std.testing.expectError(error.UnsupportedCompactionQueryDType, scope.init(&pipeline, &source, 1, 1));
+        try std.testing.expect(scope.forwarding == null and scope.shadow.storage == null);
+    }
+
+    test "future decode forwarding owner fault and cancellation cleanup close at zero" {
+        const Work = struct {
+            fn prepare(scope: *FutureDecodeBranchOwnerScope, parent: *runtime.kv.host_allocation_tracker.HostAllocationTracker) !*runtime.kv.host_allocation_tracker.HostAllocationTracker {
+                scope.forwarding = try runtime.kv.host_allocation_tracker.HostAllocationTracker.initForwardingScope(parent);
+                const child = &scope.forwarding.?;
+                scope.generation = child.forwarding_generation;
+                return child;
+            }
+            fn fault(scope: *FutureDecodeBranchOwnerScope, parent: *runtime.kv.host_allocation_tracker.HostAllocationTracker) !void {
+                const child = try prepare(scope, parent);
+                defer scope.deinit();
+                const live = try child.allocator().alloc(u8, 64);
+                defer child.allocator().free(live);
+                try parent.armNextPositiveAllocationFailure();
+                if (child.allocator().rawAlloc(1, .of(u8), @returnAddress()) == null) return error.OutOfMemory;
+                return error.TestUnexpectedResult;
+            }
+            fn cancel(scope: *FutureDecodeBranchOwnerScope, parent: *runtime.kv.host_allocation_tracker.HostAllocationTracker) !void {
+                const child = try prepare(scope, parent);
+                defer scope.deinit();
+                const live = try child.allocator().alloc(u8, 32);
+                defer child.allocator().free(live);
+                return check();
+            }
+            fn check() !void {
+                return error.Cancelled;
+            }
+        };
+
+        var parent = runtime.kv.host_allocation_tracker.HostAllocationTracker.init(null, 0);
+        const before = parent.snapshot();
+        var fault_scope: FutureDecodeBranchOwnerScope = .{};
+        try std.testing.expectError(error.OutOfMemory, Work.fault(&fault_scope, &parent));
+        try std.testing.expect(fault_scope.forwarding == null and fault_scope.shadow.storage == null);
+        const after_fault = parent.snapshot();
+        try std.testing.expectEqual(before.logical_live_bytes, after_fault.logical_live_bytes);
+        try std.testing.expectEqual(before.physical_live_bytes, after_fault.physical_live_bytes);
+        try std.testing.expect(after_fault.logical_peak_bytes >= 64);
+
+        var cancel_parent = runtime.kv.host_allocation_tracker.HostAllocationTracker.init(null, 0);
+        var cancel_scope: FutureDecodeBranchOwnerScope = .{};
+        try std.testing.expectError(error.Cancelled, Work.cancel(&cancel_scope, &cancel_parent));
+        try std.testing.expect(cancel_scope.forwarding == null and cancel_scope.shadow.storage == null);
+        try std.testing.expectEqual(@as(u64, 0), cancel_parent.snapshot().tracked_combined_live_bytes);
+        try std.testing.expect(cancel_parent.snapshot().logical_peak_bytes >= 32);
+    }
+
+    const FutureProbeLogitsStats = struct {
+        backend_owned_calls: u16 = 0,
+        backend_owned_ns: u64 = 0,
+        backend_owned_frames: u16 = 0,
+        generic_calls: u16 = 0,
+        backend_owned_selected: bool = false,
+        gpu_greedy_calls: u16 = 0,
+        gpu_greedy_frames: u16 = 0,
+        gpu_greedy_ns: u64 = 0,
+        gpu_greedy_selected: bool = false,
+    };
+
+    fn validateFutureProbeLogitsStats(stats: FutureProbeLogitsStats, expected: u16) !void {
+        if (stats.gpu_greedy_selected) {
+            if (stats.gpu_greedy_calls != expected or stats.gpu_greedy_frames != expected or
+                stats.backend_owned_calls != 0 or stats.generic_calls != 0 or stats.backend_owned_selected)
+                return error.InvalidFutureDecodeTraining;
+            return;
+        }
+        const total = std.math.add(u16, stats.backend_owned_calls, stats.generic_calls) catch
+            return error.InvalidFutureDecodeTraining;
+        if (total != expected) return error.InvalidFutureDecodeTraining;
+        if (stats.backend_owned_selected) {
+            if (stats.backend_owned_calls != expected or
+                stats.backend_owned_frames != expected or
+                stats.generic_calls != 0)
+                return error.InvalidFutureDecodeTraining;
+        } else if (stats.backend_owned_calls != 0 or stats.backend_owned_frames != 0) {
+            return error.InvalidFutureDecodeTraining;
+        }
+    }
+
+    test "context future probe full logits counters distinguish backend-owned and generic lanes" {
+        try validateFutureProbeLogitsStats(.{ .backend_owned_calls = 256, .backend_owned_frames = 256, .backend_owned_selected = true }, 256);
+        try validateFutureProbeLogitsStats(.{ .generic_calls = 256 }, 256);
+        try std.testing.expectError(error.InvalidFutureDecodeTraining, validateFutureProbeLogitsStats(.{ .backend_owned_calls = 256, .backend_owned_frames = 255, .backend_owned_selected = true }, 256));
+        try std.testing.expectError(error.InvalidFutureDecodeTraining, validateFutureProbeLogitsStats(.{ .backend_owned_calls = 1, .generic_calls = 255 }, 256));
+        try validateFutureProbeLogitsStats(.{ .gpu_greedy_calls = 256, .gpu_greedy_frames = 256, .gpu_greedy_selected = true }, 256);
+        try std.testing.expectError(error.InvalidFutureDecodeTraining, validateFutureProbeLogitsStats(.{ .gpu_greedy_calls = 255, .gpu_greedy_frames = 255, .gpu_greedy_selected = true }, 256));
+        try std.testing.expectError(error.InvalidFutureDecodeTraining, validateFutureProbeLogitsStats(.{ .gpu_greedy_calls = 256, .gpu_greedy_frames = 256, .gpu_greedy_selected = true, .generic_calls = 1 }, 256));
+    }
+
+    fn futureSourceKvDigest(self: *NativeGenerationPipeline, compute: *metal_compute.MetalCompute, storage: *runtime.kv.storage_runtime.KvStorageRuntime, sequence: runtime.kv.storage_runtime.SequenceId, revision: u64, max_head_bytes: usize) ![32]u8 {
+        if (!builtin.is_test or max_head_bytes == 0) return error.UnqualifiedFaultInjection;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly.future-decode-installed-kv-content.v1\x00");
+        hash.update(std.mem.asBytes(&revision));
+        for (0..self.gpt_config.num_hidden_layers) |layer| {
+            if (!self.gpt_config.isKvDonorLayer(layer)) continue;
+            const geometry = try self.gpt_config.kvDonorGeometry(layer);
+            const window: u32 = if (geometry.sliding) self.gpt_config.sliding_window else 0;
+            for (0..geometry.num_kv_heads) |head_index| {
+                try checkAttentionMatchQueryWork(self);
+                var downloaded = try compute.attentionMatchDownloadHead(storage, sequence, self.allocator, @intCast(layer), head_index, window, revision, max_head_bytes, .{ .context = self, .check_fn = checkAttentionMatchQueryWork });
+                defer downloaded.deinit();
+                const head = downloaded.head();
+                hash.update(std.mem.asBytes(&layer));
+                hash.update(std.mem.asBytes(&head_index));
+                hash.update(std.mem.asBytes(&window));
+                hash.update(std.mem.asBytes(&head.dim));
+                hash.update(std.mem.asBytes(&head.compacted_until));
+                hash.update(std.mem.sliceAsBytes(head.positions));
+                hash.update(std.mem.sliceAsBytes(head.coverage_ends));
+                hash.update(std.mem.sliceAsBytes(head.keys));
+                hash.update(std.mem.sliceAsBytes(head.values));
+                hash.update(std.mem.sliceAsBytes(head.bias));
+                hash.update(std.mem.asBytes(&head.fp8));
+                hash.update(std.mem.asBytes(&head.compressed.version));
+                hash.update(std.mem.sliceAsBytes(head.compressed.spans));
+                hash.update(head.compressed.keys);
+                hash.update(head.compressed.values);
+            }
+        }
+        return hash.finalResult();
+    }
+
     /// Append with a single last-token logit projection. Keeping the last token
     /// separate avoids materializing [chunk, vocabulary] host logits. The final
     /// row uses the common serving wrapper, including its installed-KV frame.
-    fn appendAttentionMatchProbeTokens(self: *NativeGenerationPipeline, state: *NativeDecodeState, tokens: []const i64) ![]f32 {
+    fn appendAttentionMatchProbeTokens(self: *NativeGenerationPipeline, state: *NativeDecodeState, tokens: []const i64, probe_stats: ?*FutureProbeLogitsStats) ![]f32 {
         if (tokens.len == 0) return error.InvalidCompactionProbe;
         var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
         defer if (execution_scope) |*scope| scope.deinit();
@@ -6413,15 +12030,423 @@ pub const NativeGenerationPipeline = struct {
             offset = end;
         }
         try checkAttentionMatchQueryWork(self);
+        // Decide ownership before the append. Once the direct lane starts, a
+        // late decline is terminal because paged KV may already be dirty.
+        const use_backend_owned = probe_stats != null and self.cb.kind() == .metal and decoder_gated_runtime.supportsConfig(self.gpt_config);
         try state.appendPrefillChunk(1);
         var context = state.gptDecodeContext(state.total_tokens, 1);
-        return self.forwardLastLogits(tokens[tokens.len - 1 ..], 1, state.total_tokens, &context);
+        if (use_backend_owned) {
+            const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+            const frames_before = compute.timing_stats.active_decode_frame_successes;
+            const started = mtpProfileTimestamp(true, self.io);
+            const logits = (try decoder_gated_runtime.forwardBackendOwnedFullLogits(
+                &self.cb,
+                self.allocator,
+                self.gpt_config,
+                self.gpt_config.num_hidden_layers,
+                tokens[tokens.len - 1],
+                state.total_tokens,
+                &context,
+            )) orelse return error.InvalidFutureDecodeTraining;
+            const frames_after = compute.timing_stats.active_decode_frame_successes;
+            if (frames_after != frames_before + 1) {
+                self.allocator.free(logits);
+                return error.InvalidFutureDecodeTraining;
+            }
+            if (probe_stats) |stats| {
+                stats.backend_owned_selected = true;
+                stats.backend_owned_calls +|= 1;
+                stats.backend_owned_frames +|= 1;
+                stats.backend_owned_ns +|= mtpProfileElapsedNs(true, self.io, started);
+            }
+            return logits;
+        }
+        const logits = try self.forwardLastLogits(tokens[tokens.len - 1 ..], 1, state.total_tokens, &context);
+        if (probe_stats) |stats| stats.generic_calls +|= 1;
+        return logits;
     }
+
+    fn appendAttentionMatchFutureGreedyToken(self: *NativeGenerationPipeline, state: *NativeDecodeState, token: i64, stats: *FutureProbeLogitsStats) !i64 {
+        // Eligibility is resolved before locking, casting, or mutating child KV.
+        // This lane has no fallback after append because a submitted frame may
+        // already have advanced paged state.
+        if (!futureTrainGpuGreedyEligible(self.cb.kind(), decoder_gated_runtime.supportsConfig(self.gpt_config)))
+            return error.InvalidFutureDecodeTraining;
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
+        try checkAttentionMatchQueryWork(self);
+        try state.appendPrefillChunk(1);
+        var context = state.gptDecodeContext(state.total_tokens, 1);
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const frames_before = compute.timing_stats.active_decode_frame_successes;
+        const started = mtpProfileTimestamp(true, self.io);
+        const next = (try decoder_gated_runtime.forwardFutureTrainGreedyTokenAtomic(
+            &self.cb,
+            self.allocator,
+            self.gpt_config,
+            self.gpt_config.num_hidden_layers,
+            token,
+            state.total_tokens,
+            &context,
+        )) orelse return error.InvalidFutureDecodeTraining;
+        if (compute.timing_stats.active_decode_frame_successes != frames_before + 1)
+            return error.InvalidFutureDecodeTraining;
+        stats.gpu_greedy_selected = true;
+        stats.gpu_greedy_calls +|= 1;
+        stats.gpu_greedy_frames +|= 1;
+        stats.gpu_greedy_ns +|= mtpProfileElapsedNs(true, self.io, started);
+        return next;
+    }
+
+    fn futureTrainGpuGreedyEligible(kind: ops.BackendKind, supported_config: bool) bool {
+        return kind == .metal and supported_config;
+    }
+
+    test "context future TRAIN GPU greedy eligibility fails before mutation" {
+        try std.testing.expect(futureTrainGpuGreedyEligible(.metal, true));
+        try std.testing.expect(!futureTrainGpuGreedyEligible(.metal, false));
+        try std.testing.expect(!futureTrainGpuGreedyEligible(.native, true));
+        try std.testing.expect(!futureTrainGpuGreedyEligible(.cuda, true));
+    }
+
+    fn captureSelfStudyTraining(self: *NativeGenerationPipeline, source_tokens: []const i64, source: *const NativeDecodeState, study: *const PreparedCompactionStudy, fixed_parent: [32]u8, max_shadow: usize) !NativeCheckpointPrepare.SelfStudyTrainingCapture {
+        const self_study = runtime.kv.attention_match_self_study_training;
+        if (!builtin.is_test or study.ids.len == 0) return error.InvalidSelfStudyCapture;
+        try self_study.validatePreparedStudyContract(study.template_bytes, study.generation_contract_bytes);
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const storage = source.kv_storage orelse return error.SelfStudyStorageUnavailable;
+        const token_digest = self_study.hashTokens(source_tokens);
+        if (!std.mem.eql(u8, &token_digest, &study.prompt_tokens_sha256)) return error.InvalidSelfStudyProvenance;
+        if (try std.math.add(usize, study.ids.len, self_study.generated_tokens) < 320) return error.SelfStudyRepeatTooShort;
+        const boundary: self_study.SourceBoundary = .{ .identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity, .sequence_id = source.sequence_id orelse return error.SelfStudySequenceUnavailable, .logical_tokens = source.total_tokens, .kv_revision = try compute.attentionMatchRevision(storage), .tokens_sha256 = token_digest };
+        const repeat = try self.allocator.alloc(i64, try std.math.add(usize, study.ids.len, self_study.generated_tokens));
+        defer self.allocator.free(repeat);
+        @memcpy(repeat[0..study.ids.len], study.ids);
+        {
+            var branch: AttentionMatchProbeShadow = .{};
+            defer branch.deinit();
+            try branch.init(self, source, try std.math.add(usize, source.total_tokens, repeat.len));
+            var logits = try self.appendAttentionMatchProbeTokens(&branch.state.?, study.ids, null);
+            defer self.allocator.free(logits);
+            for (0..self_study.generated_tokens) |i| {
+                const token = try self_study.greedyToken(logits, self.gpt_config.vocab_size);
+                repeat[study.ids.len + i] = token;
+                const next = try self.appendAttentionMatchProbeTokens(&branch.state.?, &.{token}, null);
+                self.allocator.free(logits);
+                logits = next;
+            }
+        }
+        const repeat_sha = self_study.hashTokens(repeat);
+        var stats: AttentionMatchQueryStats = .{};
+        var collected = try self.collectAttentionMatchQueries(source_tokens, source, .{ .prefix_mode = .clone, .repeat_mode = .reference, .stats = &stats, .collection = .{ .samples_per_consumer = 320, .max_bytes = self_study.maximum_bytes }, .chunk_size = 256, .explicit_repeat_tokens = repeat, .explicit_repeat_sha256 = repeat_sha, .max_shadow_kv_bytes = max_shadow });
+        errdefer collected.deinit();
+        const after: self_study.SourceBoundary = .{ .identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity, .sequence_id = source.sequence_id orelse return error.SelfStudySourceMutated, .logical_tokens = source.total_tokens, .kv_revision = try compute.attentionMatchRevision(storage), .tokens_sha256 = self_study.hashTokens(source_tokens) };
+        if (!std.meta.eql(boundary, after) or !stats.shadow_scope_released or stats.shadow_scope_delta_bytes != 0) return error.SelfStudySourceMutated;
+        const generated = try self.allocator.dupe(i64, repeat[study.ids.len..]);
+        errdefer self.allocator.free(generated);
+        const generated_sha = self_study.hashTokens(generated);
+        var contract_sha: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(study.generation_contract_bytes, &contract_sha, .{});
+        return .{ .allocator = self.allocator, .queries = collected, .generated_ids = generated, .prompt_tokens = study.ids, .prompt_tokens_sha256 = self_study.hashTokens(study.ids), .rendered_suffix_sha256 = study.rendered_suffix_sha256, .generation_contract_sha256 = contract_sha, .generated_ids_sha256 = generated_sha, .complete_repeat_sha256 = repeat_sha, .source_before = boundary, .source_after = after, .primary_parent_manifest_sha256 = fixed_parent };
+    }
+
+    /// Capture 256 TRAIN queries from an exact-source continuation without a
+    /// template suffix or reference/gold access. EOS is observed and counted,
+    /// but generation remains deterministic fixed-length so a short ordinary
+    /// answer cannot silently change the 256-row fit contract.
+    fn captureFutureDecodeTraining(self: *NativeGenerationPipeline, source_tokens: []const i64, source: *const NativeDecodeState, source_last_logits: []const f32, max_shadow: usize, fault_controller: context_fault_injection.Slot) !NativeCheckpointPrepare.FutureDecodeTrainingCapture {
+        const policy = runtime.kv.attention_match_future_decode_training;
+        const self_study = runtime.kv.attention_match_self_study_training;
+        if (source_last_logits.len != self.gpt_config.vocab_size or source_tokens.len != source.total_tokens)
+            return error.InvalidFutureDecodeTraining;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const storage = source.kv_storage orelse return error.SelfStudyStorageUnavailable;
+        const source_sequence = source.sequence_id orelse return error.SelfStudySequenceUnavailable;
+        const capture_parent = storage.ownerAllocationTracker() orelse return error.ContextPhysicalAccountingUnavailable;
+        const capture_parent_before = capture_parent.snapshot();
+        const token_digest = self_study.hashTokens(source_tokens);
+        const boundary: self_study.SourceBoundary = .{ .identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity, .sequence_id = source.sequence_id orelse return error.SelfStudySequenceUnavailable, .logical_tokens = source.total_tokens, .kv_revision = try compute.attentionMatchRevision(storage), .tokens_sha256 = token_digest };
+        const configured_append_index: u32 = if (comptime builtin.is_test)
+            if (fault_controller) |fault| fault.future_append_index else 0
+        else
+            0;
+        const kv_digest_enabled = if (comptime builtin.is_test)
+            platform.env.getenvBool("ANTFLY_TEST_FUTURE_BRANCH_KV_DIGEST")
+        else
+            false;
+        const kv_digest_before = if (kv_digest_enabled)
+            try self.futureSourceKvDigest(compute, storage, source_sequence, boundary.kv_revision, max_shadow)
+        else
+            @as([32]u8, @splat(0));
+        const generated = try self.allocator.alloc(i64, policy.generated_tokens);
+        errdefer self.allocator.free(generated);
+        var eos_count: u16 = 0;
+        var probe_stats: FutureProbeLogitsStats = .{};
+        var successful_appends: u32 = 0;
+        var branch_error: ?anyerror = null;
+        {
+            var branch: FutureDecodeBranchOwnerScope = .{};
+            try branch.init(self, source, try std.math.add(usize, source.total_tokens, policy.generated_tokens), max_shadow);
+            defer {
+                const cleanup = branch.closeWithReceipt() orelse @panic("Metal future decode branch omitted forwarding receipt");
+                const parent_before = cleanup.parent_before;
+                const revision_after = compute.attentionMatchRevision(storage) catch 0;
+                const tokens_after = self_study.hashTokens(source_tokens);
+                const metadata_unchanged = revision_after == boundary.kv_revision and source.total_tokens == boundary.logical_tokens and
+                    std.mem.eql(u8, &tokens_after, &boundary.tokens_sha256);
+                const kv_digest_after = if (kv_digest_enabled)
+                    self.futureSourceKvDigest(compute, storage, source_sequence, boundary.kv_revision, max_shadow) catch @as([32]u8, @splat(0))
+                else
+                    @as([32]u8, @splat(0));
+                const kv_content_unchanged = !std.mem.allEqual(u8, &kv_digest_before, 0) and std.mem.eql(u8, &kv_digest_before, &kv_digest_after);
+                const parent_after = cleanup.parent_tracker.snapshot();
+                std.debug.print(
+                    "future_decode_branch_receipt {{\"schema\":\"antfly.future-decode-branch-receipt.v2\",\"lane\":\"{s}\",\"successful_appends\":{},\"total_appends\":{},\"child_logical_live_bytes\":{},\"child_physical_live_bytes\":{},\"child_shared_live_bytes\":{},\"child_private_live_bytes\":{},\"branch_parent_logical_before_bytes\":{},\"branch_parent_logical_after_bytes\":{},\"branch_parent_physical_before_bytes\":{},\"branch_parent_physical_after_bytes\":{},\"branch_parent_shared_before_bytes\":{},\"branch_parent_shared_after_bytes\":{},\"branch_parent_private_before_bytes\":{},\"branch_parent_private_after_bytes\":{},\"source_revision_before\":{},\"source_revision_after\":{},\"source_metadata_unchanged\":{},\"source_kv_digest_before\":\"{x}\",\"source_kv_digest_after\":\"{x}\",\"source_kv_content_unchanged\":{},\"scope_complete\":{},\"injected_after_append\":{},\"injected_append_index\":{},\"error\":\"{s}\"}}\n",
+                    .{
+                        if (probe_stats.gpu_greedy_selected) "gpu" else "default",
+                        successful_appends,
+                        policy.generated_tokens,
+                        cleanup.forwarding.child.logical_live_bytes,
+                        cleanup.forwarding.child.physical_live_bytes,
+                        cleanup.forwarding.child.shared_backing_live_bytes,
+                        cleanup.forwarding.child.private_device_live_bytes,
+                        parent_before.logical_live_bytes,
+                        parent_after.logical_live_bytes,
+                        parent_before.physical_live_bytes,
+                        parent_after.physical_live_bytes,
+                        parent_before.shared_backing_live_bytes,
+                        parent_after.shared_backing_live_bytes,
+                        parent_before.private_device_live_bytes,
+                        parent_after.private_device_live_bytes,
+                        boundary.kv_revision,
+                        revision_after,
+                        metadata_unchanged,
+                        kv_digest_before,
+                        kv_digest_after,
+                        kv_content_unchanged,
+                        cleanup.forwarding.completed,
+                        branch_error != null and successful_appends > 0,
+                        configured_append_index,
+                        if (branch_error) |err| @errorName(err) else "none",
+                    },
+                );
+            }
+            if (platform.env.getenvBool("ANTFLY_METAL_ATTENTION_MATCH_FUTURE_TRAIN_GPU_GREEDY")) {
+                var token = try self_study.greedyToken(source_last_logits, self.gpt_config.vocab_size);
+                for (generated, 0..) |*slot, append_index| {
+                    slot.* = token;
+                    if (self.gpt_config.isEosToken(@intCast(token))) eos_count +|= 1;
+                    token = self.appendAttentionMatchFutureGreedyToken(&branch.shadow.state.?, token, &probe_stats) catch |err| {
+                        branch_error = err;
+                        return err;
+                    };
+                    successful_appends = @intCast(append_index + 1);
+                    if (comptime builtin.is_test) if (fault_controller) |fault| {
+                        const completed: u32 = @intCast(append_index + 1);
+                        const total: u32 = @intCast(policy.generated_tokens);
+                        if (fault.kind == .future_append_failure and completed == fault.future_append_index)
+                            fault.recordFutureAppendFailure(completed, total) catch |err| {
+                                branch_error = err;
+                                return err;
+                            };
+                        fault.checkpoint(.future_append, completed, total) catch |err| {
+                            branch_error = err;
+                            return err;
+                        };
+                    };
+                }
+            } else {
+                var logits = try self.allocator.dupe(f32, source_last_logits);
+                defer self.allocator.free(logits);
+                for (generated, 0..) |*slot, append_index| {
+                    try checkAttentionMatchQueryWork(self);
+                    const token = try self_study.greedyToken(logits, self.gpt_config.vocab_size);
+                    slot.* = token;
+                    if (self.gpt_config.isEosToken(@intCast(token))) eos_count +|= 1;
+                    const next = self.appendAttentionMatchProbeTokens(&branch.shadow.state.?, &.{token}, &probe_stats) catch |err| {
+                        branch_error = err;
+                        return err;
+                    };
+                    self.allocator.free(logits);
+                    logits = next;
+                    successful_appends = @intCast(append_index + 1);
+                    if (comptime builtin.is_test) if (fault_controller) |fault| {
+                        const completed: u32 = @intCast(append_index + 1);
+                        const total: u32 = @intCast(policy.generated_tokens);
+                        if (fault.kind == .future_append_failure and completed == fault.future_append_index)
+                            fault.recordFutureAppendFailure(completed, total) catch |err| {
+                                branch_error = err;
+                                return err;
+                            };
+                        fault.checkpoint(.future_append, completed, total) catch |err| {
+                            branch_error = err;
+                            return err;
+                        };
+                    };
+                }
+            }
+        }
+        const generated_sha = self_study.hashTokens(generated);
+        var stats: AttentionMatchQueryStats = .{};
+        var collected = try self.collectAttentionMatchQueries(source_tokens, source, .{ .prefix_mode = .clone, .repeat_mode = .reference, .stats = &stats, .collection = .{ .samples_per_consumer = policy.future_rows, .max_bytes = self_study.maximum_bytes }, .chunk_size = 256, .explicit_repeat_tokens = generated, .explicit_repeat_sha256 = generated_sha, .max_shadow_kv_bytes = max_shadow });
+        errdefer collected.deinit();
+        const after: self_study.SourceBoundary = .{ .identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity, .sequence_id = source.sequence_id orelse return error.SelfStudySourceMutated, .logical_tokens = source.total_tokens, .kv_revision = try compute.attentionMatchRevision(storage), .tokens_sha256 = self_study.hashTokens(source_tokens) };
+        if (!std.meta.eql(boundary, after) or !stats.shadow_scope_released or stats.shadow_scope_delta_bytes != 0)
+            return error.SelfStudySourceMutated;
+        const expected_probe_calls = std.math.cast(u16, policy.generated_tokens) orelse return error.InvalidFutureDecodeTraining;
+        try validateFutureProbeLogitsStats(probe_stats, expected_probe_calls);
+        const capture_parent_after = capture_parent.snapshot();
+        std.debug.print("future_decode_capture_retained schema=antfly.future-decode-capture-retained.v1 owner={} before_logical={} after_logical={} before_physical={} after_physical={} before_shared={} after_shared={} before_private={} after_private={} generated_bytes={} query_peak_bytes={} outputs_retained=true diagnostic_only=true\n", .{
+            capture_parent_after.owner_identity,
+            capture_parent_before.logical_live_bytes,
+            capture_parent_after.logical_live_bytes,
+            capture_parent_before.physical_live_bytes,
+            capture_parent_after.physical_live_bytes,
+            capture_parent_before.shared_backing_live_bytes,
+            capture_parent_after.shared_backing_live_bytes,
+            capture_parent_before.private_device_live_bytes,
+            capture_parent_after.private_device_live_bytes,
+            generated.len * @sizeOf(i64),
+            collected.peak_bytes,
+        });
+        std.debug.print("future_decode_probe backend_owned_full_logits_selected={} backend_owned_full_logits_calls={} backend_owned_full_logits_ns={} backend_owned_frame_successes={} generic_last_logits_calls={} gpu_greedy_selected={} gpu_greedy_calls={} gpu_greedy_ns={} gpu_greedy_frames={} generated_tokens={}\n", .{ probe_stats.backend_owned_selected, probe_stats.backend_owned_calls, probe_stats.backend_owned_ns, probe_stats.backend_owned_frames, probe_stats.generic_calls, probe_stats.gpu_greedy_selected, probe_stats.gpu_greedy_calls, probe_stats.gpu_greedy_ns, probe_stats.gpu_greedy_frames, policy.generated_tokens });
+        return .{ .allocator = self.allocator, .queries = collected, .generated_ids = generated, .generated_ids_sha256 = generated_sha, .source_before = boundary, .source_after = after, .early_eos_observations = eos_count, .backend_owned_full_logits_calls = probe_stats.backend_owned_calls, .backend_owned_full_logits_ns = probe_stats.backend_owned_ns, .backend_owned_frame_successes = probe_stats.backend_owned_frames, .generic_last_logits_calls = probe_stats.generic_calls, .backend_owned_full_logits_selected = probe_stats.backend_owned_selected, .gpu_greedy_calls = probe_stats.gpu_greedy_calls, .gpu_greedy_ns = probe_stats.gpu_greedy_ns, .gpu_greedy_frame_successes = probe_stats.gpu_greedy_frames, .gpu_greedy_selected = probe_stats.gpu_greedy_selected };
+    }
+
+    fn queryDiagnostic(p: quality_mod.QueryCollectionProvenance, c: *const runtime.kv.attention_match_queries.Collector, s: AttentionMatchQueryStats) quality_mod.QueryCollectionDiagnostic {
+        return .{
+            .provenance = p,
+            .setup_ns = s.setup_ns,
+            .prefix_clone_ns = s.prefix_ns,
+            .repeat_forward_ns = s.repeat_ns,
+            .cleanup_ns = s.cleanup_ns,
+            .forward_calls = s.forward_calls,
+            .samples = c.samples.len,
+            .repeat_rows = c.repeat_length,
+            .chunk_rows = 256,
+            .consumers = c.consumers.len,
+            .query_bytes = c.peak_bytes,
+            .cloned_bytes = s.cloned_bytes,
+            .shadow_allocation_bound_bytes = s.shadow_allocation_bound_bytes,
+            .shadow_owner_peak_bytes = s.shadow_owner_peak_bytes,
+            .ragged_attention_calls = s.ragged_repeat_calls,
+            .scope_released = s.shadow_scope_released,
+            .scope_delta_bytes = s.shadow_scope_delta_bytes,
+        };
+    }
+
+    fn captureReferenceCoverageTraining(self: *NativeGenerationPipeline, source_tokens: []const i64, source: *const NativeDecodeState, primary_parent: [32]u8, max_shadow: usize, policy: NativeCheckpointPrepare.ReferenceCoverageTrainingCapture.Policy, stats_out: ?*AttentionMatchQueryStats) !NativeCheckpointPrepare.ReferenceCoverageTrainingCapture {
+        const self_study = runtime.kv.attention_match_self_study_training;
+        const coverage = runtime.kv.attention_match_reference_coverage;
+        if (!builtin.is_test) return error.InvalidReferenceCoverageBinding;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const storage = source.kv_storage orelse return error.ReferenceCoverageStorageUnavailable;
+        const selection_workspace = switch (policy) {
+            .coverage320 => try coverage.workspaceBytes(source_tokens.len),
+            .dense512 => try coverage.dense512WorkspaceBytes(source_tokens.len),
+        };
+        if (selection_workspace > coverage.maximum_workspace_bytes) return error.CompactionQueryLimit;
+        const boundary: self_study.SourceBoundary = .{ .identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity, .sequence_id = source.sequence_id orelse return error.ReferenceCoverageSequenceUnavailable, .logical_tokens = source.total_tokens, .kv_revision = try compute.attentionMatchRevision(storage), .tokens_sha256 = self_study.hashTokens(source_tokens) };
+        var selection = switch (policy) {
+            .coverage320 => try coverage.select(self.allocator, source_tokens, coverage.source_study_tokens, coverage.sample_count, .{ .context = self, .check_fn = checkAttentionMatchQueryWork }),
+            .dense512 => try coverage.selectDense512(self.allocator, source_tokens, coverage.source_study_tokens, .{ .context = self, .check_fn = checkAttentionMatchQueryWork }),
+        };
+        errdefer selection.deinit();
+        var stats: AttentionMatchQueryStats = .{};
+        var collected = try self.collectAttentionMatchQueries(source_tokens, source, .{ .prefix_mode = .clone, .repeat_mode = .reference, .stats = &stats, .collection = .{ .samples_per_consumer = selection.offsets.len, .max_bytes = self_study.maximum_bytes }, .chunk_size = 256, .explicit_repeat_tokens = selection.repeat_tokens, .explicit_repeat_sha256 = selection.repeat_sha256, .explicit_sample_offsets = selection.offsets, .max_shadow_kv_bytes = max_shadow });
+        errdefer collected.deinit();
+        if (collected.samples.len != selection.positions.len) return error.InvalidReferenceCoverageBinding;
+        for (collected.samples, selection.positions) |observation, expected| if (observation.position != expected) return error.InvalidReferenceCoverageBinding;
+        const after: self_study.SourceBoundary = .{ .identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity, .sequence_id = source.sequence_id orelse return error.ReferenceCoverageSourceMutated, .logical_tokens = source.total_tokens, .kv_revision = try compute.attentionMatchRevision(storage), .tokens_sha256 = self_study.hashTokens(source_tokens) };
+        if (!std.meta.eql(boundary, after) or !stats.shadow_scope_released or stats.shadow_scope_delta_bytes != 0) return error.ReferenceCoverageSourceMutated;
+        if (stats_out) |out| out.* = stats;
+        return .{ .allocator = self.allocator, .queries = collected, .selection = selection, .policy = policy, .source_before = boundary, .source_after = after, .primary_parent_manifest_sha256 = primary_parent };
+    }
+
+    const FreshQualityPrefillPreparation = struct {
+        geometry: metal_compute.MetalCompute.FreshQualityGeometry,
+        before: metal_runtime.RawRuntimeMemoryStats,
+        after: metal_runtime.RawRuntimeMemoryStats,
+        e4_before: metal_runtime.E4FusedHalfStats,
+        e2_before: metal_runtime.E2FusedHalfStats,
+
+        fn retainedDeviceBytes(self: FreshQualityPrefillPreparation) !usize {
+            return std.math.cast(usize, try std.math.sub(u64, self.after.total_bytes, self.before.total_bytes)) orelse
+                error.CompactionWorkspaceLimit;
+        }
+    };
+
+    fn freshQualityPrefillGuard(
+        serving_prefill: bool,
+        supplied: bool,
+        has_scheduler: bool,
+        has_scheduler_lease: bool,
+        has_graph_cache: bool,
+        has_compiled_partition: bool,
+    ) !void {
+        if (!serving_prefill or supplied or has_scheduler or has_scheduler_lease or
+            has_graph_cache or has_compiled_partition)
+            return error.UnsupportedNativeQualityPreparedRoute;
+    }
+
+    /// Explicit test-only hook for a future fresh quality request. Existing
+    /// supplied/default paths do not call this function.
+    fn prepareFreshQualityPrefillSlots(self: *NativeGenerationPipeline, supplied: bool) !FreshQualityPrefillPreparation {
+        if (comptime !builtin.is_test or !build_options.enable_metal)
+            return error.UnsupportedNativeQualityPreparedRoute;
+        try freshQualityPrefillGuard(
+            true,
+            supplied,
+            self.scheduler != null,
+            self.scheduler_lease != null,
+            self.graph_cache != null,
+            self.compiled_partition_backend != null,
+        );
+        if (self.cb.kind() != .metal or self.kv_dtype != .f16)
+            return error.UnsupportedNativeQualityPreparedRoute;
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const decode_runtime = compute.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        if (metal_runtime.hasActiveFrame(decode_runtime) or metal_runtime.hasSubmittedFrame(decode_runtime))
+            return error.ContextTransactionBusy;
+        const before = metal_runtime.runtimeMemorySnapshot(decode_runtime);
+        const e4_before = try metal_runtime.e4FusedHalfStats(decode_runtime);
+        const e2_before = try metal_runtime.e2FusedHalfStats(decode_runtime);
+        const geometry = try compute.prepareFreshQualityImmutableSlots(self.gpt_config);
+        const after = metal_runtime.runtimeMemorySnapshot(decode_runtime);
+        if (before.attention_span_bytes != after.attention_span_bytes)
+            return error.InvalidNativeQualityPreparedRoute;
+        return .{
+            .geometry = geometry,
+            .before = before,
+            .after = after,
+            .e4_before = e4_before,
+            .e2_before = e2_before,
+        };
+    }
+
+    test "fresh quality prepared geometry guard is explicit and rejects attached routes" {
+        try freshQualityPrefillGuard(true, false, false, false, false, false);
+        inline for (.{
+            .{ false, false, false, false, false, false },
+            .{ true, true, false, false, false, false },
+            .{ true, false, true, false, false, false },
+            .{ true, false, false, true, false, false },
+            .{ true, false, false, false, true, false },
+            .{ true, false, false, false, false, true },
+        }) |args| try std.testing.expectError(error.UnsupportedNativeQualityPreparedRoute, freshQualityPrefillGuard(args[0], args[1], args[2], args[3], args[4], args[5]));
+    }
+
+    const NativeQualityServingPrefillResult = struct {
+        logits: []f32,
+        stats: NativeQualityServingPrefillStats,
+    };
 
     /// Reuse the public prefill loop for an empty, full-history exact owner.
     /// The private owner disables SWA ring eviction before this call, so every
     /// source donor remains available for calibration and checkpoint fitting.
-    fn nativeQualityServingPrefill(self: *NativeGenerationPipeline, state: *NativeDecodeState, tokens: []const i64) ![]f32 {
+    fn nativeQualityServingPrefill(self: *NativeGenerationPipeline, state: *NativeDecodeState, tokens: []const i64) !NativeQualityServingPrefillResult {
         if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeQualityPreparedRoute;
         var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
         defer if (execution_scope) |*scope| scope.deinit();
@@ -6433,13 +12458,16 @@ pub const NativeGenerationPipeline = struct {
             self.compiled_partition_backend != null or self.scheduler != null or self.scheduler_lease != null)
             return error.UnsupportedNativeQualityPreparedRoute;
         try setWorkloadProfileRegime(&self.cb, .prefill);
-        const output = try self.executePrefill(tokens, tokens.len, 0, state, .{ .prefill_chunk_size = 256 }, false, false, false);
+        const chunk_rows = nativeGenerationPrefillChunkCeiling(.metal, self.gpt_config, 2048);
+        var observed: PrefillExecutionStats = .{};
+        const output = try self.executePrefill(tokens, tokens.len, 0, state, .{ .prefill_chunk_size = chunk_rows, .prefill_execution_stats = &observed }, false, false, false);
         errdefer if (output.last_logits) |logits| self.allocator.free(logits);
         defer if (output.last_hidden) |hidden| self.cb.free(hidden);
         if (output.greedy_token != null or output.last_hidden != null or output.last_hidden_rows != 0 or
             state.total_tokens != tokens.len or state.allow_swa_ring)
             return error.UnsupportedNativeQualityPreparedRoute;
-        return output.last_logits orelse error.UnsupportedNativeQualityPreparedRoute;
+        if (observed.completed_rows != tokens.len) return error.UnsupportedNativeQualityPreparedRoute;
+        return .{ .logits = output.last_logits orelse return error.UnsupportedNativeQualityPreparedRoute, .stats = try nativeQualityServingPrefillStats(chunk_rows, observed) };
     }
 
     fn nativeQualityPublicText(self: *NativeGenerationPipeline, prompt: []const u8, tokens: []const i64) ![]u8 {
@@ -6469,22 +12497,46 @@ pub const NativeGenerationPipeline = struct {
         try checkAttentionMatchQueryWork(self);
         const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
         const storage = state.kv_storage orelse return error.UnsupportedNativeQualityPreparedRoute;
-        if (!compute.hasInstalledAttentionMatch(storage)) return error.UnsupportedNativeQualityPreparedRoute;
+        if (!compute.hasInstalledAttentionMatch(storage)) {
+            std.log.err("native_quality_prepared_route_rejected kind=greedy stage=installed_binding", .{});
+            return error.UnsupportedNativeQualityPreparedRoute;
+        }
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
         try state.appendPrefillChunk(1);
         const context = state.gptDecodeContext(state.total_tokens, 1);
-        var frame = (try AttentionMatchForwardFrame.begin(self, 1, &context)) orelse return error.UnsupportedNativeQualityPreparedRoute;
+        var frame = (try AttentionMatchForwardFrame.begin(self, 1, &context)) orelse {
+            std.log.err("native_quality_prepared_route_rejected kind=greedy stage=frame_begin execution={any}", .{compute.attentionMatchExecution()});
+            return error.UnsupportedNativeQualityPreparedRoute;
+        };
         defer frame.deinit();
         const before = compute.attention_match_prepared_tail_blocks;
-        const next = (try decoder_gated_runtime.forwardGreedyToken(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers, token, state.total_tokens, &context)) orelse return error.UnsupportedNativeQualityPreparedRoute;
-        try frame.finish();
+        const coalesced = compute.attentionMatchExecution().coalesced_stage;
+        const next: usize = if (coalesced) blk: {
+            const tensor = (try decoder_gated_runtime.forwardLastLogitsTensor(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers, token, state.total_tokens, &context)) orelse {
+                std.log.err("native_quality_prepared_route_rejected kind=greedy stage=decoder_forward", .{});
+                return error.UnsupportedNativeQualityPreparedRoute;
+            };
+            defer self.cb.free(tensor);
+            try frame.finish();
+            const logits = try self.cb.toFloat32(tensor, self.allocator);
+            defer self.allocator.free(logits);
+            gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, logits);
+            break :blk activations.argmax(logits);
+        } else blk: {
+            const legacy = (try decoder_gated_runtime.forwardGreedyToken(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers, token, state.total_tokens, &context)) orelse {
+                std.log.err("native_quality_prepared_route_rejected kind=greedy stage=decoder_forward", .{});
+                return error.UnsupportedNativeQualityPreparedRoute;
+            };
+            if (legacy < 0 or legacy >= self.gpt_config.vocab_size) return error.InvalidNativeQualityPreparedRoute;
+            break :blk @intCast(legacy);
+        };
+        if (!coalesced) try frame.finish();
         const blocks = compute.attention_match_prepared_tail_blocks - before;
         @import("../runtime/kv/metal_checkpoint_quality.zig").validatePreparedStep(blocks, self.gpt_config.num_hidden_layers, first) catch |err| {
-            std.log.err("native_quality_prepared_route_rejected kind=greedy position={d} completed_blocks={d} expected_blocks={d} cold_allowed={} next={d}", .{ state.total_tokens - 1, blocks, self.gpt_config.num_hidden_layers, first, next });
+            std.log.err("native_quality_prepared_route_rejected kind=greedy position={d} completed_blocks={d} expected_blocks={d} cold_allowed={}", .{ state.total_tokens - 1, blocks, self.gpt_config.num_hidden_layers, first });
             return err;
         };
-        if (next < 0 or next >= self.gpt_config.vocab_size) return error.InvalidNativeQualityPreparedRoute;
-        return .{ .token = @intCast(next), .blocks = blocks };
+        return .{ .token = next, .blocks = blocks };
     }
 
     /// Score the prepared decoder's raw logits after its frame has drained.
@@ -6497,14 +12549,23 @@ pub const NativeGenerationPipeline = struct {
         try checkAttentionMatchQueryWork(self);
         const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
         const storage = state.kv_storage orelse return error.UnsupportedNativeQualityPreparedRoute;
-        if (!compute.hasInstalledAttentionMatch(storage)) return error.UnsupportedNativeQualityPreparedRoute;
+        if (!compute.hasInstalledAttentionMatch(storage)) {
+            std.log.err("native_quality_prepared_route_rejected kind=teacher stage=installed_binding", .{});
+            return error.UnsupportedNativeQualityPreparedRoute;
+        }
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
         try state.appendPrefillChunk(1);
         const context = state.gptDecodeContext(state.total_tokens, 1);
-        var frame = (try AttentionMatchForwardFrame.begin(self, 1, &context)) orelse return error.UnsupportedNativeQualityPreparedRoute;
+        var frame = (try AttentionMatchForwardFrame.begin(self, 1, &context)) orelse {
+            std.log.err("native_quality_prepared_route_rejected kind=teacher stage=frame_begin execution={any}", .{compute.attentionMatchExecution()});
+            return error.UnsupportedNativeQualityPreparedRoute;
+        };
         defer frame.deinit();
         const before = compute.attention_match_prepared_tail_blocks;
-        const tensor = (try decoder_gated_runtime.forwardLastLogitsTensor(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers, token, state.total_tokens, &context)) orelse return error.UnsupportedNativeQualityPreparedRoute;
+        const tensor = (try decoder_gated_runtime.forwardLastLogitsTensor(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers, token, state.total_tokens, &context)) orelse {
+            std.log.err("native_quality_prepared_route_rejected kind=teacher stage=decoder_forward", .{});
+            return error.UnsupportedNativeQualityPreparedRoute;
+        };
         defer self.cb.free(tensor);
         try frame.finish();
         const blocks = compute.attention_match_prepared_tail_blocks - before;
@@ -6547,6 +12608,77 @@ pub const NativeGenerationPipeline = struct {
         return @intCast(next);
     }
 
+    const NativeQualityRouteCounters = struct {
+        forward: usize,
+        serving: usize,
+        ordinary: usize,
+        ordinary_frames: usize,
+        prepared: usize,
+        cold: usize,
+    };
+
+    fn validateNativeQualityPreparedCounters(value: NativeQualityRouteCounters) !void {
+        if (value.ordinary != 0 or value.ordinary_frames != 0 or
+            value.serving != value.forward or value.prepared + value.cold != value.forward or
+            value.cold > 1)
+            return error.InvalidNativeQualityPreparedRoute;
+    }
+
+    fn validateNativeQualityOrdinaryCounters(value: NativeQualityRouteCounters, framed: bool) !void {
+        if (value.serving != 0 or value.prepared != 0 or value.cold != 0 or
+            (framed and value.ordinary != value.forward) or
+            (!framed and value.ordinary != 0) or value.ordinary_frames != value.ordinary)
+            return error.InvalidNativeQualityPreparedRoute;
+    }
+
+    fn qualityRouteCounters(value: anytype) NativeQualityRouteCounters {
+        return .{
+            .forward = value.forward_steps,
+            .serving = value.serving_forward_steps,
+            .ordinary = value.ordinary_serving_forward_steps,
+            .ordinary_frames = value.ordinary_backend_frames,
+            .prepared = value.prepared_forward_steps,
+            .cold = value.cold_staged_forward_steps,
+        };
+    }
+
+    fn validateNativeQualityBranchRoutes(
+        retained_prepared_source: bool,
+        exact_greedy: quality_mod.Greedy,
+        exact_teacher: quality_mod.Scores,
+        compacted_greedy: quality_mod.Greedy,
+        compacted_teacher: quality_mod.Scores,
+    ) !void {
+        const exact_greedy_counters = qualityRouteCounters(exact_greedy);
+        if (retained_prepared_source) {
+            try validateNativeQualityPreparedCounters(exact_greedy_counters);
+        } else if (exact_greedy_counters.ordinary != 0) {
+            try validateNativeQualityOrdinaryCounters(exact_greedy_counters, true);
+        } else {
+            try validateNativeQualityOrdinaryCounters(exact_greedy_counters, false);
+        }
+        // Teacher-forced exact-source scoring deliberately uses the raw exact
+        // append path. The prepared binding is exercised by the independent
+        // compacted branch and cannot silently relabel these exact counters.
+        try validateNativeQualityOrdinaryCounters(qualityRouteCounters(exact_teacher), false);
+        try validateNativeQualityPreparedCounters(qualityRouteCounters(compacted_greedy));
+        try validateNativeQualityPreparedCounters(qualityRouteCounters(compacted_teacher));
+    }
+
+    test "context native quality validates retained exact and compacted route roles" {
+        var exact_greedy: quality_mod.Greedy = .{ .forward_steps = 3, .serving_forward_steps = 3, .prepared_forward_steps = 2, .cold_staged_forward_steps = 1 };
+        const exact_teacher: quality_mod.Scores = .{ .forward_steps = 19 };
+        const compacted_greedy: quality_mod.Greedy = .{ .forward_steps = 3, .serving_forward_steps = 3, .prepared_forward_steps = 3 };
+        const compacted_teacher: quality_mod.Scores = .{ .forward_steps = 19, .serving_forward_steps = 19, .prepared_forward_steps = 18, .cold_staged_forward_steps = 1 };
+        try validateNativeQualityBranchRoutes(true, exact_greedy, exact_teacher, compacted_greedy, compacted_teacher);
+        exact_greedy.serving_forward_steps = 0;
+        try std.testing.expectError(error.InvalidNativeQualityPreparedRoute, validateNativeQualityBranchRoutes(true, exact_greedy, exact_teacher, compacted_greedy, compacted_teacher));
+        try std.testing.expectError(error.InvalidNativeQualityPreparedRoute, validateNativeQualityBranchRoutes(false, compacted_greedy, exact_teacher, compacted_greedy, compacted_teacher));
+        var bad_compacted_teacher = compacted_teacher;
+        bad_compacted_teacher.ordinary_serving_forward_steps = 1;
+        try std.testing.expectError(error.InvalidNativeQualityPreparedRoute, validateNativeQualityBranchRoutes(true, .{}, exact_teacher, compacted_greedy, bad_compacted_teacher));
+    }
+
     /// Each branch owns a fresh clone of an immutable prompt boundary. Answer
     /// tokens are chosen independently, with the ordinary model suppression
     /// mask and EOS policy. No gold provider is reachable from this helper.
@@ -6556,6 +12688,7 @@ pub const NativeGenerationPipeline = struct {
         prefill_logits: []const f32,
         prompt: []const u8,
         output_limit: usize,
+        force_raw_exact: bool,
     ) !@import("../runtime/kv/metal_checkpoint_quality.zig").Greedy {
         const allocation = runtime.kv.host_allocation_tracker;
         var owner = try allocation.RequestAllocationOwner.init(null);
@@ -6569,10 +12702,15 @@ pub const NativeGenerationPipeline = struct {
         var logits = try self.allocator.dupe(f32, prefill_logits);
         defer self.allocator.free(logits);
         const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
-        const compacted = compute.hasInstalledAttentionMatch(&shadow.storage.?);
-        const ordinary_prepared = !compacted and platform.env.getenvBool("ANTFLY_METAL_QUALITY_ORDINARY_PREPARED_GREEDY");
+        const installed = compute.hasInstalledAttentionMatch(&shadow.storage.?);
+        if (force_raw_exact and !installed) return error.UnsupportedNativeQualityPreparedRoute;
+        const compacted = installed and !force_raw_exact;
+        const ordinary_prepared = !force_raw_exact and !compacted and platform.env.getenvBool("ANTFLY_METAL_QUALITY_ORDINARY_PREPARED_GREEDY");
         var prepared_next: ?usize = null;
         var result: @import("../runtime/kv/metal_checkpoint_quality.zig").Greedy = .{ .owner_id = owner.tracker.snapshot().owner_identity };
+        const route_before = metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime);
+        const fused_half_before = try metal_runtime.e4FusedHalfStats(compute.provider_impl.raw_decode_runtime);
+        const rejection_before = compute.provider_impl.raw_lm_head_q4_resident_sampling_rejections;
         errdefer self.allocator.free(result.public_text);
         for (0..output_limit) |index| {
             try checkAttentionMatchQueryWork(self);
@@ -6600,7 +12738,7 @@ pub const NativeGenerationPipeline = struct {
                 result.ordinary_serving_forward_steps += 1;
                 result.ordinary_backend_frames += 1;
             } else {
-                const next_logits = try self.appendAttentionMatchProbeTokens(&shadow.state.?, &next);
+                const next_logits = try self.appendAttentionMatchProbeTokens(&shadow.state.?, &next, null);
                 self.allocator.free(logits);
                 logits = next_logits;
             }
@@ -6609,6 +12747,18 @@ pub const NativeGenerationPipeline = struct {
         const text_count = result.count - @intFromBool(result.hit_eos);
         result.public_text = try self.nativeQualityPublicText(prompt, result.tokens[0..text_count]);
         try compute.synchronizeAttentionMatchKv();
+        const route_after = metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime);
+        const fused_half_after = try metal_runtime.e4FusedHalfStats(compute.provider_impl.raw_decode_runtime);
+        result.lm_head_q4_q6_refine_dispatches = try std.math.sub(u64, route_after.lm_head_q4_q6_refine_dispatches, route_before.lm_head_q4_q6_refine_dispatches);
+        result.lm_head_q6_full_argmax_dispatches = try std.math.sub(u64, route_after.lm_head_q6_full_argmax_dispatches, route_before.lm_head_q6_full_argmax_dispatches);
+        result.lm_head_q4_resident_sampling_rejections = try std.math.sub(u64, compute.provider_impl.raw_lm_head_q4_resident_sampling_rejections, rejection_before);
+        inline for (.{ "attempts", "hits", "pair_dispatches", "down_dispatches", "fallbacks", "fatal_failures" }) |field| {
+            @field(result, "e4_fused_half_" ++ field) = try std.math.sub(
+                u64,
+                @field(fused_half_after, field),
+                @field(fused_half_before, field),
+            );
+        }
         _ = owner.captureCommitted();
         shadow.deinit();
         result.release = owner.release();
@@ -6656,7 +12806,7 @@ pub const NativeGenerationPipeline = struct {
                 result.prepared_layer_blocks += @intCast(step.blocks);
                 if (step.blocks != 0) result.prepared_forward_steps += 1 else result.cold_staged_forward_steps += 1;
                 break :blk step.logits;
-            } else try self.appendAttentionMatchProbeTokens(&shadow.state.?, &next);
+            } else try self.appendAttentionMatchProbeTokens(&shadow.state.?, &next, null);
             self.allocator.free(logits);
             logits = next_logits;
             result.forward_steps += 1;
@@ -6689,6 +12839,24 @@ pub const NativeGenerationPipeline = struct {
         return elapsed;
     }
 
+    fn admitNativeQualityPhase(
+        plan: @import("../runtime/kv/metal_checkpoint_cycles.zig").PhasePlan,
+        retained_wire_bytes: usize,
+    ) !usize {
+        var charged = plan;
+        charged.wire = try std.math.add(usize, charged.wire, retained_wire_bytes);
+        return charged.admit();
+    }
+
+    fn chargeFreshQualityPreparedDevice(
+        plan: @import("../runtime/kv/metal_checkpoint_cycles.zig").PhasePlan,
+        retained_device_bytes: usize,
+    ) !@import("../runtime/kv/metal_checkpoint_cycles.zig").PhasePlan {
+        var charged = plan;
+        charged.device = try std.math.add(usize, charged.device, retained_device_bytes);
+        return charged;
+    }
+
     /// Native whole-head qualification, independent of the legacy block
     /// profile route. Gold is revealed only after transport, installed-byte
     /// verification, and both independent greedy answers. Numerical or task
@@ -6699,6 +12867,93 @@ pub const NativeGenerationPipeline = struct {
         prompt: []const u8,
         request: @import("../runtime/kv/metal_checkpoint_quality.zig").Request,
         reference: @import("../runtime/kv/metal_checkpoint_quality.zig").Reference,
+        self_study: ?*const PreparedCompactionStudy,
+    ) !@import("../runtime/kv/metal_checkpoint_quality.zig").Report {
+        return self.qualifyMetalCheckpointQualityCandidate(tokens, prompt, request, reference, .{ .fit = self_study }, null);
+    }
+
+    /// Test-only one-case capture of the already accepted fitted wire. The
+    /// normal quality entry remains byte-retention free.
+    pub fn qualifyMetalCheckpointQualityCapturing(
+        self: *NativeGenerationPipeline,
+        tokens: []const i64,
+        prompt: []const u8,
+        request: @import("../runtime/kv/metal_checkpoint_quality.zig").Request,
+        reference: @import("../runtime/kv/metal_checkpoint_quality.zig").Reference,
+        self_study: ?*const PreparedCompactionStudy,
+        capture: @import("../runtime/kv/metal_checkpoint_quality.zig").AcceptedSnapshotCapture,
+    ) !@import("../runtime/kv/metal_checkpoint_quality.zig").Report {
+        return self.qualifyMetalCheckpointQualityCandidate(tokens, prompt, request, reference, .{ .fit = self_study }, capture);
+    }
+
+    /// Test-only evaluation of an already fitted, independently sealed
+    /// checkpoint. Authentication completes before the first Metal dispatch.
+    pub fn qualifySuppliedMetalCheckpointQuality(
+        self: *NativeGenerationPipeline,
+        tokens: []const i64,
+        prompt: []const u8,
+        request: @import("../runtime/kv/metal_checkpoint_quality.zig").Request,
+        reference: @import("../runtime/kv/metal_checkpoint_quality.zig").Reference,
+        supplied: @import("../runtime/kv/metal_checkpoint_quality.zig").SuppliedCandidate,
+    ) !@import("../runtime/kv/metal_checkpoint_quality.zig").Report {
+        return self.qualifyMetalCheckpointQualityCandidate(tokens, prompt, request, reference, .{ .supplied = supplied }, null);
+    }
+
+    pub fn qualifyPreparedServingMetalCheckpointQuality(
+        self: *NativeGenerationPipeline,
+        tokens: []const i64,
+        prompt: []const u8,
+        request: @import("../runtime/kv/metal_checkpoint_quality.zig").Request,
+        reference: @import("../runtime/kv/metal_checkpoint_quality.zig").Reference,
+        prepared: *@import("../runtime/kv/metal_checkpoint_quality.zig").PreparedServingCandidate,
+    ) !@import("../runtime/kv/metal_checkpoint_quality.zig").Report {
+        return self.qualifyMetalCheckpointQualityCandidate(tokens, prompt, request, reference, .{ .prepared_serving = prepared }, null);
+    }
+
+    const MetalQualityCandidateSource = union(enum) {
+        fit: ?*const PreparedCompactionStudy,
+        supplied: @import("../runtime/kv/metal_checkpoint_quality.zig").SuppliedCandidate,
+        prepared_serving: *@import("../runtime/kv/metal_checkpoint_quality.zig").PreparedServingCandidate,
+
+        fn runsFit(self: MetalQualityCandidateSource) bool {
+            return switch (self) {
+                .fit => true,
+                .supplied => false,
+                .prepared_serving => false,
+            };
+        }
+
+        fn usesRetainedSource(self: MetalQualityCandidateSource) bool {
+            return switch (self) {
+                .prepared_serving => true,
+                else => false,
+            };
+        }
+
+        fn retainedInputBytes(self: MetalQualityCandidateSource) usize {
+            return switch (self) {
+                .prepared_serving => |prepared| prepared.retained_input_bytes,
+                else => 0,
+            };
+        }
+
+        fn runFitFactory(self: MetalQualityCandidateSource, context: anytype, factory: anytype) !?NativeCheckpointPrepare.HostPlan {
+            return switch (self) {
+                .fit => try factory(context),
+                .supplied => null,
+                .prepared_serving => null,
+            };
+        }
+    };
+
+    fn qualifyMetalCheckpointQualityCandidate(
+        self: *NativeGenerationPipeline,
+        tokens: []const i64,
+        prompt: []const u8,
+        request: @import("../runtime/kv/metal_checkpoint_quality.zig").Request,
+        reference: @import("../runtime/kv/metal_checkpoint_quality.zig").Reference,
+        candidate_source: MetalQualityCandidateSource,
+        capture: ?@import("../runtime/kv/metal_checkpoint_quality.zig").AcceptedSnapshotCapture,
     ) !@import("../runtime/kv/metal_checkpoint_quality.zig").Report {
         if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
         const quality = @import("../runtime/kv/metal_checkpoint_quality.zig");
@@ -6711,15 +12966,58 @@ pub const NativeGenerationPipeline = struct {
         const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
         const capacity = try request.capacity(tokens.len, self.gpt_config.max_position_embeddings);
         const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
+        if (capture != null and (!candidate_source.runsFit() or request.admission != .cumulative_ladder_4_3_2 or request.encoding != .f16))
+            return error.InvalidNativeQualityRequest;
+        var quality_future_training_authority: ?runtime.kv.attention_match_future_decode_training.Authority = null;
+        var quality_future_training_capture: ?quality.FutureTrainingCaptureEvidence = null;
+        switch (candidate_source) {
+            .fit => {},
+            .supplied => |supplied| {
+                if (request.admission != .fixed) return error.InvalidNativeQualityRequest;
+                try supplied.validate(identity, tokens);
+            },
+            .prepared_serving => |prepared| {
+                if (request.admission != .cumulative_ladder_4_3_2 or request.encoding != prepared.encoding or
+                    !quality.preparedEvidenceProfileMatchesEncoding(prepared.producer_v18, prepared.encoding)) return error.InvalidNativeQualityRequest;
+                if (!prepared.live) return error.InvalidPreparedServingQualityCandidate;
+            },
+        }
+        var prepared_source_preflight: ?checkpoint.Owned = null;
+        defer if (prepared_source_preflight) |*owned| owned.deinit();
+        var supplied_preflight: ?checkpoint.Owned = switch (candidate_source) {
+            .fit => null,
+            .supplied => |supplied| try supplied.decode(self.allocator, identity, tokens, control),
+            .prepared_serving => |prepared| candidate: {
+                const pair = try prepared.take(identity, tokens);
+                prepared_source_preflight = pair.source;
+                break :candidate pair.candidate;
+            },
+        };
+        defer if (supplied_preflight) |*owned| owned.deinit();
+        if (supplied_preflight) |owned| {
+            if (owned.state.logical_length != tokens.len or owned.state.tokens.len != tokens.len) return error.SuppliedCheckpointBlueprintMismatch;
+            for (owned.state.tokens, tokens) |actual, wanted| if (wanted < 0 or actual != @as(u32, @intCast(wanted))) return error.SuppliedCheckpointBlueprintMismatch;
+        }
         const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
         const limits = checkpoint.serving_limits;
         const previous_quality_execution = compute.attention_match_execution;
         defer compute.attention_match_execution = previous_quality_execution;
-        compute.attention_match_execution = native_checkpoint_release.Execution.diagnosticFromEnvironment();
+        compute.attention_match_execution = if (candidate_source.usesRetainedSource())
+            self.prepared_quality_execution orelse return error.InvalidQualityWorkerAuthority
+        else
+            native_checkpoint_release.Execution.diagnosticFromEnvironment();
         const auxiliary = NativeCheckpointPrepare.auxiliary_host_bytes;
         const estimate = try runtime.tier.memory.estimateGptGeneration(.metal, .f16, self.gpt_config, @max(capacity, tokens.len + 512), 1, 256);
         for (tokens) |token| if (token < 0 or token >= self.gpt_config.vocab_size) return error.InvalidCompactionQueries;
-        _ = try (cycles.PhasePlan{ .owners = 0, .host = auxiliary, .device = try std.math.add(usize, estimate.kv_bytes, estimate.scratch_bytes) }).admit();
+        const cold_device_reserve = try std.math.add(usize, try std.math.add(usize, estimate.kv_bytes, estimate.scratch_bytes), estimate.additional_backend_weight_bytes);
+        const retained_checkpoint_host_bytes = if (prepared_source_preflight) |source| try std.math.add(
+            usize,
+            try source.state.residentBytes(),
+            try supplied_preflight.?.state.residentBytes(),
+        ) else 0;
+        // Prepared input byte arrays remain caller-owned and live until this
+        // entire call returns. Charge them independently from decoded states.
+        _ = try (cycles.PhasePlan{ .owners = 0, .host = try std.math.add(usize, auxiliary, retained_checkpoint_host_bytes), .wire = candidate_source.retainedInputBytes(), .device = cold_device_reserve }).admit();
         var exact_owner = try allocation.RequestAllocationOwner.init(null);
         var exact_owner_live = true;
         defer if (exact_owner_live) {
@@ -6741,88 +13039,398 @@ pub const NativeGenerationPipeline = struct {
         var phase_durations: quality.PhaseDurations = .{};
         try exact.initEmptyAllocated(self, exact_owner.allocator(), exact_owner.tracker);
         const serving_prefill = platform.env.getenvBool("ANTFLY_METAL_QUALITY_SERVING_PREFILL");
-        const logits = if (serving_prefill)
-            try self.nativeQualityServingPrefill(&exact.state.?, tokens)
-        else
-            try self.appendAttentionMatchProbeTokens(&exact.state.?, tokens);
+        const prepare_fresh_geometry = platform.env.getenvBool("ANTFLY_METAL_QUALITY_PREPARE_FRESH_GEOMETRY");
+        var fresh_preparation: ?FreshQualityPrefillPreparation = null;
+        var prepared_device_bytes: usize = 0;
+        if (prepare_fresh_geometry) {
+            if (!serving_prefill or !candidate_source.runsFit()) return error.UnsupportedNativeQualityPreparedRoute;
+            phase = "geometry_prepare";
+            fresh_preparation = try self.prepareFreshQualityPrefillSlots(false);
+            prepared_device_bytes = try fresh_preparation.?.retainedDeviceBytes();
+            _ = try (try chargeFreshQualityPreparedDevice(.{
+                .owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker),
+                .host = auxiliary,
+            }, prepared_device_bytes)).admit();
+            phase_durations.geometry_prepare = self.finishNativeQualityPhase(&phase_started, "geometry_prepare");
+            phase = "exact_prefill";
+        }
+        const source_prefill_fused_half_before = try metal_runtime.e4FusedHalfStats(compute.provider_impl.raw_decode_runtime);
+        const source_prefill_e2_fused_half_before = try metal_runtime.e2FusedHalfStats(compute.provider_impl.raw_decode_runtime);
+        var retained_source_ids: ?[]u32 = null;
+        defer if (retained_source_ids) |ids| self.allocator.free(ids);
+        var serving_prefill_stats: ?NativeQualityServingPrefillStats = null;
+        const logits = if (prepared_source_preflight) |source| retained: {
+            const ids = try self.allocator.alloc(u32, tokens.len);
+            retained_source_ids = ids;
+            for (tokens, ids) |token, *id| id.* = @intCast(token);
+            break :retained try self.restoreAttentionMatchStateWithLocalCapacityPolicy(source.state, ids, request.output_tokens, true, &exact.state.?, null, .exact_window_causal_union_v1);
+        } else if (serving_prefill) serving: {
+            const result = try self.nativeQualityServingPrefill(&exact.state.?, tokens);
+            serving_prefill_stats = result.stats;
+            break :serving result.logits;
+        } else try self.appendAttentionMatchProbeTokens(&exact.state.?, tokens, null);
+        if (prepared_source_preflight) |*source| {
+            source.deinit();
+            prepared_source_preflight = null;
+        }
+        const source_prefill_fused_half_after = try metal_runtime.e4FusedHalfStats(compute.provider_impl.raw_decode_runtime);
+        const source_prefill_e2_fused_half_after = try metal_runtime.e2FusedHalfStats(compute.provider_impl.raw_decode_runtime);
+        const quality_prefill_requested_ceiling_rows: usize = if (serving_prefill_stats) |stats| stats.requested_ceiling_rows else if (serving_prefill) 0 else 256;
+        const quality_prefill_chunk_rows: usize = if (serving_prefill_stats) |stats| stats.used_chunk_rows else if (serving_prefill) 0 else 256;
+        const quality_prefill_eligible_rows = tokens.len - @intFromBool(!serving_prefill);
+        const quality_prefill_full_chunk_count = if (serving_prefill_stats) |stats| stats.full_chunk_count else if (serving_prefill) 0 else quality_prefill_eligible_rows / quality_prefill_chunk_rows;
+        const quality_prefill_tail_rows = if (serving_prefill_stats) |stats| stats.tail_rows else if (serving_prefill) 0 else quality_prefill_eligible_rows % quality_prefill_chunk_rows;
+        const quality_prefill_final_token_rows: usize = @intFromBool(!serving_prefill);
+        const quality_prefill_completed_chunks = if (serving_prefill_stats) |stats| stats.completed_chunks else if (serving_prefill) 0 else quality_prefill_full_chunk_count + @intFromBool(quality_prefill_tail_rows != 0) + quality_prefill_final_token_rows;
+        const source_prefill_fused_half_delta: metal_runtime.E4FusedHalfStats = .{
+            .attempts = try std.math.sub(u64, source_prefill_fused_half_after.attempts, source_prefill_fused_half_before.attempts),
+            .hits = try std.math.sub(u64, source_prefill_fused_half_after.hits, source_prefill_fused_half_before.hits),
+            .pair_dispatches = try std.math.sub(u64, source_prefill_fused_half_after.pair_dispatches, source_prefill_fused_half_before.pair_dispatches),
+            .down_dispatches = try std.math.sub(u64, source_prefill_fused_half_after.down_dispatches, source_prefill_fused_half_before.down_dispatches),
+            .fallbacks = try std.math.sub(u64, source_prefill_fused_half_after.fallbacks, source_prefill_fused_half_before.fallbacks),
+            .fatal_failures = try std.math.sub(u64, source_prefill_fused_half_after.fatal_failures, source_prefill_fused_half_before.fatal_failures),
+        };
+        const source_prefill_e2_fused_half_delta: metal_runtime.E2FusedHalfStats = .{
+            .attempts = try std.math.sub(u64, source_prefill_e2_fused_half_after.attempts, source_prefill_e2_fused_half_before.attempts),
+            .hits = try std.math.sub(u64, source_prefill_e2_fused_half_after.hits, source_prefill_e2_fused_half_before.hits),
+            .pair_6144_dispatches = try std.math.sub(u64, source_prefill_e2_fused_half_after.pair_6144_dispatches, source_prefill_e2_fused_half_before.pair_6144_dispatches),
+            .pair_12288_dispatches = try std.math.sub(u64, source_prefill_e2_fused_half_after.pair_12288_dispatches, source_prefill_e2_fused_half_before.pair_12288_dispatches),
+            .down_6144_dispatches = try std.math.sub(u64, source_prefill_e2_fused_half_after.down_6144_dispatches, source_prefill_e2_fused_half_before.down_6144_dispatches),
+            .down_12288_dispatches = try std.math.sub(u64, source_prefill_e2_fused_half_after.down_12288_dispatches, source_prefill_e2_fused_half_before.down_12288_dispatches),
+            .fallbacks = try std.math.sub(u64, source_prefill_e2_fused_half_after.fallbacks, source_prefill_e2_fused_half_before.fallbacks),
+            .fatal_failures = try std.math.sub(u64, source_prefill_e2_fused_half_after.fatal_failures, source_prefill_e2_fused_half_before.fatal_failures),
+        };
+        std.debug.print(
+            "metal_checkpoint_quality_source_prefill route={s} serving_prefill={} requested_rows={d} completed_rows={d} requested_chunk_ceiling_rows={d} full_chunk_rows={d} full_chunk_count={d} tail_rows={d} final_token_rows={d} completed_chunks={d} fused_half_attempts={d} fused_half_hits={d} fused_half_pair_dispatches={d} fused_half_down_dispatches={d} fused_half_fallbacks={d} fused_half_fatal_failures={d}\n",
+            .{
+                if (fresh_preparation != null) "prepared_eager_full_history" else if (serving_prefill) "eager_full_history" else "probe_append",
+                serving_prefill,
+                tokens.len,
+                exact.state.?.total_tokens,
+                quality_prefill_requested_ceiling_rows,
+                quality_prefill_chunk_rows,
+                quality_prefill_full_chunk_count,
+                quality_prefill_tail_rows,
+                quality_prefill_final_token_rows,
+                quality_prefill_completed_chunks,
+                source_prefill_fused_half_delta.attempts,
+                source_prefill_fused_half_delta.hits,
+                source_prefill_fused_half_delta.pair_dispatches,
+                source_prefill_fused_half_delta.down_dispatches,
+                source_prefill_fused_half_delta.fallbacks,
+                source_prefill_fused_half_delta.fatal_failures,
+            },
+        );
+        std.debug.print(
+            "metal_checkpoint_quality_source_prefill_e2 prepared={} attempts={d} hits={d} pair_6144={d} pair_12288={d} down_6144={d} down_12288={d} fallbacks={d} fatal_failures={d}\n",
+            .{ fresh_preparation != null, source_prefill_e2_fused_half_delta.attempts, source_prefill_e2_fused_half_delta.hits, source_prefill_e2_fused_half_delta.pair_6144_dispatches, source_prefill_e2_fused_half_delta.pair_12288_dispatches, source_prefill_e2_fused_half_delta.down_6144_dispatches, source_prefill_e2_fused_half_delta.down_12288_dispatches, source_prefill_e2_fused_half_delta.fallbacks, source_prefill_e2_fused_half_delta.fatal_failures },
+        );
         defer self.allocator.free(logits);
         phase_durations.exact_prefill = self.finishNativeQualityPhase(&phase_started, "exact_prefill");
         const source_revision = try compute.attentionMatchRevision(&exact.storage.?);
         const owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker);
-        const plan = try NativeCheckpointPrepare.hostPlan(self.gpt_config, tokens.len, request.encoding, true);
-        const query_overhead = try std.math.add(usize, auxiliary, try std.math.add(usize, estimate.scratch_bytes, NativeCheckpointPrepare.collection_options.max_bytes));
-        const query_base = try std.math.add(usize, owners, query_overhead);
-        if (query_base >= cycles.max_aggregate_bytes) return error.CompactionWorkspaceLimit;
-        const query_limit = @min(4 * 1024 * 1024 * 1024, cycles.max_aggregate_bytes - query_base);
-        var admitted = try (cycles.PhasePlan{ .owners = owners, .host = auxiliary, .queries = NativeCheckpointPrepare.collection_options.max_bytes, .device = try std.math.add(usize, estimate.scratch_bytes, query_limit) }).admit();
-        phase = "query_collection";
-        var query_stats: AttentionMatchQueryStats = .{};
-        const started = mtpProfileTimestamp(true, self.io);
-        var queries = try self.collectAttentionMatchQueries(tokens, &exact.state.?, .{
-            .prefix_mode = .clone,
-            .repeat_mode = .reference,
-            .stats = &query_stats,
-            .collection = NativeCheckpointPrepare.collection_options,
-            .chunk_size = 256,
-            .max_repeat_tokens = 512,
-            .representative_repeat = true,
-            .max_shadow_kv_bytes = query_limit,
-        });
-        var queries_live = true;
-        defer if (queries_live) queries.deinit();
-        phase_durations.query_collection = self.finishNativeQualityPhase(&phase_started, "query_collection");
-        if (!query_stats.shadow_scope_released or query_stats.shadow_scope_delta_bytes != 0 or !query_stats.shadow_uses_source_owner)
-            return error.ContextPhysicalAccountingUnavailable;
-        admitted = @max(admitted, try (cycles.PhasePlan{ .owners = owners, .host = try std.math.add(usize, auxiliary, plan.fit_bytes), .queries = queries.peak_bytes }).admit());
-        var prepare: NativeCheckpointPrepare = .{
-            .encoding = request.encoding,
-            .minimum_savings_ratio = request.minimum_savings_ratio,
-            .planned_fit_host_bytes = plan.fit_bytes,
-            .planned_fit_workers = plan.workers,
-            .planned_fit_head_workspace_bytes = plan.head_workspace_bytes,
-            .capture_quality_evidence = true,
-        };
-        defer prepare.deinit();
-        phase = "fit";
-        const stats = try self.prepareMetalAttentionMatchFit(tokens, logits, &exact.state.?, &queries, mtpProfileElapsedNs(true, self.io, started), &prepare);
+        var admitted: usize = 0;
+        var stats: runtime.kv.attention_match_engine.Stats = .{};
+        var calibration: ?runtime.kv.attention_match_queries.Seal = null;
         var calibration_consumers: [256]runtime.kv.attention_match_queries.Consumer = @splat(std.mem.zeroes(runtime.kv.attention_match_queries.Consumer));
-        if (queries.consumers.len > calibration_consumers.len) return error.InvalidNativeQualityPublication;
-        @memcpy(calibration_consumers[0..queries.consumers.len], queries.consumers);
-        queries.deinit();
-        queries_live = false;
-        phase_durations.fit = self.finishNativeQualityPhase(&phase_started, "fit");
-        if (prepare.result == null or prepare.result.?.outcome != .compacted or stats.completed_chunks == 0 or
-            stats.validated_heads == 0 or stats.candidate_global_bytes >= stats.source_global_bytes)
-            return error.CompactionCycleDidNotCompact;
-        phase = "transport";
-        const candidate_bytes = try prepare.result.?.checkpoint.state.residentBytes();
-        const wire_bytes = try checkpoint.encodedSize(prepare.result.?.checkpoint.state, limits, request.encoding, control);
-        admitted = @max(admitted, try (cycles.PhasePlan{ .owners = owners, .host = try std.math.add(usize, auxiliary, candidate_bytes), .wire = wire_bytes, .import = limits.max_state_bytes }).admit());
-        const wire = try checkpoint.encodeWithEncoding(self.allocator, prepare.result.?.checkpoint.state, limits, request.encoding, control);
-        var wire_live = true;
-        defer if (wire_live) self.allocator.free(wire);
+        var query_stats: AttentionMatchQueryStats = .{};
         var wire_digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(wire, &wire_digest, .{});
-        var decoded = try checkpoint.decodeWithControl(self.allocator, wire, identity, limits, control);
-        var decoded_live = true;
+        var source_checkpoint_sha256: [32]u8 = undefined;
+        var supplied_closure_sha256: ?[32]u8 = null;
+        var solves: u64 = 0;
+        var fit_calls: usize = 0;
+        var calibration_executed = false;
+        var decoded: checkpoint.Owned = undefined;
+        var decoded_live = false;
         defer if (decoded_live) decoded.deinit();
-        const solves = prepare.fp64_accelerated_value_solves;
-        prepare.deinit();
-        self.allocator.free(wire);
-        wire_live = false;
+        var retained_fitted_wire: ?[]u8 = null;
+        defer if (retained_fitted_wire) |wire| self.allocator.free(wire);
+        const fit_plan = try candidate_source.runFitFactory(.{
+            .config = self.gpt_config,
+            .tokens = tokens.len,
+            .encoding = request.encoding,
+            .admission = request.admission,
+            .chunk_rows = request.chunk_rows,
+            .reject_exact_active_fixed_point = request.reject_exact_active_fixed_point,
+            .fit_strategy = request.fit_strategy,
+            .private_dense512_policy = request.private_dense512_policy,
+            .private_resident_hybrid_policy = request.private_resident_hybrid_policy,
+        }, struct {
+            fn call(context: anytype) !NativeCheckpointPrepare.HostPlan {
+                var result = try NativeCheckpointPrepare.hostPlanWithQualityPolicy(context.config, context.tokens, context.encoding, true, context.admission, context.chunk_rows, context.reject_exact_active_fixed_point);
+                result.fit_strategy = context.fit_strategy;
+                if (context.fit_strategy == .identity_chunk_coefficients_adaptive_v18)
+                    result = if (context.private_dense512_policy)
+                        try NativeCheckpointPrepare.v18ParallelPlanWithWorkspaceProfile(result.source_bytes, try NativeCheckpointPrepare.v18EligibleHeadCount(context.config), if (context.private_resident_hybrid_policy) 2 * 1024 * 1024 * 1024 else 1024 * 1024 * 1024, if (context.private_resident_hybrid_policy) .resident_native_hybrid_2g_v1 else .standard)
+                    else
+                        try NativeCheckpointPrepare.v18ParallelPlan(result.source_bytes, try NativeCheckpointPrepare.v18EligibleHeadCount(context.config));
+                return result;
+            }
+        }.call);
+        const self_study: ?*const PreparedCompactionStudy = switch (candidate_source) {
+            .fit => |value| value,
+            .supplied => null,
+            .prepared_serving => null,
+        };
+        const whole_fit_dir = if (comptime builtin.is_test) switch (candidate_source) {
+            .fit => platform.env.getenv("ANTFLY_METAL_QUALITY_WHOLE_FIT_INPUT_DIR"),
+            .supplied => null,
+            .prepared_serving => null,
+        } else null;
+        const augmentation_dir = if (comptime builtin.is_test) if (whole_fit_dir != null) platform.env.getenv("ANTFLY_METAL_QUALITY_TRAINING_AUGMENTATION_DIR") else null else null;
+        const self_study_dir = if (comptime builtin.is_test) platform.env.getenv("ANTFLY_METAL_QUALITY_SELF_STUDY_TRAINING_DIR") else null;
+        const reference_coverage_dir = if (comptime builtin.is_test) platform.env.getenv("ANTFLY_METAL_QUALITY_REFERENCE_COVERAGE_TRAINING_DIR") else null;
+        const future_augmentation_dir = if (comptime builtin.is_test) platform.env.getenv("ANTFLY_METAL_QUALITY_FUTURE_TRAINING_AUGMENTATION_DIR") else null;
+        if (future_augmentation_dir != null and whole_fit_dir == null) return error.InvalidFutureAugmentation;
+        if (self_study_dir != null and reference_coverage_dir != null) return error.InvalidReferenceCoverageBinding;
+        if (reference_coverage_dir) |dir| {
+            if (augmentation_dir == null or !std.mem.eql(u8, dir, augmentation_dir.?)) return error.InvalidReferenceCoverageBinding;
+        } else if ((self_study_dir == null) != (self_study == null) or (self_study_dir != null and augmentation_dir == null) or (self_study_dir != null and !std.mem.eql(u8, self_study_dir.?, augmentation_dir.?))) return error.InvalidSelfStudyBinding;
+        var self_study_capture: ?NativeCheckpointPrepare.SelfStudyTrainingCapture = null;
+        defer if (self_study_capture) |*owned| owned.deinit();
+        if (self_study) |prepared| if (reference_coverage_dir == null) {
+            const fixed = try wholeFitDigestEnv("ANTFLY_METAL_QUALITY_SELF_STUDY_PRIMARY_MANIFEST_SHA256");
+            const primary_manifest_path = platform.env.getenv("ANTFLY_METAL_QUALITY_SELF_STUDY_PRIMARY_MANIFEST_PATH") orelse return error.InvalidSelfStudyBinding;
+            if (!std.fs.path.isAbsolute(primary_manifest_path)) return error.InvalidSelfStudyBinding;
+            const whole_fit_manifest = try std.Io.Dir.cwd().readFileAlloc(self.io.?, primary_manifest_path, self.allocator, .limited(runtime.kv.attention_match_whole_fit_input.manifest_reservation));
+            defer self.allocator.free(whole_fit_manifest);
+            var actual_primary: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(whole_fit_manifest, &actual_primary, .{});
+            if (!std.mem.eql(u8, &fixed, &actual_primary)) return error.InvalidSelfStudyBinding;
+            self_study_capture = try self.captureSelfStudyTraining(tokens, &exact.state.?, prepared, fixed, 4 * 1024 * 1024 * 1024);
+        };
+        const all_queries_started = mtpProfileTimestamp(true, self.io);
+        var dense_stats: AttentionMatchQueryStats = .{};
+        var dense_diag: quality_mod.QueryCollectionDiagnostic = .{};
+        var primary_diag: quality_mod.QueryCollectionDiagnostic = .{};
+        var all_queries_ns: u64 = 0;
+        var reference_coverage_capture: ?NativeCheckpointPrepare.ReferenceCoverageTrainingCapture = null;
+        defer if (reference_coverage_capture) |*owned| owned.deinit();
+        if (reference_coverage_dir != null) {
+            const retained = try wholeFitDigestEnv("ANTFLY_METAL_QUALITY_REFERENCE_COVERAGE_PRIMARY_MANIFEST_SHA256");
+            const retained_path = platform.env.getenv("ANTFLY_METAL_QUALITY_REFERENCE_COVERAGE_PRIMARY_MANIFEST_PATH") orelse return error.InvalidReferenceCoverageBinding;
+            if (!std.fs.path.isAbsolute(retained_path)) return error.InvalidReferenceCoverageBinding;
+            const retained_bytes = try std.Io.Dir.cwd().readFileAlloc(self.io.?, retained_path, self.allocator, .limited(runtime.kv.attention_match_whole_fit_input.manifest_reservation));
+            defer self.allocator.free(retained_bytes);
+            var actual: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(retained_bytes, &actual, .{});
+            if (!std.mem.eql(u8, &actual, &retained)) return error.InvalidReferenceCoverageBinding;
+            const requested_samples = try std.fmt.parseInt(u16, platform.env.getenv("ANTFLY_METAL_QUALITY_REFERENCE_COVERAGE_SAMPLES") orelse return error.InvalidReferenceCoverageBinding, 10);
+            const coverage_policy: NativeCheckpointPrepare.ReferenceCoverageTrainingCapture.Policy = switch (requested_samples) {
+                320 => .coverage320,
+                512 => .dense512,
+                else => return error.InvalidReferenceCoverageBinding,
+            };
+            reference_coverage_capture = try self.captureReferenceCoverageTraining(tokens, &exact.state.?, retained, 4 * 1024 * 1024 * 1024, coverage_policy, &dense_stats);
+            if (coverage_policy == .dense512) {
+                dense_diag = queryDiagnostic(.dense512_reference, &reference_coverage_capture.?.queries, dense_stats);
+                try dense_diag.validate();
+            }
+        }
+        switch (candidate_source) {
+            .fit => {
+                const plan = fit_plan orelse return error.InvalidNativeQualityPublication;
+                const whole_fit_samples: u16 = if (whole_fit_dir != null) try std.fmt.parseInt(u16, platform.env.getenv("ANTFLY_METAL_QUALITY_WHOLE_FIT_INPUT_SAMPLES") orelse return error.InvalidWholeFitInputBinding, 10) else 320;
+                if (whole_fit_dir != null and whole_fit_samples != 320 and whole_fit_samples != 512) return error.InvalidWholeFitInputBinding;
+                const augmentation_samples: u16 = if (augmentation_dir != null) try std.fmt.parseInt(u16, platform.env.getenv("ANTFLY_METAL_QUALITY_TRAINING_AUGMENTATION_SAMPLES") orelse "320", 10) else runtime.kv.attention_match_training_augmentation.legacy_samples_per_stratum;
+                if (augmentation_dir != null and !runtime.kv.attention_match_training_augmentation.allowedSamples(augmentation_samples) and
+                    !(reference_coverage_capture != null and reference_coverage_capture.?.policy == .dense512 and augmentation_samples == 512)) return error.InvalidTrainingAugmentationBinding;
+                const quality_collection: runtime.kv.attention_match_queries.Options = if (whole_fit_dir != null) .{ .samples_per_consumer = whole_fit_samples, .max_bytes = if (whole_fit_samples == 512) 80 * 1024 * 1024 else 64 * 1024 * 1024 } else NativeCheckpointPrepare.collection_options;
+                const augmentation_bytes: usize = if (reference_coverage_capture) |coverage_capture|
+                    @max(64 * 1024 * 1024, coverage_capture.queries.peak_bytes)
+                else if (augmentation_dir != null)
+                    64 * 1024 * 1024
+                else
+                    0;
+                const reserved_query_bytes = if (request.private_dense512_policy)
+                    plan.query_reserve_bytes
+                else
+                    try std.math.add(usize, quality_collection.max_bytes, augmentation_bytes);
+                const query_overhead = try std.math.add(usize, auxiliary, try std.math.add(usize, estimate.scratch_bytes, reserved_query_bytes));
+                const query_base = try std.math.add(usize, owners, query_overhead);
+                if (query_base >= cycles.max_aggregate_bytes) return error.CompactionWorkspaceLimit;
+                const query_limit = @min(4 * 1024 * 1024 * 1024, cycles.max_aggregate_bytes - query_base);
+                admitted = try (try chargeFreshQualityPreparedDevice(.{ .owners = owners, .host = auxiliary, .queries = reserved_query_bytes, .device = try std.math.add(usize, estimate.scratch_bytes, query_limit) }, prepared_device_bytes)).admit();
+                phase = "query_collection";
+                const started = mtpProfileTimestamp(true, self.io);
+                var queries = try self.collectAttentionMatchQueries(tokens, &exact.state.?, .{ .prefix_mode = .clone, .repeat_mode = .reference, .stats = &query_stats, .collection = quality_collection, .chunk_size = 256, .max_repeat_tokens = 512, .representative_repeat = true, .max_shadow_kv_bytes = query_limit });
+                var queries_live = true;
+                defer if (queries_live) queries.deinit();
+                primary_diag = queryDiagnostic(.primary_reference, &queries, query_stats);
+                try primary_diag.validate();
+                if (!query_stats.shadow_scope_released or query_stats.shadow_scope_delta_bytes != 0 or !query_stats.shadow_uses_source_owner) return error.ContextPhysicalAccountingUnavailable;
+                NativeCheckpointPrepare.validatePlanAdmission(plan, request.admission, request.chunk_rows, request.reject_exact_active_fixed_point) catch return error.InvalidNativeQualityPublication;
+                var prepare: NativeCheckpointPrepare = .{ .encoding = request.encoding, .minimum_savings_ratio = request.minimum_savings_ratio, .planned_fit_host_bytes = plan.fit_bytes, .planned_fit_workers = plan.workers, .planned_fit_head_workspace_bytes = plan.head_workspace_bytes, .admission = request.admission, .chunk_rows = request.chunk_rows, .reject_exact_active_fixed_point = request.reject_exact_active_fixed_point, .capture_quality_evidence = true };
+                prepare.quality_fit_strategy = request.fit_strategy;
+                var private_collection: ?PrivateDenseCollection = null;
+                defer if (private_collection) |*owned| owned.deinit();
+                var future_decode_capture: ?NativeCheckpointPrepare.FutureDecodeTrainingCapture = null;
+                defer if (future_decode_capture) |*owned| owned.deinit();
+                var fit_query_bytes = queries.peak_bytes;
+                if (try configurePrivateQualityDense(&prepare, plan, request.private_dense512_policy, request.private_future_decode_training_v1, request.private_resident_hybrid_policy, request.resident_hybrid_authority)) {
+                    private_collection = try self.collectPrivateDenseTraining(tokens, &exact.state.?, &queries, &dense_stats);
+                    if (request.private_future_decode_training_v1 or request.private_resident_hybrid_policy) {
+                        private_collection.?.merged.clear();
+                        future_decode_capture = try self.captureFutureDecodeTraining(tokens, &exact.state.?, logits, query_limit, if (comptime builtin.is_test) null else {});
+                        if (future_decode_capture.?.generated_ids.len != 256) return error.InvalidNativeQualityPublication;
+                        var generated_ids: [256]i64 = undefined;
+                        @memcpy(generated_ids[0..], future_decode_capture.?.generated_ids);
+                        quality_future_training_capture = .{
+                            .generated_ids = generated_ids,
+                            .generated_ids_count = @intCast(generated_ids.len),
+                            .generated_ids_sha256 = future_decode_capture.?.generated_ids_sha256,
+                            .source_before = future_decode_capture.?.source_before,
+                            .source_after = future_decode_capture.?.source_after,
+                            .early_eos_observations = future_decode_capture.?.early_eos_observations,
+                            .backend_owned_full_logits_calls = future_decode_capture.?.backend_owned_full_logits_calls,
+                            .backend_owned_full_logits_ns = future_decode_capture.?.backend_owned_full_logits_ns,
+                            .backend_owned_frame_successes = future_decode_capture.?.backend_owned_frame_successes,
+                            .generic_last_logits_calls = future_decode_capture.?.generic_last_logits_calls,
+                            .backend_owned_full_logits_selected = future_decode_capture.?.backend_owned_full_logits_selected,
+                            .gpu_greedy_calls = future_decode_capture.?.gpu_greedy_calls,
+                            .gpu_greedy_ns = future_decode_capture.?.gpu_greedy_ns,
+                            .gpu_greedy_frame_successes = future_decode_capture.?.gpu_greedy_frame_successes,
+                            .gpu_greedy_selected = future_decode_capture.?.gpu_greedy_selected,
+                        };
+                        const future_batches = try future_decode_capture.?.queries.finish();
+                        if (request.private_resident_hybrid_policy) {
+                            prepare.private_dense_training = &private_collection.?.training;
+                            prepare.private_future_training_batches = future_batches;
+                            const collector_seal = try private_collection.?.queries.seal(.{ .context = self, .check_fn = checkAttentionMatchQueryWork });
+                            prepare.private_collector_source_length = collector_seal.source_length;
+                            prepare.private_collector_repeat_length = collector_seal.repeat_length;
+                            prepare.private_collector_required_bytes = private_collection.?.queries.peak_bytes;
+                            prepare.private_collector_manifest_sha256 = collector_seal.sha256;
+                        } else {
+                            const merged = try mergePrivateFutureDecodeTraining(self.allocator, try queries.finish(), private_collection.?.training.batches, future_batches, future_decode_capture.?, .{ .context = self, .check_fn = checkAttentionMatchQueryWork });
+                            quality_future_training_capture.?.heldout_sha256_before_fit = merged.authority.heldout_sha256;
+                            prepare.future_training_authority = merged.authority;
+                            private_collection.?.merged = merged.training;
+                            private_collection.?.live_bytes = try privateDenseQueryLiveBytes(&queries, &private_collection.?.queries, &private_collection.?.selection, &private_collection.?.training, &private_collection.?.merged);
+                        }
+                        private_collection.?.live_bytes = try std.math.add(usize, private_collection.?.live_bytes, future_decode_capture.?.queries.peak_bytes);
+                        private_collection.?.live_bytes = try std.math.add(usize, private_collection.?.live_bytes, try std.math.mul(usize, future_decode_capture.?.generated_ids.len, @sizeOf(i64)));
+                    }
+                    dense_diag = private_collection.?.diagnostic;
+                    prepare.private_dense512_query_rows = if (request.private_future_decode_training_v1)
+                        private_collection.?.merged.positions.len
+                    else
+                        private_collection.?.training.positions.len;
+                    fit_query_bytes = private_collection.?.live_bytes;
+                    if (fit_query_bytes > plan.query_reserve_bytes) return error.CompactionWorkspaceLimit;
+                    prepare.private_query_live_bytes = fit_query_bytes;
+                    prepare.private_training_batches = if (request.private_resident_hybrid_policy) null else private_collection.?.merged.batches;
+                }
+                defer prepare.deinit();
+                defer prepare.private_training_batches = null;
+                all_queries_ns = mtpProfileElapsedNs(true, self.io, all_queries_started);
+                phase_durations.query_collection = self.finishNativeQualityPhase(&phase_started, "query_collection");
+                admitted = @max(admitted, try (try chargeFreshQualityPreparedDevice(.{ .owners = owners, .host = try std.math.add(usize, auxiliary, plan.fit_bytes), .queries = fit_query_bytes }, prepared_device_bytes)).admit());
+                if (whole_fit_dir) |output_dir| prepare.whole_fit_input = .{ .output_dir = output_dir, .augmentation_output_dir = augmentation_dir, .augmentation_samples = augmentation_samples, .samples = whole_fit_samples, .method = if (platform.env.getenvBool("ANTFLY_METAL_QUALITY_WHOLE_FIT_INPUT_TOP2")) .top2 else .top1, .source_freeze_sha256 = try wholeFitDigestEnv("ANTFLY_METAL_QUALITY_WHOLE_FIT_INPUT_SOURCE_FREEZE_SHA256"), .binary_sha256 = try wholeFitDigestEnv("ANTFLY_METAL_QUALITY_WHOLE_FIT_INPUT_BINARY_SHA256"), .exporter_sha256 = try wholeFitDigestEnv("ANTFLY_METAL_QUALITY_WHOLE_FIT_INPUT_EXPORTER_SHA256"), .self_study = if (self_study_capture) |*owned| owned else null, .reference_coverage = if (reference_coverage_capture) |*owned| owned else null };
+                if (future_augmentation_dir) |output_dir| {
+                    const authority = prepare.future_training_authority orelse return error.InvalidFutureAugmentation;
+                    const evidence = quality_future_training_capture orelse return error.InvalidFutureAugmentation;
+                    try evidence.validate(authority);
+                    if (!request.private_future_decode_training_v1 or !std.fs.path.isAbsolute(output_dir)) return error.InvalidFutureAugmentation;
+                    prepare.future_mix_output_dir = output_dir;
+                    prepare.future_training_capture = evidence;
+                    prepare.future_historical_study_tokens_sha256 = private_collection.?.selection.repeat_sha256;
+                }
+                phase = "fit";
+                fit_calls = 1;
+                calibration_executed = true;
+                stats = try self.prepareMetalAttentionMatchFit(tokens, logits, &exact.state.?, &queries, mtpProfileElapsedNs(true, self.io, started), &prepare);
+                if (queries.consumers.len > calibration_consumers.len) return error.InvalidNativeQualityPublication;
+                @memcpy(calibration_consumers[0..queries.consumers.len], queries.consumers);
+                queries.deinit();
+                queries_live = false;
+                phase_durations.fit = self.finishNativeQualityPhase(&phase_started, "fit");
+                const fit_outcome = if (prepare.result) |result| @tagName(result.outcome) else "missing";
+                const result_source_host_bytes = if (prepare.result) |result| result.source_host_bytes else 0;
+                std.debug.print(
+                    "metal_checkpoint_quality_fit_result outcome={s} admission={s} chunk_rows={d} reject_exact_active_fixed_point={} minimum_savings_ratio={d} attempted_chunks={d} completed_chunks={d} validated_heads={d} preserved_heads={d} retention_retries={d} convergence_fallbacks={d} source_host_bytes={d} source_global_bytes={d} candidate_global_bytes={d} fitted_global_bytes={d} fitted_global_savings_ratio={d} actual_global_savings_ratio={d} max_rejected_mass_error={d} max_rejected_output_rmse={d} max_head_mass_error={d} max_head_output_rmse={d}\n",
+                    .{ fit_outcome, @tagName(request.admission), request.chunk_rows, request.reject_exact_active_fixed_point, request.minimum_savings_ratio, stats.attempted_chunks, stats.completed_chunks, stats.validated_heads, stats.preserved_heads, stats.retention_retries, stats.convergence_fallbacks, result_source_host_bytes, stats.source_global_bytes, stats.candidate_global_bytes, stats.fitted_global_bytes, stats.fitted_global_savings_ratio, stats.actual_global_savings_ratio, stats.max_rejected_mass_error, stats.max_rejected_output_rmse, stats.max_head_mass_error, stats.max_head_output_rmse },
+                );
+                if (prepare.result == null or prepare.result.?.outcome != .compacted or stats.completed_chunks == 0 or stats.validated_heads == 0 or stats.candidate_global_bytes >= stats.source_global_bytes) return error.CompactionCycleDidNotCompact;
+                quality_future_training_authority = prepare.result.?.future_training_authority;
+                calibration = prepare.quality_calibration orelse return error.InvalidNativeQualityPublication;
+                source_checkpoint_sha256 = prepare.quality_source_sha256;
+                solves = prepare.fp64_accelerated_value_solves;
+                phase = "transport";
+                const candidate_state = switch (prepare.result.?.payload) {
+                    .host => |owned| owned.state,
+                    .device => return error.UnsupportedNativeQualityRoute,
+                };
+                const candidate_bytes = try candidate_state.residentBytes();
+                const wire_bytes = try checkpoint.encodedSize(candidate_state, limits, request.encoding, control);
+                admitted = @max(admitted, try (try chargeFreshQualityPreparedDevice(.{ .owners = owners, .host = try std.math.add(usize, auxiliary, candidate_bytes), .wire = wire_bytes, .import = limits.max_state_bytes }, prepared_device_bytes)).admit());
+                const wire = try checkpoint.encodeWithEncoding(self.allocator, candidate_state, limits, request.encoding, control);
+                var branch_wire_live = true;
+                defer if (branch_wire_live) self.allocator.free(wire);
+                if (capture != null) {
+                    retained_fitted_wire = wire;
+                    branch_wire_live = false;
+                }
+                std.crypto.hash.sha2.Sha256.hash(wire, &wire_digest, .{});
+                decoded = try checkpoint.decodeWithControl(self.allocator, wire, identity, limits, control);
+                decoded_live = true;
+                phase_durations.transport = self.finishNativeQualityPhase(&phase_started, "transport");
+            },
+            .supplied => |supplied| {
+                fit_calls = 0;
+                calibration_executed = false;
+                supplied_closure_sha256 = supplied.closure_sha256;
+                stats = .{ .completed_chunks = supplied.completed_chunks, .validated_heads = supplied.validated_heads, .preserved_heads = supplied.preserved_heads, .source_global_bytes = supplied.source_global_bytes, .candidate_global_bytes = supplied.candidate_global_bytes, .fitted_global_bytes = supplied.candidate_global_bytes, .fitted_global_savings_ratio = @as(f64, @floatFromInt(supplied.source_global_bytes)) / @as(f64, @floatFromInt(supplied.candidate_global_bytes)), .actual_global_savings_ratio = @as(f64, @floatFromInt(supplied.source_global_bytes)) / @as(f64, @floatFromInt(supplied.candidate_global_bytes)), .max_head_mass_error = supplied.max_head_mass_error, .max_head_output_rmse = supplied.max_head_output_rmse };
+                source_checkpoint_sha256 = supplied.source_checkpoint_sha256;
+                wire_digest = supplied.wire_sha256;
+                admitted = try (try chargeFreshQualityPreparedDevice(.{ .owners = owners, .host = auxiliary, .wire = supplied.wire.len, .import = limits.max_state_bytes }, prepared_device_bytes)).admit();
+                decoded = supplied_preflight orelse return error.InvalidSuppliedCheckpointQualityCandidate;
+                supplied_preflight = null;
+                decoded_live = true;
+                if (decoded.state.logical_length != tokens.len or decoded.state.tokens.len != tokens.len) return error.SuppliedCheckpointBlueprintMismatch;
+                for (decoded.state.tokens, tokens) |actual, wanted| if (wanted < 0 or actual != @as(u32, @intCast(wanted))) return error.SuppliedCheckpointBlueprintMismatch;
+            },
+            .prepared_serving => |prepared| {
+                fit_calls = 0;
+                calibration_executed = false;
+                supplied_closure_sha256 = prepared.closure_sha256;
+                stats = .{ .completed_chunks = prepared.completed_chunks, .validated_heads = prepared.validated_heads, .preserved_heads = prepared.preserved_heads, .source_global_bytes = prepared.source_global_bytes, .candidate_global_bytes = prepared.candidate_global_bytes, .fitted_global_bytes = prepared.candidate_global_bytes, .fitted_global_savings_ratio = @as(f64, @floatFromInt(prepared.source_global_bytes)) / @as(f64, @floatFromInt(prepared.candidate_global_bytes)), .actual_global_savings_ratio = @as(f64, @floatFromInt(prepared.source_global_bytes)) / @as(f64, @floatFromInt(prepared.candidate_global_bytes)), .max_head_mass_error = prepared.max_head_mass_error, .max_head_output_rmse = prepared.max_head_output_rmse };
+                source_checkpoint_sha256 = prepared.source_checkpoint_sha256;
+                wire_digest = prepared.checkpoint_sha256;
+                decoded = supplied_preflight orelse return error.InvalidPreparedServingQualityCandidate;
+                supplied_preflight = null;
+                decoded_live = true;
+                if (decoded.state.logical_length != tokens.len or decoded.state.tokens.len != tokens.len) return error.SuppliedCheckpointBlueprintMismatch;
+                for (decoded.state.tokens, tokens) |actual, wanted| if (wanted < 0 or actual != @as(u32, @intCast(wanted))) return error.SuppliedCheckpointBlueprintMismatch;
+            },
+        }
+        if (candidate_source.runsFit() != (fit_calls == 1 and calibration_executed)) return error.InvalidNativeQualityPublication;
+        const retained_wire_bytes = if (retained_fitted_wire) |wire| wire.len else candidate_source.retainedInputBytes();
         const ids = try self.allocator.alloc(u32, tokens.len);
         defer self.allocator.free(ids);
         for (tokens, ids) |token, *id| id.* = @intCast(token);
-        phase_durations.transport = self.finishNativeQualityPhase(&phase_started, "transport");
+        if (!candidate_source.runsFit() and !candidate_source.usesRetainedSource()) {
+            var source_snapshot = try self.snapshotAttentionMatchState(ids, logits, &exact.state.?, identity, limits, limits.max_state_bytes);
+            defer source_snapshot.deinit();
+            const source_wire = try checkpoint.encodeWithEncoding(self.allocator, source_snapshot.state, limits, .f16, control);
+            defer self.allocator.free(source_wire);
+            var actual_source_digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(source_wire, &actual_source_digest, .{});
+            if (!std.mem.eql(u8, &actual_source_digest, &source_checkpoint_sha256)) return error.SuppliedCheckpointSourceMismatch;
+            phase_durations.transport = self.finishNativeQualityPhase(&phase_started, "transport");
+        }
         phase = "install";
-        admitted = @max(admitted, try (cycles.PhasePlan{
+        admitted = @max(admitted, try admitNativeQualityPhase(try chargeFreshQualityPreparedDevice(.{
             .owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker),
             .host = try std.math.add(usize, auxiliary, try decoded.state.residentBytes()),
             .device = try metal_attention_storage.allocationBytesWithControl(decoded.state, limits, control),
-        }).admit());
+        }, prepared_device_bytes), retained_wire_bytes));
         try compacted.initEmptyAllocated(self, compacted_owner.allocator(), compacted_owner.tracker);
         const before_install = try compute.attentionMatchRevision(&compacted.storage.?);
-        const compacted_logits = try self.restoreAttentionMatchState(decoded.state, ids, request.output_tokens, true, &compacted.state.?, null);
+        const compacted_logits = if (candidate_source.usesRetainedSource())
+            try self.restoreAttentionMatchStateWithLocalCapacityPolicy(decoded.state, ids, request.output_tokens, true, &compacted.state.?, null, .exact_window_causal_union_v1)
+        else
+            try self.restoreAttentionMatchState(decoded.state, ids, request.output_tokens, true, &compacted.state.?, null);
         defer self.allocator.free(compacted_logits);
         const after_install = try compute.attentionMatchRevision(&compacted.storage.?);
         if (after_install != before_install + 1) return error.InvalidNativeQualityPublication;
@@ -6849,18 +13457,77 @@ pub const NativeGenerationPipeline = struct {
             .allocator = self.allocator,
             .calibration_consumers = calibration_consumers,
             .phase_durations_ns = phase_durations,
+            .primary_query_collection = primary_diag,
+            .dense512_query_collection = dense_diag,
+            .query_collection_combined_before_fit_ns = all_queries_ns,
+            .future_training_authority = quality_future_training_authority,
+            .future_training_capture = quality_future_training_capture,
             .source_serving_prefill = serving_prefill,
+            .source_prefill_full_chunk_rows = quality_prefill_chunk_rows,
+            .source_prefill_full_chunk_count = quality_prefill_full_chunk_count,
+            .source_prefill_tail_rows = quality_prefill_tail_rows,
+            .source_prefill_final_token_rows = if (serving_prefill) 0 else 1,
+            .source_prefill_e4_fused_half_attempts = try std.math.sub(u64, source_prefill_fused_half_after.attempts, source_prefill_fused_half_before.attempts),
+            .source_prefill_e4_fused_half_hits = try std.math.sub(u64, source_prefill_fused_half_after.hits, source_prefill_fused_half_before.hits),
+            .source_prefill_e4_fused_half_pair_dispatches = try std.math.sub(u64, source_prefill_fused_half_after.pair_dispatches, source_prefill_fused_half_before.pair_dispatches),
+            .source_prefill_e4_fused_half_down_dispatches = try std.math.sub(u64, source_prefill_fused_half_after.down_dispatches, source_prefill_fused_half_before.down_dispatches),
+            .source_prefill_e4_fused_half_fallbacks = try std.math.sub(u64, source_prefill_fused_half_after.fallbacks, source_prefill_fused_half_before.fallbacks),
+            .source_prefill_e4_fused_half_fatal_failures = try std.math.sub(u64, source_prefill_fused_half_after.fatal_failures, source_prefill_fused_half_before.fatal_failures),
+            .source_prefill_e2_fused_half_attempts = source_prefill_e2_fused_half_delta.attempts,
+            .source_prefill_e2_fused_half_hits = source_prefill_e2_fused_half_delta.hits,
+            .source_prefill_e2_fused_half_pair_6144_dispatches = source_prefill_e2_fused_half_delta.pair_6144_dispatches,
+            .source_prefill_e2_fused_half_pair_12288_dispatches = source_prefill_e2_fused_half_delta.pair_12288_dispatches,
+            .source_prefill_e2_fused_half_down_6144_dispatches = source_prefill_e2_fused_half_delta.down_6144_dispatches,
+            .source_prefill_e2_fused_half_down_12288_dispatches = source_prefill_e2_fused_half_delta.down_12288_dispatches,
+            .source_prefill_e2_fused_half_fallbacks = source_prefill_e2_fused_half_delta.fallbacks,
+            .source_prefill_e2_fused_half_fatal_failures = source_prefill_e2_fused_half_delta.fatal_failures,
+            .source_prefill_prepared_geometry = if (fresh_preparation) |prepared| switch (prepared.geometry) {
+                .e2b_dense35 => 2,
+                .e4b_dense42 => 4,
+            } else 0,
+            .source_prefill_prepared_route = fresh_preparation != null,
+            .source_prefill_prepared_runtime_total_bytes_before = if (fresh_preparation) |prepared| prepared.before.total_bytes else 0,
+            .source_prefill_prepared_runtime_total_bytes_after = if (fresh_preparation) |prepared| prepared.after.total_bytes else 0,
+            .source_prefill_prepared_runtime_private_bytes_before = if (fresh_preparation) |prepared| prepared.before.private_bytes else 0,
+            .source_prefill_prepared_runtime_private_bytes_after = if (fresh_preparation) |prepared| prepared.after.private_bytes else 0,
+            .source_prefill_prepared_runtime_shared_bytes_before = if (fresh_preparation) |prepared| prepared.before.shared_bytes else 0,
+            .source_prefill_prepared_runtime_shared_bytes_after = if (fresh_preparation) |prepared| prepared.after.shared_bytes else 0,
+            .source_prefill_prepared_runtime_managed_bytes_before = if (fresh_preparation) |prepared| prepared.before.managed_bytes else 0,
+            .source_prefill_prepared_runtime_managed_bytes_after = if (fresh_preparation) |prepared| prepared.after.managed_bytes else 0,
+            .source_prefill_prepared_runtime_norm_bytes_before = if (fresh_preparation) |prepared| prepared.before.norm_bytes else 0,
+            .source_prefill_prepared_runtime_norm_bytes_after = if (fresh_preparation) |prepared| prepared.after.norm_bytes else 0,
+            .source_prefill_prepared_runtime_dense_linear_bytes_before = if (fresh_preparation) |prepared| prepared.before.dense_linear_bytes else 0,
+            .source_prefill_prepared_runtime_dense_linear_bytes_after = if (fresh_preparation) |prepared| prepared.after.dense_linear_bytes else 0,
+            .source_prefill_prepared_runtime_quant_linear_bytes_before = if (fresh_preparation) |prepared| prepared.before.quant_linear_bytes else 0,
+            .source_prefill_prepared_runtime_quant_linear_bytes_after = if (fresh_preparation) |prepared| prepared.after.quant_linear_bytes else 0,
+            .source_prefill_prepared_runtime_scratch_bytes_before = if (fresh_preparation) |prepared| prepared.before.scratch_bytes else 0,
+            .source_prefill_prepared_runtime_scratch_bytes_after = if (fresh_preparation) |prepared| prepared.after.scratch_bytes else 0,
+            .source_prefill_prepared_runtime_buffer_count_before = if (fresh_preparation) |prepared| prepared.before.buffer_count else 0,
+            .source_prefill_prepared_runtime_buffer_count_after = if (fresh_preparation) |prepared| prepared.after.buffer_count else 0,
+            .source_prefill_prepared_retained_device_bytes = @intCast(prepared_device_bytes),
             .frozen = .{
                 .identity = identity,
                 .observed = observed_configuration,
                 .execution = execution_configuration,
-                .configuration_sha256 = native_checkpoint_release.configurationFingerprint(execution_configuration, observed_configuration.backend_environment_sha256),
+                .configuration_sha256 = quality.fitStrategyConfigurationFingerprint(quality.admissionEncodingConfigurationFingerprint(native_checkpoint_release.configurationFingerprint(execution_configuration, observed_configuration.backend_environment_sha256), request.admission, request.chunk_rows, request.reject_exact_active_fixed_point, request.encoding), request.fit_strategy),
                 .implementation_sha256 = @import("compaction_identity").digest,
                 .prompt_sha256 = try context_teacher_forced.promptTokenDigest(tokens),
                 .checkpoint_sha256 = wire_digest,
                 .installed_sha256 = installed_digest,
-                .source_checkpoint_sha256 = prepare.quality_source_sha256,
-                .calibration = prepare.quality_calibration orelse return error.InvalidNativeQualityPublication,
+                .source_checkpoint_sha256 = source_checkpoint_sha256,
+                .calibration = calibration,
+                .candidate_source = switch (candidate_source) {
+                    .fit => .fitted,
+                    .supplied => .supplied,
+                    .prepared_serving => .prepared_serving,
+                },
+                .fit_calls = fit_calls,
+                .calibration_executed = calibration_executed,
+                .admission = request.admission,
+                .chunk_rows = request.chunk_rows,
+                .reject_exact_active_fixed_point = request.reject_exact_active_fixed_point,
+                .encoding = request.encoding,
+                .fit_strategy = request.fit_strategy,
                 .source_revision = source_revision,
                 .destination_revision_before_install = before_install,
                 .installed_revision = after_install,
@@ -6885,10 +13552,104 @@ pub const NativeGenerationPipeline = struct {
             .fp64_accelerated_value_solves = solves,
             .query_scope_released = query_stats.shadow_scope_released,
             .query_scope_delta_bytes = query_stats.shadow_scope_delta_bytes,
+            .candidate_source = switch (candidate_source) {
+                .fit => .fitted,
+                .supplied => .supplied,
+                .prepared_serving => .prepared_serving,
+            },
+            .source_route = if (candidate_source.usesRetainedSource()) .producer_retained_exact else .generated_exact,
+            .fit_calls = fit_calls,
+            .calibration_executed = calibration_executed,
+            .admission = request.admission,
+            .chunk_rows = request.chunk_rows,
+            .reject_exact_active_fixed_point = request.reject_exact_active_fixed_point,
+            .fit_strategy = request.fit_strategy,
+            .v18_policy_sha256 = quality.fitStrategyConfigurationFingerprint(@splat(0), request.fit_strategy),
+            .v18_eligible_heads = stats.v18_eligible_heads,
+            .v18_attempted_heads = stats.v18_attempted_heads,
+            .v18_accepted_heads = stats.v18_accepted_heads,
+            .v18_preserved_heads = stats.v18_preserved_heads,
+            .v18_fallback_heads = stats.v18_fallback_heads,
+            .v18_cache_ready_heads = stats.v18_cache_ready_heads,
+            .v18_planned_exact_heads = stats.v18_planned_exact_heads,
+            .v18_exact_f32_probability_heads = stats.v18_exact_f32_probability_heads,
+            .incremental_gram_chooser_calls = stats.incremental_gram_chooser_calls,
+            .v18_query_batch_rows = stats.v18_query_batch_rows,
+            .v18_planned_head_workspace_bytes = stats.v18_planned_head_workspace_bytes,
+            .v18_cache_phase_peak_bound_bytes = stats.v18_cache_phase_peak_bound_bytes,
+            .v18_bounded_heads = stats.v18_bounded_heads,
+            .v18_bounded_delta_heads = stats.v18_bounded_delta_heads,
+            .v18_bounded_delta_tiles = stats.v18_bounded_delta_tiles,
+            .v18_bounded_delta_backend_calls = stats.v18_bounded_delta_backend_calls,
+            .v18_bounded_delta_packed_bytes_peak = stats.v18_bounded_delta_packed_bytes_peak,
+            .v18_bounded_delta_staged_bytes_peak = stats.v18_bounded_delta_staged_bytes_peak,
+            .v18_bounded_delta_fallbacks = stats.v18_bounded_delta_fallbacks,
+            .v18_bounded_tsqr_heads = stats.v18_bounded_tsqr_heads,
+            .v18_bounded_tsqr_calls = stats.v18_bounded_tsqr_calls,
+            .v18_bounded_tsqr_workspace_peak_bytes = stats.v18_bounded_tsqr_workspace_peak_bytes,
+            .v18_bounded_tsqr_cancellation_checks = stats.v18_bounded_tsqr_cancellation_checks,
+            .v18_primary_budget_percent = stats.v18_primary_budget_percent,
+            .v18_budget_fallback_heads = stats.v18_budget_fallback_heads,
+            .v18_evidence_profile = if (request.fit_strategy == .legacy)
+                .none
+            else if (stats.v18_bounded_delta_heads > 0 and stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                .private_hybrid_bounded_accelerated_batch64_workspace1gib
+            else if (stats.v18_bounded_heads > 0 and stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                .private_hybrid_bounded_batch64_workspace1gib
+            else if (stats.v18_primary_budget_percent != 0)
+                switch (request.encoding) {
+                    .f16 => .private_physical_budget_batch64_workspace1gib,
+                    .fp8 => .private_fp8_physical_budget_batch64_workspace1gib,
+                    .rotated4 => .private_rotated4_physical_budget_batch64_workspace1gib,
+                    else => .none,
+                }
+            else if (stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                .private_budget95_batch64_workspace1gib
+            else
+                .legacy_batch16_workspace512mib,
+            .v18_evidence_profile_sha256 = if (request.fit_strategy == .legacy)
+                @splat(0)
+            else if (stats.v18_bounded_delta_heads > 0 and stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                quality.v18EvidenceProfileDigest(.private_hybrid_bounded_accelerated_batch64_workspace1gib)
+            else if (stats.v18_bounded_heads > 0 and stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                quality.v18EvidenceProfileDigest(.private_hybrid_bounded_batch64_workspace1gib)
+            else if (stats.v18_primary_budget_percent != 0)
+                quality.v18EvidenceProfileDigest(switch (request.encoding) {
+                    .f16 => .private_physical_budget_batch64_workspace1gib,
+                    .fp8 => .private_fp8_physical_budget_batch64_workspace1gib,
+                    .rotated4 => .private_rotated4_physical_budget_batch64_workspace1gib,
+                    else => .none,
+                })
+            else if (stats.v18_query_batch_rows == 64 and stats.v18_planned_head_workspace_bytes == 1024 * 1024 * 1024)
+                quality.v18EvidenceProfileDigest(.private_budget95_batch64_workspace1gib)
+            else
+                quality.v18EvidenceProfileDigest(.legacy_batch16_workspace512mib),
+            .v18_codec_physical_profile = if (stats.v18_bounded_heads > 0) switch (request.encoding) {
+                .f16 => .bounded_f16_codec_physical_v1,
+                .fp8 => .bounded_fp8_codec_physical_v1,
+                .rotated4 => .bounded_rotated4_codec_physical_v1,
+                else => .none,
+            } else .none,
+            .v18_codec_physical_profile_sha256 = if (stats.v18_bounded_heads > 0) quality.v18EvidenceProfileDigest(switch (request.encoding) {
+                .f16 => .bounded_f16_codec_physical_v1,
+                .fp8 => .bounded_fp8_codec_physical_v1,
+                .rotated4 => .bounded_rotated4_codec_physical_v1,
+                else => .none,
+            }) else @splat(0),
+            .v18_bounded_tsqr_policy_sha256 = if (stats.v18_bounded_tsqr_heads > 0) quality.boundedTsqrValuePolicyDigest() else @splat(0),
+            .supplied_closure_sha256 = supplied_closure_sha256,
         };
+        switch (candidate_source) {
+            .prepared_serving => |prepared| prepared.producer_v18.apply(&report),
+            else => {},
+        }
         errdefer report.deinit();
         try report.frozen.validate();
         phase = "model_slots";
+        report.admitted_peak_bytes = @max(report.admitted_peak_bytes, try admitNativeQualityPhase(try chargeFreshQualityPreparedDevice(.{
+            .owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker),
+            .host = auxiliary,
+        }, prepared_device_bytes), retained_wire_bytes));
         {
             var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
             defer if (execution_scope) |*scope| scope.deinit();
@@ -6905,25 +13666,32 @@ pub const NativeGenerationPipeline = struct {
         report.phase_durations_ns.model_slots = self.finishNativeQualityPhase(&phase_started, "model_slots");
         // Branches execute serially. Reserve one complete clone plus forward
         // scratch alongside both immutable boundary owners before any clone.
-        report.admitted_peak_bytes = @max(report.admitted_peak_bytes, try (cycles.PhasePlan{
+        report.admitted_peak_bytes = @max(report.admitted_peak_bytes, try admitNativeQualityPhase(try chargeFreshQualityPreparedDevice(.{
             .owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker),
             .host = auxiliary,
             .device = try std.math.add(usize, estimate.kv_bytes, estimate.scratch_bytes),
-        }).admit());
+        }, prepared_device_bytes), retained_wire_bytes));
         // No provider has been passed to preparation, study, fitting,
         // transport, installation, or either independent answer generator.
         phase = "exact_greedy";
-        report.exact_greedy = try self.nativeQualityGreedy(&exact.state.?, logits, prompt, request.output_tokens);
+        report.exact_greedy = try self.nativeQualityGreedy(&exact.state.?, logits, prompt, request.output_tokens, false);
         report.phase_durations_ns.exact_greedy = self.finishNativeQualityPhase(&phase_started, "exact_greedy");
         phase = "compacted_greedy";
         report.compacted_greedy_runtime_kv_bytes_before = metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime).attention_span_bytes;
-        report.compacted_greedy = try self.nativeQualityGreedy(&compacted.state.?, compacted_logits, prompt, request.output_tokens);
+        report.compacted_greedy = try self.nativeQualityGreedy(&compacted.state.?, compacted_logits, prompt, request.output_tokens, false);
         report.compacted_greedy_runtime_kv_bytes_after = metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime).attention_span_bytes;
         if (report.compacted_greedy_runtime_kv_bytes_after != report.compacted_greedy_runtime_kv_bytes_before) {
             std.log.err("native_quality_runtime_kv_changed phase=compacted_greedy before={d} after={d}", .{ report.compacted_greedy_runtime_kv_bytes_before, report.compacted_greedy_runtime_kv_bytes_after });
             return error.InvalidNativeQualityPreparedRoute;
         }
         report.phase_durations_ns.compacted_greedy = self.finishNativeQualityPhase(&phase_started, "compacted_greedy");
+        if (request.route_parity_diagnostic) {
+            // This third independent branch is the same authenticated exact
+            // source as exact_greedy, forced through the raw append path. The
+            // reference remains unavailable until all greedy branches finish.
+            report.exact_raw_greedy_diagnostic = try self.nativeQualityGreedy(&exact.state.?, logits, prompt, request.output_tokens, true);
+            report.route_parity_diagnostic_unqualified = true;
+        }
         phase = "reference_reveal";
         const gold = try reference.reveal(report.frozen, request.output_tokens);
         report.phase_durations_ns.reference_reveal = self.finishNativeQualityPhase(&phase_started, "reference_reveal");
@@ -6932,6 +13700,11 @@ pub const NativeGenerationPipeline = struct {
         phase = "exact_teacher";
         report.exact_teacher = try self.nativeQualityTeacher(&exact.state.?, logits, gold, false);
         report.phase_durations_ns.exact_teacher = self.finishNativeQualityPhase(&phase_started, "exact_teacher");
+        if (request.route_parity_diagnostic) {
+            // Same exact source and gold sequence, but the prepared serving
+            // continuation. No fitted/compacted checkpoint participates.
+            report.exact_prepared_teacher_diagnostic = try self.nativeQualityTeacher(&exact.state.?, logits, gold, true);
+        }
         phase = "compacted_teacher";
         report.compacted_teacher_runtime_kv_bytes_before = metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime).attention_span_bytes;
         report.compacted_teacher = try self.nativeQualityTeacher(&compacted.state.?, compacted_logits, gold, true);
@@ -6942,18 +13715,11 @@ pub const NativeGenerationPipeline = struct {
         }
         report.phase_durations_ns.compacted_teacher = self.finishNativeQualityPhase(&phase_started, "compacted_teacher");
         phase = "teardown";
-        if (report.exact_greedy.serving_forward_steps != 0 or report.exact_teacher.serving_forward_steps != 0 or
-            (report.exact_greedy.ordinary_serving_forward_steps != 0 and report.exact_greedy.ordinary_serving_forward_steps != report.exact_greedy.forward_steps) or
-            report.exact_greedy.ordinary_backend_frames != report.exact_greedy.ordinary_serving_forward_steps or
-            report.exact_teacher.ordinary_serving_forward_steps != 0 or report.exact_teacher.ordinary_backend_frames != 0 or
-            report.compacted_greedy.ordinary_serving_forward_steps != 0 or report.compacted_greedy.ordinary_backend_frames != 0 or
-            report.compacted_teacher.ordinary_serving_forward_steps != 0 or report.compacted_teacher.ordinary_backend_frames != 0 or
-            report.compacted_greedy.serving_forward_steps != report.compacted_greedy.forward_steps or
-            report.compacted_teacher.serving_forward_steps != report.compacted_teacher.forward_steps or
-            report.compacted_greedy.prepared_forward_steps + report.compacted_greedy.cold_staged_forward_steps != report.compacted_greedy.forward_steps or
-            report.compacted_teacher.prepared_forward_steps + report.compacted_teacher.cold_staged_forward_steps != report.compacted_teacher.forward_steps or
-            report.compacted_greedy.cold_staged_forward_steps > 1 or report.compacted_teacher.cold_staged_forward_steps > 1)
-            return error.InvalidNativeQualityPreparedRoute;
+        report.admitted_peak_bytes = @max(report.admitted_peak_bytes, try admitNativeQualityPhase(try chargeFreshQualityPreparedDevice(.{
+            .owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker),
+            .host = auxiliary,
+        }, prepared_device_bytes), retained_wire_bytes));
+        try validateNativeQualityBranchRoutes(candidate_source.usesRetainedSource(), report.exact_greedy, report.exact_teacher, report.compacted_greedy, report.compacted_teacher);
         report.continuation_runtime_kv_bytes = metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime).attention_span_bytes;
         const owner_ids = [_]u64{ report.source_owner_id, report.compacted_owner_id, report.exact_greedy.owner_id, report.compacted_greedy.owner_id, report.exact_teacher.owner_id, report.compacted_teacher.owner_id };
         for (owner_ids, 0..) |owner_id, i| {
@@ -6978,8 +13744,1486 @@ pub const NativeGenerationPipeline = struct {
             return error.ContextPhysicalAccountingUnavailable;
         report.phase_durations_ns.teardown = self.finishNativeQualityPhase(&phase_started, "teardown");
         report.collection_elapsed_ns = mtpProfileElapsedNs(true, self.io, collection_started);
+        if (capture) |destination| {
+            const wire = retained_fitted_wire orelse return error.InvalidNativeQualityPublication;
+            report.accepted_snapshot = try quality.writeAcceptedSnapshot(self.io orelse return error.InvalidNativeQualityPublication, destination, wire, wire_digest);
+            const snapshot_hex = std.fmt.bytesToHex(report.accepted_snapshot.?.sha256, .lower);
+            std.debug.print("metal_checkpoint_quality_snapshot_captured path={s} bytes={d} sha256={s}\n", .{ report.accepted_snapshot.?.path, report.accepted_snapshot.?.bytes, &snapshot_hex });
+        }
         report.collection_complete = true;
         return report;
+    }
+
+    pub const SavedAfkvDecodeDiagnostic = struct {
+        output_tokens: [64]usize,
+        decode_steps: usize,
+        attention_calls: u64,
+        donor_appends: u64,
+        direct_ffn_successes: u64,
+        direct_ffn_fallbacks: u64,
+        canonical_last_logits_calls: u64,
+        prepared_greedy_successes: u64,
+        invalid: bool,
+        owner_released: bool,
+        post_release_live_bytes: usize,
+    };
+
+    pub const RecentPrefillCaptureAuthorityInputs = struct {
+        source_freeze_sha256: [32]u8,
+        implementation_semantic_sha256: [32]u8,
+        execution_sha256: [32]u8,
+        source_checkpoint_sha256: [32]u8,
+        profile_sha256: [32]u8,
+        policy_sha256: [32]u8,
+        device_registry_id: u64,
+        device_name_sha256: [32]u8,
+        compiler_identity_sha256: [32]u8,
+        backend_environment_sha256: [32]u8,
+    };
+
+    pub const RecentPrefillCaptureDiagnostic = struct {
+        training: recent_prefill_capture.Training,
+        direct_fit: ?@import("../runtime/kv/attention_match_recent64_direct_diagnostic.zig").Result,
+        capture_elapsed_ns: u64,
+        compiled_runtime_reset_before_fit: bool,
+        source_authority: graph_mod.model_runtime.ExactPagedKvSourceAuthority,
+        capture_epoch: u64,
+        native_plan_calls: usize,
+        native_commit_calls: usize,
+        native_copy_bytes: usize,
+        canonical_copy_calls: usize,
+        training_values_sha256: [32]u8,
+        training_positions_sha256: [32]u8,
+        admitted_host_physical_bytes: usize,
+        admitted_backend_bytes: usize,
+        admitted_combined_physical_bytes: usize,
+        budget: *runtime.tier.memory.RunBudget,
+        host_reservation: runtime.tier.memory.Reservation,
+        backend_reservation: runtime.tier.memory.Reservation,
+        fit_host_reservation: ?runtime.tier.memory.Reservation,
+        fit_backend_reservation: ?runtime.tier.memory.Reservation,
+
+        pub fn deinit(self: *RecentPrefillCaptureDiagnostic) void {
+            if (self.direct_fit) |*fit| fit.deinit();
+            if (self.fit_backend_reservation) |reservation| self.budget.release(reservation);
+            if (self.fit_host_reservation) |reservation| self.budget.release(reservation);
+            self.training.deinit();
+            self.budget.release(self.backend_reservation);
+            self.budget.release(self.host_reservation);
+            self.* = undefined;
+        }
+    };
+
+    pub const RecentPrefillTrainingPublisher = struct {
+        context: *anyopaque,
+        publish_fn: *const fn (*anyopaque, recent_prefill_capture.Training, [recent_prefill_capture.consumer_count]recent_prefill_capture.Consumer) anyerror!void,
+
+        pub fn publish(self: @This(), training: recent_prefill_capture.Training, topology: [recent_prefill_capture.consumer_count]recent_prefill_capture.Consumer) !void {
+            return self.publish_fn(self.context, training, topology);
+        }
+    };
+
+    fn recentPrefillCaptureTopology(config: gpt_mod.Config) ![recent_prefill_capture.consumer_count]recent_prefill_capture.Consumer {
+        var topology: [recent_prefill_capture.consumer_count]recent_prefill_capture.Consumer = undefined;
+        var count: usize = 0;
+        for (0..config.num_hidden_layers) |layer| {
+            if (config.layerUsesSlidingAttention(layer)) continue;
+            if (count == topology.len) return error.InvalidRecentQueryTopology;
+            const geometry = try config.kvDonorGeometry(layer);
+            topology[count] = .{ .donor_layer = geometry.donor_layer, .consumer_layer = layer };
+            count += 1;
+        }
+        if (count != topology.len) return error.InvalidRecentQueryTopology;
+        return topology;
+    }
+
+    fn recentPrefillHostAdmissionBytes() !usize {
+        const page: usize = 16 * 1024;
+        var bytes = std.mem.alignForward(usize, try recent_prefill_capture.Owner.requiredBytes(), page);
+        bytes = try std.math.add(usize, bytes, std.mem.alignForward(usize, try recent_prefill_capture.trainingRequiredBytes(), page));
+        // Owner.complete downloads the shared capture into one temporary host
+        // staging allocation before sealing it into the permanent owner.
+        bytes = try std.math.add(usize, bytes, std.mem.alignForward(usize, try metal_recent_prefill_capture.Owner.sharedRequiredBytes(), page));
+        bytes = try std.math.add(usize, bytes, std.mem.alignForward(usize, 8128 * @sizeOf(i64), page));
+        return std.math.add(usize, bytes, page);
+    }
+
+    /// Builtin-test-only actual compiled whole-model prefill capture. The
+    /// caller supplies a hash-checked saved AFKV solely as the authoritative
+    /// 8128-token source and a fresh paged decode state owned by the real model
+    /// loader. No serving profile can reach this method.
+    pub fn diagnoseRecentPrefillQueryCapture(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        config: GenerationConfig,
+        authority_inputs: RecentPrefillCaptureAuthorityInputs,
+        heldout: ?@import("../runtime/kv/attention_match_prepared_heldout_bundle.zig").Owned,
+        budget: *runtime.tier.memory.RunBudget,
+        direct_fit_mode: ?@import("../runtime/kv/attention_match_recent64_direct_diagnostic.zig").Mode,
+        training_publisher: ?RecentPrefillTrainingPublisher,
+    ) !RecentPrefillCaptureDiagnostic {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeSoakRoute;
+        if (self.cb.kind() != .metal or self.compiled_partition_backend != .metal or
+            self.compiled_attachment_target != .whole_model or self.graph_cache == null or
+            self.recent_prefill_query_capture != null or config.kv_cache_mode == .select_v1 or
+            saved.logical_length != 8128 or saved.tokens.len != 8128)
+            return error.UnsupportedNativeSoakRoute;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        if (!saved.identity.eql(identity)) return error.UnsupportedKvIdentity;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const raw_runtime = compute.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const topology = try recentPrefillCaptureTopology(self.gpt_config);
+        var prompt_sha256: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(saved.tokens), &prompt_sha256, .{});
+        const capture_epoch = try allocateQualityContextInstance();
+        const authority = recent_prefill_capture.Authority{
+            .source_freeze_sha256 = authority_inputs.source_freeze_sha256,
+            .implementation_semantic_sha256 = authority_inputs.implementation_semantic_sha256,
+            .execution_sha256 = authority_inputs.execution_sha256,
+            .source_checkpoint_sha256 = authority_inputs.source_checkpoint_sha256,
+            .prompt_tokens_sha256 = prompt_sha256,
+            .profile_sha256 = authority_inputs.profile_sha256,
+            .policy_sha256 = authority_inputs.policy_sha256,
+            .identity = .{ .weights = identity.weights, .tokenizer = identity.tokenizer, .template = identity.template, .layout = identity.layout },
+            // The compiled runtime's post-prefill revision does not exist yet.
+            // Bind the in-flight owner to its unique request epoch, then return
+            // the independently observed compiled source authority below.
+            .source_revision = capture_epoch,
+            .capture_epoch = capture_epoch,
+            .device_registry_id = authority_inputs.device_registry_id,
+            .device_name_sha256 = authority_inputs.device_name_sha256,
+            .compiler_identity_sha256 = authority_inputs.compiler_identity_sha256,
+            .backend_environment_sha256 = authority_inputs.backend_environment_sha256,
+            .logical_tokens = 8128,
+            .fitted_middle_end_exclusive = 6080,
+        };
+        try authority.validate();
+
+        const host_reservation = try budget.tryReserveKv(.host, try recentPrefillHostAdmissionBytes());
+        errdefer budget.release(host_reservation);
+        const shared_bytes = std.mem.alignForward(usize, try metal_recent_prefill_capture.Owner.sharedRequiredBytes(), 16 * 1024);
+        // Metal shared storage is charged once to combined physical usage by
+        // its backend reservation, while this independent check also includes
+        // it in the unified host/process envelope.
+        const admitted_host_physical_bytes = try std.math.add(usize, budget.hostTotalBytes(), shared_bytes);
+        if (budget.limits.host_limit_bytes != 0 and admitted_host_physical_bytes > budget.limits.host_limit_bytes)
+            return error.MemoryBudgetExceeded;
+        const backend_reservation = try budget.tryReserveKv(.backend, shared_bytes);
+        errdefer budget.release(backend_reservation);
+
+        var owner = try metal_recent_prefill_capture.Owner.init(
+            self.allocator,
+            @ptrCast(raw_runtime),
+            authority,
+            topology,
+            try recent_prefill_capture.Owner.requiredBytes(),
+            .{ .context = self, .check_fn = checkAttentionMatchQueryWork },
+        );
+        defer owner.deinit();
+        const prompt = try self.allocator.alloc(i64, saved.tokens.len);
+        defer self.allocator.free(prompt);
+        for (saved.tokens, prompt) |token, *destination| destination.* = token;
+
+        var shadow: AttentionMatchProbeShadow = .{};
+        defer shadow.deinit();
+        try shadow.initEmpty(self);
+        const decode_state = &shadow.state.?;
+
+        var capture_descriptor = owner.makeDescriptor();
+        if (platform.env.getenvBool("ANTFLY_METAL_RECENT64_CANONICAL_CAPTURE_DIAGNOSTIC")) {
+            capture_descriptor.native_plan_fn = null;
+            capture_descriptor.native_commit_fn = null;
+        }
+        self.recent_prefill_query_capture = capture_descriptor;
+        defer self.recent_prefill_query_capture = null;
+        const capture_started = platform.time.monotonicNs();
+        const output = try self.executePrefill(prompt, prompt.len, 0, decode_state, config, false, false, false);
+        defer {
+            if (output.last_logits) |logits| self.allocator.free(logits);
+            if (output.last_hidden) |hidden| self.cb.free(hidden);
+        }
+        const cache = self.graph_cache orelse return error.MissingCompiledModelRuntime;
+        const source_authority = try graph_mod.execution.compiledModelExactPagedKvAuthority(self, cache);
+        try source_authority.validate();
+        const token_digest = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(prompt);
+        if (source_authority.logical_tokens != prompt.len or
+            !std.mem.eql(u8, &source_authority.token_stream_sha256, &token_digest))
+            return error.InvalidExactPagedKvHandoffAuthority;
+        var training = owner.training(self.allocator) catch |err| {
+            const capture_debug = owner.debugSnapshot();
+            std.debug.print(
+                "recent-prefill-capture failure error={s} encoded_calls={d} pending_consumers={d} copied_frame_nonce={d} completed={} poisoned={} terminal_seq={d} horizon={d}\n",
+                .{
+                    @errorName(err),
+                    capture_debug.encoded_calls,
+                    capture_debug.pending_consumers,
+                    capture_debug.encoded_frame_submission_epoch,
+                    capture_debug.completed,
+                    capture_debug.poisoned,
+                    saved.logical_length,
+                    recent_prefill_capture.horizon,
+                },
+            );
+            return err;
+        };
+        errdefer training.deinit();
+        const capture_elapsed_ns = platform.time.monotonicNs() -| capture_started;
+        const capture_debug = owner.debugSnapshot();
+        var values_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        values_hash.update("antfly.recent64-native-training-values.v1\x00");
+        var positions_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        positions_hash.update("antfly.recent64-native-training-positions.v1\x00");
+        for (training.batches) |batch| {
+            values_hash.update(std.mem.sliceAsBytes(batch.train));
+            positions_hash.update(std.mem.sliceAsBytes(batch.train_positions));
+        }
+        if (training_publisher) |publisher| try publisher.publish(training, topology);
+        var direct_fit: ?@import("../runtime/kv/attention_match_recent64_direct_diagnostic.zig").Result = null;
+        errdefer if (direct_fit) |*fit| fit.deinit();
+        var fit_host_reservation: ?runtime.tier.memory.Reservation = null;
+        errdefer if (fit_host_reservation) |reservation| budget.release(reservation);
+        var fit_backend_reservation: ?runtime.tier.memory.Reservation = null;
+        errdefer if (fit_backend_reservation) |reservation| budget.release(reservation);
+        var compiled_runtime_reset_before_fit = false;
+        if (heldout) |hho| {
+            // The copied TRAIN owner and retained source-authority receipt no
+            // longer borrow compiled KV. Reset that mutable request state
+            // before admitting the host-only fit, while retaining immutable
+            // compiled model/cache ownership for ordinary pipeline teardown.
+            const compiled_runtime = cache.getSessionCompiledModelRuntime(.metal, .whole_model) orelse
+                return error.MissingCompiledModelRuntime;
+            try compiled_runtime.reset();
+            compiled_runtime_reset_before_fit = true;
+
+            const direct = @import("../runtime/kv/attention_match_recent64_direct_diagnostic.zig");
+            std.debug.print("recent64-fit-admission host={d} backend={d} kv={d} scratch={d} fit_host={d} fit_backend={d}\n", .{
+                budget.hostTotalBytes(), budget.backendTotalBytes(), budget.kvTotalBytes(), budget.scratchTotalBytes(), direct.host_fit_cap_bytes, direct.head_workspace_bytes,
+            });
+            fit_host_reservation = budget.tryReserveScratch(.host, direct.host_fit_cap_bytes) catch |err| {
+                var denial: [512]u8 = undefined;
+                std.debug.print("recent64-fit-admission denied {s}\n", .{budget.lastDenialString(&denial) catch "unavailable"});
+                return err;
+            };
+            fit_backend_reservation = budget.tryReserveScratch(.backend, direct.head_workspace_bytes) catch |err| {
+                var denial: [512]u8 = undefined;
+                std.debug.print("recent64-fit-admission denied {s}\n", .{budget.lastDenialString(&denial) catch "unavailable"});
+                return err;
+            };
+            const Fitter = @import("../ops/metal_attention_match_fit.zig").Fitter;
+            var fitter = try Fitter.initWorker(self.allocator, null, direct.head_workspace_bytes, direct.head_workspace_bytes);
+            defer _ = fitter.deinitAndTakeValueSolves();
+            try fitter.setPhaseProfiling(true);
+            direct_fit = direct.run(
+                self.allocator,
+                saved,
+                training,
+                hho,
+                fitter.backend(),
+                .{ .context = self, .check_fn = checkAttentionMatchQueryWork },
+                direct_fit_mode orelse return error.InvalidNativeSoakRequest,
+            ) catch |err| {
+                std.debug.print("recent64-fitter-failure-profile-json {f}\n", .{std.json.fmt(.{
+                    .schema = "antfly.recent64-fitter-failure-profile.v1",
+                    .mode = @tagName(direct_fit_mode.?),
+                    .error_name = @errorName(err),
+                    .phase_counters = fitter.phaseCounters(),
+                    .diagnostic_only = true,
+                    .qualification_credit = false,
+                }, .{})});
+                return err;
+            };
+        }
+        const final_host_physical_bytes = try std.math.add(usize, budget.hostTotalBytes(), shared_bytes);
+        if (budget.limits.host_limit_bytes != 0 and final_host_physical_bytes > budget.limits.host_limit_bytes)
+            return error.MemoryBudgetExceeded;
+        return .{
+            .training = training,
+            .direct_fit = direct_fit,
+            .capture_elapsed_ns = capture_elapsed_ns,
+            .compiled_runtime_reset_before_fit = compiled_runtime_reset_before_fit,
+            .source_authority = source_authority,
+            .capture_epoch = capture_epoch,
+            .native_plan_calls = capture_debug.native_plan_calls,
+            .native_commit_calls = capture_debug.native_commit_calls,
+            .native_copy_bytes = capture_debug.native_copy_bytes,
+            .canonical_copy_calls = capture_debug.canonical_copy_calls,
+            .training_values_sha256 = values_hash.finalResult(),
+            .training_positions_sha256 = positions_hash.finalResult(),
+            .admitted_host_physical_bytes = final_host_physical_bytes,
+            .admitted_backend_bytes = budget.backendTotalBytes(),
+            .admitted_combined_physical_bytes = try std.math.add(usize, budget.hostTotalBytes(), budget.backendTotalBytes()),
+            .budget = budget,
+            .host_reservation = host_reservation,
+            .backend_reservation = backend_reservation,
+            .fit_host_reservation = fit_host_reservation,
+            .fit_backend_reservation = fit_backend_reservation,
+        };
+    }
+
+    pub const CompiledPackedImportOneStepDiagnostic = struct {
+        diagnostic_only: bool = true,
+        qualification_credit: bool = false,
+        source_authority: graph_mod.model_runtime.ExactPagedKvSourceAuthority,
+        layout_witness: CompiledPackedLayoutWitness,
+        import_elapsed_ns: u64,
+        copied_bytes: usize,
+        peak_host_staging_bytes: ?usize,
+        imported_owners: usize,
+        logical_tokens: u32,
+        retained_rows: u32,
+        first_token: u32,
+        next_token: u32,
+        framed_attention_dispatches: u64,
+        split_decode_dispatches: u64,
+        source_reset_after_import: bool,
+    };
+
+    pub const CompiledAfkvExactKvDiagnostic = struct {
+        diagnostic_only: bool = true,
+        qualification_credit: bool = false,
+        source_authority: graph_mod.model_runtime.ExactPagedKvSourceAuthority,
+        layout_witness: CompiledPackedLayoutWitness,
+        copied_bytes: usize,
+        peak_host_staging_bytes: ?usize = null,
+        imported_owners: usize,
+        source_unchanged: bool,
+        release: @import("../backends/packed_context_session.zig").OwnerReleaseReceipt,
+        comparison: @import("../backends/packed_context_session.zig").CompiledExactKvComparison,
+    };
+
+    pub const CompiledPackedLayoutLayerWitness = struct {
+        layer: u32,
+        owner: u32,
+        sliding_window: u32,
+        kv_heads: u32,
+        query_heads: u32,
+        head_dim: u32,
+        rope_active_dim: u32,
+        rope_frequency_dim: u32,
+        rope_theta: f32,
+        copied_rows: u32,
+    };
+
+    pub const CompiledPackedLayoutWitness = struct {
+        schema: []const u8 = "antfly.compiled-packed-effective-layout.v1",
+        loaded_model_config: bool = true,
+        logical_tokens: u32,
+        dtype_bytes: u32 = 2,
+        kv_components: u32 = 2,
+        context_layout_sha256: [32]u8,
+        layer_count: u32 = 42,
+        layers: [42]CompiledPackedLayoutLayerWitness,
+    };
+
+    pub const CompiledPackedDiff64Diagnostic = struct {
+        diagnostic_only: bool = true,
+        qualification_credit: bool = false,
+        reference_tokens: [64]u32,
+        packed_tokens: [64]u32,
+        token_mismatches: u32,
+        finite_logits: bool,
+        compared_logits: u64,
+        maximum_absolute_logit_delta: f64,
+        logit_rmse: f64,
+        first_prefill_compared_logits: u64,
+        first_prefill_maximum_absolute_logit_delta: ?f64,
+        first_prefill_logit_rmse: ?f64,
+        source_authority: graph_mod.model_runtime.ExactPagedKvSourceAuthority,
+        layout_witness: CompiledPackedLayoutWitness,
+        copied_bytes: usize,
+        imported_owners: usize,
+        packed_decode_steps: u32,
+        packed_framed_attention_dispatches: u64,
+        packed_split_decode_dispatches: u64,
+        packed_committed_owner_appends: u64,
+        source_unchanged: bool,
+        compiled_reset_before_import: bool,
+        packed_owner_released: bool,
+        packed_post_release_live_bytes: u64,
+        logit_comparison_scope: []const u8,
+        finite_packed_logits: bool,
+        reference_prefill_elapsed_ns: u64,
+        reference_decode_elapsed_ns: u64,
+        candidate_prefill_elapsed_ns: u64,
+        import_elapsed_ns: u64,
+        packed_decode_elapsed_ns: u64,
+        prepared_serving_route: bool = false,
+        packed_raw_logits_inspected: bool = true,
+        finite_check_scope: []const u8 = "all_packed_raw_logits",
+        reference_greedy_calls: u64 = 0,
+        reference_decoder_frame_begins: u64 = 0,
+        reference_decoder_frame_submits: u64 = 0,
+        reference_decoder_frame_wait_ns: u128 = 0,
+        reference_decoder_frame_gpu_ns: u128 = 0,
+        reference_lm_head_refine_dispatches: u64 = 0,
+        reference_fused_argmax_ops: u64 = 0,
+        reference_split_argmax_ops: u64 = 0,
+        serving_greedy_calls: u64 = 0,
+        serving_decoder_frame_begins: u64 = 0,
+        serving_decoder_frame_submits: u64 = 0,
+        serving_decoder_frame_wait_ns: u128 = 0,
+        serving_decoder_frame_gpu_ns: u128 = 0,
+        serving_lm_head_refine_dispatches: u64 = 0,
+        serving_fused_argmax_ops: u64 = 0,
+        serving_split_argmax_ops: u64 = 0,
+    };
+
+    const CompiledPackedReferenceMode = enum { full_host_logits, greedy_tokens, serving_prepared_tokens };
+
+    pub const CompiledSingleDecodeMode = enum { full_host_logits, terminal_greedy };
+
+    pub const CompiledSingleDecodeFullLogitsCapture = struct {
+        context: *anyopaque,
+        /// Borrowed from ModelOutput for this synchronous call only.
+        write_fn: *const fn (context: *anyopaque, logits: []const f32) anyerror!void,
+
+        fn write(self: @This(), logits: []const f32) !void {
+            try self.write_fn(self.context, logits);
+        }
+    };
+
+    pub const CompiledSingleDecodeDiagnostic = struct {
+        schema: []const u8 = "antfly.compiled-single-decode-microdiagnostic.v1",
+        diagnostic_only: bool = true,
+        qualification_credit: bool = false,
+        serving_activation: bool = false,
+        prefix_tokens: u32,
+        mode: CompiledSingleDecodeMode,
+        legacy_full_logits_route: bool,
+        native_identity: runtime.kv.attention_match_checkpoint.Identity,
+        source_prefix_sha256: [32]u8,
+        source_authority: graph_mod.model_runtime.ExactPagedKvSourceAuthority,
+        input_token: u32,
+        finite_full_logits: bool,
+        full_logits_count: usize,
+        full_logits_sha256: ?[32]u8,
+        greedy_token: ?u32,
+        decode_elapsed_ns: u64,
+    };
+
+    /// Builtin-test-only one-frame isolation for the compiled decode path.
+    /// Every invocation starts from a fresh shadow and performs exactly one
+    /// decode after a 8127- or 8128-token compiled prefill.
+    pub fn diagnoseCompiledSingleDecode(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        compiled_config: GenerationConfig,
+        prefix_tokens: usize,
+        mode: CompiledSingleDecodeMode,
+        full_logits_capture: ?CompiledSingleDecodeFullLogitsCapture,
+        legacy_full_logits_route: bool,
+    ) !CompiledSingleDecodeDiagnostic {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeSoakRoute;
+        if (self.cb.kind() != .metal or self.compiled_partition_backend != .metal or self.compiled_attachment_target != .whole_model or
+            self.graph_cache == null or saved.logical_length != 8128 or saved.tokens.len != 8128 or
+            (prefix_tokens != 8127 and prefix_tokens != 8128))
+            return error.UnsupportedNativeSoakRoute;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        if (!saved.identity.eql(identity)) return error.UnsupportedKvIdentity;
+        const prompt = try self.allocator.alloc(i64, prefix_tokens);
+        defer self.allocator.free(prompt);
+        for (saved.tokens[0..prefix_tokens], prompt) |token, *out| out.* = token;
+        var shadow: AttentionMatchProbeShadow = .{};
+        defer shadow.deinit();
+        try shadow.initEmpty(self);
+        const prefill = try self.executePrefill(prompt, prompt.len, 0, &shadow.state.?, compiled_config, false, false, false);
+        defer {
+            if (prefill.last_logits) |logits| self.allocator.free(logits);
+            if (prefill.last_hidden) |hidden| self.cb.free(hidden);
+        }
+        const first_logits = prefill.last_logits orelse return error.MissingTeacherForcedLogits;
+        if (first_logits.len != self.gpt_config.vocab_size) return error.InvalidModelOutput;
+        for (first_logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+        applySuppressTokenMask(first_logits, self.gpt_config.suppressTokenIds());
+        const input_token: u32 = @intCast(activations.argmax(first_logits));
+        const compiled_runtime = self.graph_cache.?.getSessionCompiledModelRuntime(.metal, .whole_model) orelse return error.MissingCompiledModelRuntime;
+        defer compiled_runtime.reset() catch {};
+        const authority = try compiled_runtime.exactPagedKvAuthority();
+        try authority.validate();
+        const source_prefix_sha256 = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(prompt);
+        if (authority.logical_tokens != prefix_tokens or !std.mem.eql(u8, &authority.token_stream_sha256, &source_prefix_sha256))
+            return error.InvalidExactPagedKvHandoffAuthority;
+        const started = platform.time.monotonicNs();
+        var finite_full_logits = false;
+        var full_logits_count: usize = 0;
+        var full_logits_sha256: ?[32]u8 = null;
+        var greedy_token: ?u32 = null;
+        switch (mode) {
+            .full_host_logits => {
+                var output = try compiled_runtime.decode(self.allocator, .{ .execution_control = self.execution_control, .token_id = input_token, .position = prefix_tokens, .attention_mode = .paged_decode, .suppress_token_ids = self.gpt_config.suppressTokenIds(), .allow_pipeline_rearm = false });
+                defer output.deinit(self.allocator);
+                const logits = try output.hostLogits(self.allocator);
+                if (logits.len != self.gpt_config.vocab_size) return error.InvalidModelOutput;
+                for (logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+                if (full_logits_capture) |capture| try capture.write(logits);
+                finite_full_logits = true;
+                full_logits_count = logits.len;
+                var logits_digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &logits_digest, .{});
+                full_logits_sha256 = logits_digest;
+            },
+            .terminal_greedy => {
+                var output = try compiled_runtime.decodeGreedy(self.allocator, .{ .execution_control = self.execution_control, .token_id = input_token, .position = prefix_tokens, .attention_mode = .paged_decode, .suppress_token_ids = self.gpt_config.suppressTokenIds(), .allow_pipeline_rearm = false });
+                defer output.deinit();
+                if (output.token_id < 0 or output.token_id >= @as(i64, @intCast(self.gpt_config.vocab_size))) return error.InvalidModelOutput;
+                greedy_token = @intCast(output.token_id);
+            },
+        }
+        return .{ .prefix_tokens = @intCast(prefix_tokens), .mode = mode, .legacy_full_logits_route = legacy_full_logits_route, .native_identity = identity, .source_prefix_sha256 = source_prefix_sha256, .source_authority = authority, .input_token = input_token, .finite_full_logits = finite_full_logits, .full_logits_count = full_logits_count, .full_logits_sha256 = full_logits_sha256, .greedy_token = greedy_token, .decode_elapsed_ns = platform.time.monotonicNs() -| started };
+    }
+
+    fn noteLogitComparison(reference: []const f32, candidate: []const f32, sum_squared: *f64, maximum: *f64, count: *u64) !void {
+        if (reference.len != candidate.len) return error.InvalidModelOutput;
+        for (reference, candidate) |expected, actual| {
+            if (!std.math.isFinite(expected) or !std.math.isFinite(actual)) return error.NonFiniteTeacherForcedLogits;
+            const delta = @as(f64, expected) - @as(f64, actual);
+            const absolute = @abs(delta);
+            maximum.* = @max(maximum.*, absolute);
+            sum_squared.* += delta * delta;
+            count.* += 1;
+        }
+    }
+
+    /// Builtin-test-only first executable seam for compiled exact prefill to
+    /// packed exact import. It deliberately runs one packed decode step; the
+    /// later 64-token differential must reuse this path rather than changing
+    /// serving admission. The saved AFKV supplies prompt tokens and identity
+    /// only and grants no producer or qualification authority.
+    pub fn diagnoseCompiledPackedImportOneStep(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        compiled_config: GenerationConfig,
+        packed_config_input: @import("../backends/packed_context_session.zig").Config,
+    ) !CompiledPackedImportOneStepDiagnostic {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeSoakRoute;
+        if (self.cb.kind() != .metal or self.compiled_partition_backend != .metal or self.compiled_attachment_target != .whole_model or
+            self.graph_cache == null or saved.logical_length != 8128 or saved.tokens.len != 8128)
+            return error.UnsupportedNativeSoakRoute;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        if (!saved.identity.eql(identity)) return error.UnsupportedKvIdentity;
+        const prompt = try self.allocator.alloc(i64, saved.tokens.len);
+        defer self.allocator.free(prompt);
+        for (saved.tokens, prompt) |token, *out| out.* = token;
+        var shadow: AttentionMatchProbeShadow = .{};
+        defer shadow.deinit();
+        try shadow.initEmpty(self);
+        const output = try self.executePrefill(prompt, prompt.len, 0, &shadow.state.?, compiled_config, false, false, false);
+        defer {
+            if (output.last_logits) |logits| self.allocator.free(logits);
+            if (output.last_hidden) |hidden| self.cb.free(hidden);
+        }
+        const first_logits = output.last_logits orelse return error.MissingTeacherForcedLogits;
+        for (first_logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+        applySuppressTokenMask(first_logits, self.gpt_config.suppressTokenIds());
+        const first_token: i64 = @intCast(activations.argmax(first_logits));
+        const cache = self.graph_cache orelse return error.MissingCompiledModelRuntime;
+        const compiled_runtime = cache.getSessionCompiledModelRuntime(.metal, .whole_model) orelse return error.MissingCompiledModelRuntime;
+        const authority = try compiled_runtime.exactPagedKvAuthority();
+        if (!std.mem.eql(u8, &authority.model_weights_sha256, &identity.weights) or
+            !std.mem.eql(u8, &authority.model_identity_layout_sha256, &identity.layout))
+            return error.InvalidExactPagedKvHandoffAuthority;
+        const token_digest = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(prompt);
+        if (authority.logical_tokens != prompt.len or !std.mem.eql(u8, &authority.token_stream_sha256, &token_digest))
+            return error.InvalidExactPagedKvHandoffAuthority;
+        var packed_config = packed_config_input;
+        packed_config.execution_control = self.execution_control;
+        if (packed_config.layout.len != 35 and packed_config.layout.len != 42) return error.InvalidContextLayout;
+        var layout_layers: [42]CompiledPackedLayoutLayerWitness = @splat(std.mem.zeroes(CompiledPackedLayoutLayerWitness));
+        for (packed_config.layout.layers[0..packed_config.layout.len], 0..) |shape, layer| layout_layers[layer] = .{
+            .layer = @intCast(layer),
+            .owner = shape.owner,
+            .sliding_window = shape.sliding_window,
+            .kv_heads = shape.kv_heads,
+            .query_heads = shape.query_heads,
+            .head_dim = shape.head_dim,
+            .rope_active_dim = shape.rope_active_dim,
+            .rope_frequency_dim = shape.rope_frequency_dim,
+            .rope_theta = shape.rope_theta,
+            .copied_rows = if (shape.owner != layer) 0 else if (shape.sliding_window == 0) @intCast(prompt.len) else @min(@as(u32, @intCast(prompt.len)), shape.sliding_window),
+        };
+        const layout_witness = CompiledPackedLayoutWitness{
+            .logical_tokens = @intCast(prompt.len),
+            .context_layout_sha256 = try runtime.context_policy.layoutDigest(packed_config.layout),
+            .layers = layout_layers,
+        };
+        var session = try @import("../backends/packed_context_session.zig").Session.init(self.allocator, packed_config);
+        defer session.deinit();
+        const started = platform.time.monotonicNs();
+        const imported = try session.importCompiledExact(.{
+            .source = compiled_runtime.exactPagedKvRangeExporter(),
+            .source_authority = .{
+                .model_weights_sha256 = authority.model_weights_sha256,
+                .model_identity_layout_sha256 = authority.model_identity_layout_sha256,
+                .context_layout_sha256 = authority.context_layout_sha256,
+                .token_stream_sha256 = authority.token_stream_sha256,
+                .source_revision = authority.source_revision,
+                .source_sequence = authority.source_sequence,
+                .logical_tokens = authority.logical_tokens,
+            },
+            .expected_tokens = @intCast(prompt.len),
+            .model_sha256 = identity.weights,
+            .layout_sha256 = identity.layout,
+            .token_sha256 = authority.token_stream_sha256,
+            .max_copy_bytes = packed_config.physical_budget_bytes,
+            .check_ctx = self,
+            .check_fn = checkAttentionMatchQueryWork,
+        });
+        const import_elapsed_ns = platform.time.monotonicNs() -| started;
+        try compiled_runtime.reset();
+        var adapter = CompactionStudyForwardContext{ .pipeline = self, .singleton_paged_decode = true, .decode_start = @intCast(prompt.len) };
+        const one = [_]i64{first_token};
+        const next_logits = try runCompactionStudyLogits(&adapter, self.allocator, session.hook(), @intCast(prompt.len), &one);
+        defer self.allocator.free(next_logits);
+        for (next_logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+        applySuppressTokenMask(next_logits, self.gpt_config.suppressTokenIds());
+        const next_token: u32 = @intCast(activations.argmax(next_logits));
+        if (!imported.fenced or !imported.source_unchanged or imported.logical_tokens != prompt.len or session.metrics.logical_tokens != prompt.len + 1)
+            return error.InvalidNativeSoakProgress;
+        std.debug.print("compiled_packed_import_one_step import_ns={d} copied_bytes={d} owners={d} logical={d} retained={d} first={d} next={d} framed={d} split={d}\n", .{ import_elapsed_ns, imported.copied_bytes, imported.owners, session.metrics.logical_tokens, session.metrics.retained_rows, first_token, next_token, session.framed_attention_dispatches, session.split_decode_dispatches });
+        return .{ .source_authority = authority, .layout_witness = layout_witness, .import_elapsed_ns = import_elapsed_ns, .copied_bytes = imported.copied_bytes, .peak_host_staging_bytes = imported.peak_host_staging_bytes, .imported_owners = imported.owners, .logical_tokens = session.metrics.logical_tokens, .retained_rows = session.metrics.retained_rows, .first_token = @intCast(first_token), .next_token = next_token, .framed_attention_dispatches = session.framed_attention_dispatches, .split_decode_dispatches = session.split_decode_dispatches, .source_reset_after_import = true };
+    }
+
+    /// Fresh compiled exact prefix versus the decoded immutable source AFKV.
+    /// No fit or decode is performed; import fences before host byte comparison.
+    pub fn diagnoseCompiledAfkvExactKv(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        compiled_config: GenerationConfig,
+        packed_config_input: @import("../backends/packed_context_session.zig").Config,
+    ) !CompiledAfkvExactKvDiagnostic {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeSoakRoute;
+        if (self.cb.kind() != .metal or self.compiled_partition_backend != .metal or self.compiled_attachment_target != .whole_model or self.graph_cache == null or saved.logical_length != 8128 or saved.tokens.len != 8128)
+            return error.UnsupportedNativeSoakRoute;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        if (!saved.identity.eql(identity)) return error.UnsupportedKvIdentity;
+        const prompt = try self.allocator.alloc(i64, saved.tokens.len);
+        defer self.allocator.free(prompt);
+        for (saved.tokens, prompt) |token, *out| out.* = token;
+        var shadow: AttentionMatchProbeShadow = .{};
+        defer shadow.deinit();
+        try shadow.initEmpty(self);
+        const output = try self.executePrefill(prompt, prompt.len, 0, &shadow.state.?, compiled_config, false, false, false);
+        defer {
+            if (output.last_logits) |logits| self.allocator.free(logits);
+            if (output.last_hidden) |hidden| self.cb.free(hidden);
+        }
+        const compiled_runtime = self.graph_cache.?.getSessionCompiledModelRuntime(.metal, .whole_model) orelse return error.MissingCompiledModelRuntime;
+        defer compiled_runtime.reset() catch {};
+        const authority = try compiled_runtime.exactPagedKvAuthority();
+        const token_digest = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(prompt);
+        if (!std.mem.eql(u8, &authority.model_weights_sha256, &identity.weights) or !std.mem.eql(u8, &authority.model_identity_layout_sha256, &identity.layout) or authority.logical_tokens != prompt.len or !std.mem.eql(u8, &authority.token_stream_sha256, &token_digest))
+            return error.InvalidExactPagedKvHandoffAuthority;
+        var packed_config = packed_config_input;
+        packed_config.execution_control = self.execution_control;
+        if (packed_config.layout.len != 42) return error.InvalidContextLayout;
+        var layout_layers: [42]CompiledPackedLayoutLayerWitness = undefined;
+        for (packed_config.layout.layers[0..packed_config.layout.len], 0..) |shape, layer| layout_layers[layer] = .{
+            .layer = @intCast(layer),
+            .owner = shape.owner,
+            .sliding_window = shape.sliding_window,
+            .kv_heads = shape.kv_heads,
+            .query_heads = shape.query_heads,
+            .head_dim = shape.head_dim,
+            .rope_active_dim = shape.rope_active_dim,
+            .rope_frequency_dim = shape.rope_frequency_dim,
+            .rope_theta = shape.rope_theta,
+            .copied_rows = if (shape.owner != layer) 0 else if (shape.sliding_window == 0) @intCast(prompt.len) else @min(@as(u32, @intCast(prompt.len)), shape.sliding_window),
+        };
+        const layout_witness = CompiledPackedLayoutWitness{ .logical_tokens = @intCast(prompt.len), .context_layout_sha256 = try runtime.context_policy.layoutDigest(packed_config.layout), .layer_count = @intCast(packed_config.layout.len), .layers = layout_layers };
+        var allocation_owner = try runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null);
+        var allocation_owner_live = true;
+        defer if (allocation_owner_live) {
+            _ = allocation_owner.release();
+        };
+        packed_config.owner_allocation_tracker = allocation_owner.tracker;
+        var session = try @import("../backends/packed_context_session.zig").Session.init(self.allocator, packed_config);
+        var session_live = true;
+        defer if (session_live) session.deinit();
+        const imported = try session.importCompiledExact(.{
+            .source = compiled_runtime.exactPagedKvRangeExporter(),
+            .source_authority = .{ .model_weights_sha256 = authority.model_weights_sha256, .model_identity_layout_sha256 = authority.model_identity_layout_sha256, .context_layout_sha256 = authority.context_layout_sha256, .token_stream_sha256 = authority.token_stream_sha256, .source_revision = authority.source_revision, .source_sequence = authority.source_sequence, .logical_tokens = authority.logical_tokens },
+            .expected_tokens = @intCast(prompt.len),
+            .model_sha256 = identity.weights,
+            .layout_sha256 = identity.layout,
+            .token_sha256 = authority.token_stream_sha256,
+            .max_copy_bytes = packed_config.physical_budget_bytes,
+            .check_ctx = self,
+            .check_fn = checkAttentionMatchQueryWork,
+        });
+        const comparison = try session.compareImportedExactCheckpoint(saved);
+        if (!imported.fenced or !imported.source_unchanged or imported.logical_tokens != prompt.len) return error.InvalidCompiledExactImportReceipt;
+        var release = session.deinitMeasured();
+        session_live = false;
+        const owner_release = allocation_owner.release();
+        allocation_owner_live = false;
+        release.released = release.released and owner_release.released;
+        release.physical_available = owner_release.allocation.tracked_combined_physical_available;
+        release.post_release_live_bytes = owner_release.post_release_live_bytes orelse return error.ContextPhysicalAccountingUnavailable;
+        if (!release.released or (release.physical_available and release.post_release_live_bytes != 0)) return error.ContextPhysicalAccountingUnavailable;
+        return .{ .source_authority = authority, .layout_witness = layout_witness, .copied_bytes = imported.copied_bytes, .peak_host_staging_bytes = imported.peak_host_staging_bytes, .imported_owners = imported.owners, .source_unchanged = imported.source_unchanged, .release = release, .comparison = comparison };
+    }
+
+    /// Builtin-test-only differential. Both arms start from independent fresh
+    /// compiled prefill state. The first stays on ModelRuntime for 63 decode
+    /// calls; after reset, the second uses the exact compiled-to-packed import
+    /// path and 63 packed canonical forwards. No serving policy is changed.
+    pub fn diagnoseCompiledPackedDiff64(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        compiled_config: GenerationConfig,
+        packed_config_input: @import("../backends/packed_context_session.zig").Config,
+    ) !CompiledPackedDiff64Diagnostic {
+        return self.diagnoseCompiledPackedDiff64Internal(saved, compiled_config, packed_config_input, .full_host_logits);
+    }
+
+    pub fn diagnoseCompiledPackedGreedy64(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        compiled_config: GenerationConfig,
+        packed_config_input: @import("../backends/packed_context_session.zig").Config,
+    ) !CompiledPackedDiff64Diagnostic {
+        return self.diagnoseCompiledPackedDiff64Internal(saved, compiled_config, packed_config_input, .greedy_tokens);
+    }
+
+    pub fn diagnoseCompiledPackedServingGreedy64(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        compiled_config: GenerationConfig,
+        packed_config_input: @import("../backends/packed_context_session.zig").Config,
+    ) !CompiledPackedDiff64Diagnostic {
+        return self.diagnoseCompiledPackedDiff64Internal(saved, compiled_config, packed_config_input, .serving_prepared_tokens);
+    }
+
+    fn diagnoseCompiledPackedDiff64Internal(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        compiled_config: GenerationConfig,
+        packed_config_input: @import("../backends/packed_context_session.zig").Config,
+        reference_mode: CompiledPackedReferenceMode,
+    ) !CompiledPackedDiff64Diagnostic {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeSoakRoute;
+        if (self.cb.kind() != .metal or self.compiled_partition_backend != .metal or self.compiled_attachment_target != .whole_model or self.graph_cache == null or saved.logical_length != 8128 or saved.tokens.len != 8128)
+            return error.UnsupportedNativeSoakRoute;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        if (!saved.identity.eql(identity)) return error.UnsupportedKvIdentity;
+        const prompt = try self.allocator.alloc(i64, saved.tokens.len);
+        defer self.allocator.free(prompt);
+        for (saved.tokens, prompt) |token, *out| out.* = token;
+        const vocab: usize = self.gpt_config.vocab_size;
+        if (vocab == 0) return error.InvalidModelOutput;
+        const reference_logit_steps: usize = if (reference_mode == .full_host_logits) 64 else 1;
+        const reference_logits = try self.allocator.alloc(f32, try std.math.mul(usize, reference_logit_steps, vocab));
+        defer self.allocator.free(reference_logits);
+        var reference_tokens: [64]u32 = undefined;
+        const cache = self.graph_cache.?;
+
+        var reference_shadow: AttentionMatchProbeShadow = .{};
+        defer reference_shadow.deinit();
+        try reference_shadow.initEmpty(self);
+        std.debug.print("compiled-packed-diff64-progress phase=reference-prefill event=begin\n", .{});
+        const reference_prefill_started = platform.time.monotonicNs();
+        const reference_prefill = try self.executePrefill(prompt, prompt.len, 0, &reference_shadow.state.?, compiled_config, false, false, false);
+        const reference_prefill_elapsed_ns = platform.time.monotonicNs() -| reference_prefill_started;
+        std.debug.print("compiled-packed-diff64-progress phase=reference-prefill event=end\n", .{});
+        defer {
+            if (reference_prefill.last_logits) |logits| self.allocator.free(logits);
+            if (reference_prefill.last_hidden) |hidden| self.cb.free(hidden);
+        }
+        const first_reference = reference_prefill.last_logits orelse return error.MissingTeacherForcedLogits;
+        if (first_reference.len != vocab) return error.InvalidModelOutput;
+        @memcpy(reference_logits[0..vocab], first_reference);
+        const first_reference_masked = try self.allocator.dupe(f32, first_reference);
+        defer self.allocator.free(first_reference_masked);
+        applySuppressTokenMask(first_reference_masked, self.gpt_config.suppressTokenIds());
+        reference_tokens[0] = @intCast(activations.argmax(first_reference_masked));
+        const compiled_runtime = cache.getSessionCompiledModelRuntime(.metal, .whole_model) orelse return error.MissingCompiledModelRuntime;
+        const decoder_reference_before = decoder_gated_runtime.getTimingStats();
+        const backend_reference_before = self.cb.debugTimingSnapshot();
+        const reference_decode_started = platform.time.monotonicNs();
+        for (1..64) |step| {
+            std.debug.print("compiled-packed-diff64-progress phase=reference-decode step={d} event=begin\n", .{step});
+            const request = graph_mod.model_runtime.DecodeRequest{
+                .execution_control = self.execution_control,
+                .token_id = @intCast(reference_tokens[step - 1]),
+                .position = prompt.len + step - 1,
+                .attention_mode = .paged_decode,
+                .suppress_token_ids = self.gpt_config.suppressTokenIds(),
+                .allow_pipeline_rearm = step + 1 < 64,
+            };
+            switch (reference_mode) {
+                .full_host_logits => {
+                    var output = try compiled_runtime.decode(self.allocator, request);
+                    defer output.deinit(self.allocator);
+                    std.debug.print("compiled-packed-diff64-progress phase=reference-decode step={d} event=decode-return\n", .{step});
+                    const logits = try output.hostLogits(self.allocator);
+                    std.debug.print("compiled-packed-diff64-progress phase=reference-decode step={d} event=host-logits\n", .{step});
+                    if (logits.len != vocab) return error.InvalidModelOutput;
+                    @memcpy(reference_logits[step * vocab ..][0..vocab], logits);
+                    reference_tokens[step] = @intCast(try output.greedyTokenSuppress(self.allocator, vocab, self.gpt_config.suppressTokenIds()));
+                },
+                .greedy_tokens, .serving_prepared_tokens => {
+                    var output = try compiled_runtime.decodeGreedy(self.allocator, request);
+                    defer output.deinit();
+                    if (output.token_id < 0 or output.token_id >= @as(i64, @intCast(vocab))) return error.InvalidModelOutput;
+                    reference_tokens[step] = @intCast(output.token_id);
+                    std.debug.print("compiled-packed-diff64-progress phase=reference-decode step={d} event=greedy-return\n", .{step});
+                },
+            }
+        }
+        const reference_decode_elapsed_ns = platform.time.monotonicNs() -| reference_decode_started;
+        const decoder_reference_after = decoder_gated_runtime.getTimingStats();
+        const backend_reference_after = self.cb.debugTimingSnapshot();
+        std.debug.print("compiled-packed-diff64-progress phase=reference-reset event=begin\n", .{});
+        try compiled_runtime.reset();
+        // The second arm must reproduce the successful one-step lifecycle: a
+        // fresh prefill owns the runtime and exact-export storage it creates.
+        // A public reset clears logical state but intentionally retains the
+        // session runtime and its Metal slot directory; do not reuse that
+        // reference-arm exporter for an independent candidate prefix.
+        cache.resetSessionCompiledModelRuntime();
+        std.debug.print("compiled-packed-diff64-progress phase=reference-reset event=end\n", .{});
+        reference_shadow.deinit();
+
+        var candidate_shadow: AttentionMatchProbeShadow = .{};
+        defer candidate_shadow.deinit();
+        try candidate_shadow.initEmpty(self);
+        std.debug.print("compiled-packed-diff64-progress phase=candidate-prefill event=begin\n", .{});
+        const candidate_prefill_started = platform.time.monotonicNs();
+        const candidate_prefill = try self.executePrefill(prompt, prompt.len, 0, &candidate_shadow.state.?, compiled_config, false, false, false);
+        const candidate_prefill_elapsed_ns = platform.time.monotonicNs() -| candidate_prefill_started;
+        std.debug.print("compiled-packed-diff64-progress phase=candidate-prefill event=end\n", .{});
+        defer {
+            if (candidate_prefill.last_logits) |logits| self.allocator.free(logits);
+            if (candidate_prefill.last_hidden) |hidden| self.cb.free(hidden);
+        }
+        const first_candidate = candidate_prefill.last_logits orelse return error.MissingTeacherForcedLogits;
+        // Acquire the candidate source only after this independent prefill, as
+        // the successful one-step import does.
+        const candidate_runtime = cache.getSessionCompiledModelRuntime(.metal, .whole_model) orelse return error.MissingCompiledModelRuntime;
+        const authority = try candidate_runtime.exactPagedKvAuthority();
+        std.debug.print("compiled-packed-diff64-source runtime_recreated=1 source_sequence={d} source_revision={d} logical_tokens={d}\n", .{ authority.source_sequence, authority.source_revision, authority.logical_tokens });
+        if (!std.mem.eql(u8, &authority.model_weights_sha256, &identity.weights) or !std.mem.eql(u8, &authority.model_identity_layout_sha256, &identity.layout))
+            return error.InvalidExactPagedKvHandoffAuthority;
+        const token_digest = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(prompt);
+        if (authority.logical_tokens != prompt.len or !std.mem.eql(u8, &authority.token_stream_sha256, &token_digest)) return error.InvalidExactPagedKvHandoffAuthority;
+        var packed_config = packed_config_input;
+        packed_config.execution_control = self.execution_control;
+        if (packed_config.layout.len != 42) return error.InvalidContextLayout;
+        var layout_layers: [42]CompiledPackedLayoutLayerWitness = undefined;
+        for (packed_config.layout.layers[0..packed_config.layout.len], 0..) |shape, layer| layout_layers[layer] = .{ .layer = @intCast(layer), .owner = shape.owner, .sliding_window = shape.sliding_window, .kv_heads = shape.kv_heads, .query_heads = shape.query_heads, .head_dim = shape.head_dim, .rope_active_dim = shape.rope_active_dim, .rope_frequency_dim = shape.rope_frequency_dim, .rope_theta = shape.rope_theta, .copied_rows = if (shape.owner != layer) 0 else if (shape.sliding_window == 0) @intCast(prompt.len) else @min(@as(u32, @intCast(prompt.len)), shape.sliding_window) };
+        const layout_witness = CompiledPackedLayoutWitness{ .logical_tokens = @intCast(prompt.len), .context_layout_sha256 = try runtime.context_policy.layoutDigest(packed_config.layout), .layers = layout_layers };
+
+        var allocation_owner = try runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null);
+        var allocation_owner_live = true;
+        defer if (allocation_owner_live) {
+            _ = allocation_owner.release();
+        };
+        packed_config.owner_allocation_tracker = allocation_owner.tracker;
+        var session = try @import("../backends/packed_context_session.zig").Session.init(self.allocator, packed_config);
+        var session_live = true;
+        defer if (session_live) {
+            session.deinit();
+        };
+        std.debug.print("compiled-packed-diff64-progress phase=packed-import event=begin\n", .{});
+        const import_started = platform.time.monotonicNs();
+        const imported = try session.importCompiledExact(.{ .source = candidate_runtime.exactPagedKvRangeExporter(), .source_authority = .{ .model_weights_sha256 = authority.model_weights_sha256, .model_identity_layout_sha256 = authority.model_identity_layout_sha256, .context_layout_sha256 = authority.context_layout_sha256, .token_stream_sha256 = authority.token_stream_sha256, .source_revision = authority.source_revision, .source_sequence = authority.source_sequence, .logical_tokens = authority.logical_tokens }, .expected_tokens = @intCast(prompt.len), .model_sha256 = identity.weights, .layout_sha256 = identity.layout, .token_sha256 = authority.token_stream_sha256, .max_copy_bytes = packed_config.physical_budget_bytes, .check_ctx = self, .check_fn = checkAttentionMatchQueryWork });
+        const import_elapsed_ns = platform.time.monotonicNs() -| import_started;
+        std.debug.print("compiled-packed-diff64-progress phase=packed-import event=end\n", .{});
+        try candidate_runtime.reset();
+        candidate_shadow.deinit();
+
+        var packed_tokens: [64]u32 = undefined;
+        var sum_squared: f64 = 0;
+        var maximum: f64 = 0;
+        var compared: u64 = 0;
+        try noteLogitComparison(reference_logits[0..vocab], first_candidate, &sum_squared, &maximum, &compared);
+        applySuppressTokenMask(first_candidate, self.gpt_config.suppressTokenIds());
+        packed_tokens[0] = @intCast(activations.argmax(first_candidate));
+        var adapter = CompactionStudyForwardContext{ .pipeline = self, .singleton_paged_decode = true, .decode_start = @intCast(prompt.len) };
+        const decoder_before = decoder_gated_runtime.getTimingStats();
+        const backend_before = self.cb.debugTimingSnapshot();
+        const packed_decode_started = platform.time.monotonicNs();
+        for (1..64) |step| {
+            std.debug.print("compiled-packed-diff64-progress phase=packed-decode step={d} event=begin\n", .{step});
+            const position = prompt.len + step - 1;
+            if (reference_mode == .greedy_tokens) {
+                packed_tokens[step] = @intCast(try runCompactionStudyPreparedModelGreedyTokenAtomic(
+                    &adapter,
+                    self.allocator,
+                    session.hook(),
+                    @intCast(position),
+                    packed_tokens[step - 1],
+                ));
+            } else if (reference_mode == .serving_prepared_tokens) {
+                packed_tokens[step] = @intCast(try runCompactionStudyPreparedModelGreedyTokenTerminal(
+                    &adapter,
+                    self.allocator,
+                    session.hook(),
+                    @intCast(position),
+                    packed_tokens[step - 1],
+                ));
+            } else {
+                const one = [_]i64{packed_tokens[step - 1]};
+                const logits = try runCompactionStudyLogits(&adapter, self.allocator, session.hook(), @intCast(position), &one);
+                defer self.allocator.free(logits);
+                for (logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+                try noteLogitComparison(reference_logits[step * vocab ..][0..vocab], logits, &sum_squared, &maximum, &compared);
+                applySuppressTokenMask(logits, self.gpt_config.suppressTokenIds());
+                packed_tokens[step] = @intCast(activations.argmax(logits));
+            }
+            std.debug.print("compiled-packed-diff64-progress phase=packed-decode step={d} event=end\n", .{step});
+        }
+        const packed_decode_elapsed_ns = platform.time.monotonicNs() -| packed_decode_started;
+        const decoder_after = decoder_gated_runtime.getTimingStats();
+        const backend_after = self.cb.debugTimingSnapshot();
+        var mismatches: u32 = 0;
+        for (reference_tokens, packed_tokens) |expected, actual| if (expected != actual) {
+            mismatches += 1;
+        };
+        const framed = session.framed_attention_dispatches;
+        const split = session.split_decode_dispatches;
+        const owner_appends = session.committed_owner_appends;
+        const final_logical = session.metrics.logical_tokens;
+        session.deinit();
+        session_live = false;
+        const release = allocation_owner.release();
+        allocation_owner_live = false;
+        const post_release = release.post_release_live_bytes orelse return error.ContextPhysicalAccountingUnavailable;
+        if (!release.released or post_release != 0 or final_logical != prompt.len + 63 or !imported.fenced or !imported.source_unchanged) return error.InvalidNativeSoakProgress;
+        const comparison_rmse = @sqrt(sum_squared / @as(f64, @floatFromInt(compared)));
+        const serving = reference_mode == .serving_prepared_tokens;
+        return .{ .reference_tokens = reference_tokens, .packed_tokens = packed_tokens, .token_mismatches = mismatches, .finite_logits = !serving, .compared_logits = compared, .maximum_absolute_logit_delta = maximum, .logit_rmse = comparison_rmse, .first_prefill_compared_logits = vocab, .first_prefill_maximum_absolute_logit_delta = if (reference_mode != .full_host_logits) maximum else null, .first_prefill_logit_rmse = if (reference_mode != .full_host_logits) comparison_rmse else null, .source_authority = authority, .layout_witness = layout_witness, .copied_bytes = imported.copied_bytes, .imported_owners = imported.owners, .packed_decode_steps = 63, .packed_framed_attention_dispatches = framed, .packed_split_decode_dispatches = split, .packed_committed_owner_appends = owner_appends, .source_unchanged = imported.source_unchanged, .compiled_reset_before_import = true, .packed_owner_released = release.released, .packed_post_release_live_bytes = post_release, .logit_comparison_scope = if (reference_mode == .full_host_logits) "all_64_steps" else "first_prefill_only", .finite_packed_logits = !serving, .reference_prefill_elapsed_ns = reference_prefill_elapsed_ns, .reference_decode_elapsed_ns = reference_decode_elapsed_ns, .candidate_prefill_elapsed_ns = candidate_prefill_elapsed_ns, .import_elapsed_ns = import_elapsed_ns, .packed_decode_elapsed_ns = packed_decode_elapsed_ns, .prepared_serving_route = serving, .packed_raw_logits_inspected = !serving, .finite_check_scope = if (serving) "first_prefill_only" else "all_packed_raw_logits", .reference_greedy_calls = if (serving) decoder_reference_after.greedy_calls -| decoder_reference_before.greedy_calls else 0, .reference_decoder_frame_begins = if (serving) backend_reference_after.provider.decoder_runtime_frame_begins -| backend_reference_before.provider.decoder_runtime_frame_begins else 0, .reference_decoder_frame_submits = if (serving) backend_reference_after.provider.decoder_runtime_frame_submits -| backend_reference_before.provider.decoder_runtime_frame_submits else 0, .reference_decoder_frame_wait_ns = if (serving) backend_reference_after.provider.decoder_runtime_frame_wait_nanos -| backend_reference_before.provider.decoder_runtime_frame_wait_nanos else 0, .reference_decoder_frame_gpu_ns = if (serving) backend_reference_after.provider.decoder_runtime_frame_gpu_nanos -| backend_reference_before.provider.decoder_runtime_frame_gpu_nanos else 0, .reference_lm_head_refine_dispatches = if (serving) backend_reference_after.provider.metal_runtime_lm_head_q4_q6_refine_dispatches -| backend_reference_before.provider.metal_runtime_lm_head_q4_q6_refine_dispatches else 0, .reference_fused_argmax_ops = if (serving) backend_reference_after.provider.active_decode_final_fused_argmax_ops -| backend_reference_before.provider.active_decode_final_fused_argmax_ops else 0, .reference_split_argmax_ops = if (serving) backend_reference_after.provider.active_decode_final_split_argmax_ops -| backend_reference_before.provider.active_decode_final_split_argmax_ops else 0, .serving_greedy_calls = if (serving) decoder_after.greedy_calls -| decoder_before.greedy_calls else 0, .serving_decoder_frame_begins = if (serving) backend_after.provider.decoder_runtime_frame_begins -| backend_before.provider.decoder_runtime_frame_begins else 0, .serving_decoder_frame_submits = if (serving) backend_after.provider.decoder_runtime_frame_submits -| backend_before.provider.decoder_runtime_frame_submits else 0, .serving_decoder_frame_wait_ns = if (serving) backend_after.provider.decoder_runtime_frame_wait_nanos -| backend_before.provider.decoder_runtime_frame_wait_nanos else 0, .serving_decoder_frame_gpu_ns = if (serving) backend_after.provider.decoder_runtime_frame_gpu_nanos -| backend_before.provider.decoder_runtime_frame_gpu_nanos else 0, .serving_lm_head_refine_dispatches = if (serving) backend_after.provider.metal_runtime_lm_head_q4_q6_refine_dispatches -| backend_before.provider.metal_runtime_lm_head_q4_q6_refine_dispatches else 0, .serving_fused_argmax_ops = if (serving) backend_after.provider.active_decode_final_fused_argmax_ops -| backend_before.provider.active_decode_final_fused_argmax_ops else 0, .serving_split_argmax_ops = if (serving) backend_after.provider.active_decode_final_split_argmax_ops -| backend_before.provider.active_decode_final_split_argmax_ops else 0 };
+    }
+
+    pub const FutureTrainP64Diagnostic = struct {
+        pub const host_scratch_envelope_bytes: usize = 32 * 1024 * 1024;
+        pub const backend_scratch_envelope_bytes: usize = 8 * 1024 * 1024;
+        training: future_train_p64_capture.TrainingOutput,
+        source_authority: graph_mod.model_runtime.ExactPagedKvSourceAuthority,
+        branch_authority: graph_mod.model_runtime.ExactPagedKvSourceAuthority,
+        continuation_ids_sha256: [32]u8,
+        continuation_origin_sha256: [32]u8,
+        producer_receipt_sha256: [32]u8,
+        capture_elapsed_ns: u64,
+        native_plan_calls: usize,
+        native_commit_calls: usize,
+        native_copy_bytes: usize,
+        budget_host_scratch_before: usize,
+        budget_backend_scratch_before: usize,
+        budget_host_scratch_after_reserve: usize,
+        budget_backend_scratch_after_reserve: usize,
+        budget: *runtime.tier.memory.RunBudget,
+        host_reservation: runtime.tier.memory.Reservation,
+        backend_reservation: runtime.tier.memory.Reservation,
+        pub fn deinit(self: *@This()) void {
+            self.training.deinit();
+            self.budget.release(self.backend_reservation);
+            self.budget.release(self.host_reservation);
+            self.* = undefined;
+        }
+    };
+
+    /// Builtin-test-only future TRAIN producer. It never exposes HHO and never
+    /// calls a fitter. The saved AFKV is immutable input; all KV appends target a
+    /// fresh exact shadow owned by this method.
+    pub fn diagnoseTeacherForcedFutureTrainP64(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        config: GenerationConfig,
+        authority_inputs: RecentPrefillCaptureAuthorityInputs,
+        continuation_origin_sha256: [32]u8,
+        budget: *runtime.tier.memory.RunBudget,
+    ) !FutureTrainP64Diagnostic {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeSoakRoute;
+        if (self.cb.kind() != .metal or self.compiled_partition_backend != .metal or self.compiled_attachment_target != .whole_model or self.graph_cache == null or self.recent_prefill_query_capture != null or saved.logical_length != future_train_p64_capture.source_tokens or saved.tokens.len != future_train_p64_capture.source_tokens) return error.UnsupportedNativeSoakRoute;
+        if (std.mem.allEqual(u8, &continuation_origin_sha256, 0)) return error.InvalidFutureTrainP64Authority;
+        const budget_host_scratch_before = budget.host_scratch_bytes;
+        const budget_backend_scratch_before = budget.backend_scratch_bytes;
+        const host_reservation = try budget.tryReserveScratch(.host, FutureTrainP64Diagnostic.host_scratch_envelope_bytes);
+        errdefer budget.release(host_reservation);
+        const backend_reservation = try budget.tryReserveScratch(.backend, FutureTrainP64Diagnostic.backend_scratch_envelope_bytes);
+        errdefer budget.release(backend_reservation);
+        const budget_host_scratch_after_reserve = budget.host_scratch_bytes;
+        const budget_backend_scratch_after_reserve = budget.backend_scratch_bytes;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        if (!saved.identity.eql(identity)) return error.UnsupportedKvIdentity;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const runtime_raw = compute.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const topology_recent = try recentPrefillCaptureTopology(self.gpt_config);
+        var topology: [future_train_p64_capture.consumer_count]future_train_p64_capture.Consumer = undefined;
+        for (&topology, topology_recent) |*dst, src| dst.* = .{ .donor_layer = src.donor_layer, .consumer_layer = src.consumer_layer };
+        const prompt = try self.allocator.alloc(i64, saved.tokens.len);
+        defer self.allocator.free(prompt);
+        for (saved.tokens, prompt) |token, *dst| dst.* = token;
+        var shadow: AttentionMatchProbeShadow = .{};
+        defer shadow.deinit();
+        try shadow.initEmpty(self);
+        var capture_config = config;
+        capture_config.max_tokens = @max(capture_config.max_tokens, future_train_p64_capture.continuation_rows);
+        const source_output = try self.executePrefill(prompt, prompt.len, 0, &shadow.state.?, capture_config, false, false, false);
+        defer {
+            if (source_output.last_logits) |v| self.allocator.free(v);
+            if (source_output.last_hidden) |v| self.cb.free(v);
+        }
+        const cache = self.graph_cache orelse return error.MissingCompiledModelRuntime;
+        const source_authority = try graph_mod.execution.compiledModelExactPagedKvAuthority(self, cache);
+        try source_authority.validate();
+        const source_token_digest = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(prompt);
+        if (source_authority.logical_tokens != prompt.len or !std.mem.eql(u8, &source_authority.token_stream_sha256, &source_token_digest)) return error.InvalidExactPagedKvHandoffAuthority;
+        const continuation = try runtime.kv.attention_match_queries.studyTokensPass(self.allocator, prompt, future_train_p64_capture.continuation_rows, 0);
+        defer self.allocator.free(continuation);
+        if (continuation.len != future_train_p64_capture.continuation_rows) return error.InvalidFutureTrainP64Capture;
+        const continuation_sha = runtime.kv.attention_match_self_study_training.hashTokens(continuation);
+        const prefix_sha = runtime.kv.attention_match_self_study_training.hashTokens(prompt);
+        const capture_epoch = try allocateQualityContextInstance();
+        const authority: future_train_p64_capture.Authority = .{ .source_freeze_sha256 = authority_inputs.source_freeze_sha256, .implementation_semantic_sha256 = authority_inputs.implementation_semantic_sha256, .execution_sha256 = authority_inputs.execution_sha256, .source_checkpoint_sha256 = authority_inputs.source_checkpoint_sha256, .source_prefix_sha256 = prefix_sha, .continuation_ids_sha256 = continuation_sha, .continuation_origin_sha256 = continuation_origin_sha256, .profile_sha256 = authority_inputs.profile_sha256, .identity = .{ .weights = identity.weights, .tokenizer = identity.tokenizer, .template = identity.template, .layout = identity.layout }, .source_revision = source_authority.source_revision, .capture_epoch = capture_epoch, .device_registry_id = authority_inputs.device_registry_id, .device_name_sha256 = authority_inputs.device_name_sha256, .compiler_identity_sha256 = authority_inputs.compiler_identity_sha256, .backend_environment_sha256 = authority_inputs.backend_environment_sha256 };
+        var owner = try metal_future_train_p64_capture.Owner.init(self.allocator, @ptrCast(runtime_raw), authority, topology, .{ .context = self, .check_fn = checkAttentionMatchQueryWork });
+        defer owner.deinit();
+        self.recent_prefill_query_capture = owner.descriptor();
+        defer self.recent_prefill_query_capture = null;
+        const started = platform.time.monotonicNs();
+        // This owned diagnostic continuation uses the compiled runtime's
+        // append contract directly. General executePrefill intentionally
+        // rejects prefilled whole-model requests and keeps that guard intact.
+        var branch_runtime = BorrowedDecodeStateRuntime.init(&shadow.state.?);
+        var branch_context = try branch_runtime.preparePrefill(
+            future_train_p64_capture.source_tokens + future_train_p64_capture.continuation_rows,
+            future_train_p64_capture.continuation_rows,
+        );
+        branch_context.recent_prefill_query_capture = self.recent_prefill_query_capture;
+        var branch_output = (try graph_mod.execution.graphForwardCompiledModelOutputSuppress(
+            self,
+            cache,
+            continuation,
+            1,
+            future_train_p64_capture.source_tokens + future_train_p64_capture.continuation_rows,
+            &branch_context,
+            &.{},
+        )) orelse return error.MissingCompiledModelRuntime;
+        defer branch_output.deinit(self.allocator);
+        const branch_logits = try branch_output.takeHostLogits(self.allocator);
+        defer self.allocator.free(branch_logits);
+        for (branch_logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+        const branch_authority = try graph_mod.execution.compiledModelExactPagedKvAuthority(self, cache);
+        try branch_authority.validate();
+        const combined = try self.allocator.alloc(i64, future_train_p64_capture.source_tokens + future_train_p64_capture.continuation_rows);
+        defer self.allocator.free(combined);
+        @memcpy(combined[0..future_train_p64_capture.source_tokens], prompt);
+        @memcpy(combined[future_train_p64_capture.source_tokens..], continuation);
+        const branch_token_digest = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(combined);
+        if (branch_authority.logical_tokens != combined.len or branch_authority.source_sequence != source_authority.source_sequence or branch_authority.source_revision == source_authority.source_revision or !std.mem.eql(u8, &branch_authority.token_stream_sha256, &branch_token_digest)) return error.InvalidExactPagedKvHandoffAuthority;
+        var training = try owner.training(self.allocator);
+        errdefer training.deinit();
+        for (training.batches) |batch| if (batch.heldout.len != 0 or batch.heldout_positions.len != 0 or batch.train.len != future_train_p64_capture.sample_rows * future_train_p64_capture.head_dim) return error.FutureTrainP64RoleViolation;
+        var receipt_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        receipt_hash.update("antfly.teacher-forced-future-train-p64-producer-receipt.v2\x00");
+        receipt_hash.update(&training.authority_sha256);
+        receipt_hash.update(&training.payload_sha256);
+        receipt_hash.update(&source_authority.model_weights_sha256);
+        receipt_hash.update(&source_authority.model_identity_layout_sha256);
+        receipt_hash.update(&source_authority.context_layout_sha256);
+        receipt_hash.update(&source_authority.token_stream_sha256);
+        receipt_hash.update(&branch_authority.model_weights_sha256);
+        receipt_hash.update(&branch_authority.model_identity_layout_sha256);
+        receipt_hash.update(&branch_authority.context_layout_sha256);
+        receipt_hash.update(&branch_authority.token_stream_sha256);
+        receipt_hash.update(&continuation_sha);
+        receipt_hash.update(&continuation_origin_sha256);
+        inline for (.{ source_authority.source_revision, branch_authority.source_revision, @as(u64, source_authority.source_sequence), @as(u64, branch_authority.source_sequence) }) |value| {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, value, .little);
+            receipt_hash.update(&bytes);
+        }
+        return .{ .training = training, .source_authority = source_authority, .branch_authority = branch_authority, .continuation_ids_sha256 = continuation_sha, .continuation_origin_sha256 = continuation_origin_sha256, .producer_receipt_sha256 = receipt_hash.finalResult(), .capture_elapsed_ns = platform.time.monotonicNs() -| started, .native_plan_calls = owner.native_plan_calls, .native_commit_calls = owner.native_commit_calls, .native_copy_bytes = owner.native_copy_bytes, .budget_host_scratch_before = budget_host_scratch_before, .budget_backend_scratch_before = budget_backend_scratch_before, .budget_host_scratch_after_reserve = budget_host_scratch_after_reserve, .budget_backend_scratch_after_reserve = budget_backend_scratch_after_reserve, .budget = budget, .host_reservation = host_reservation, .backend_reservation = backend_reservation };
+    }
+
+    pub const FutureTrainPhaseP64Diagnostic = struct {
+        pub const host_scratch_envelope_bytes: usize = 32 * 1024 * 1024;
+        pub const backend_scratch_envelope_bytes: usize = 8 * 1024 * 1024;
+        training: future_train_phase_p64_capture.TrainingOutput,
+        source_authority: graph_mod.model_runtime.ExactPagedKvSourceAuthority,
+        branch_authority: graph_mod.model_runtime.ExactPagedKvSourceAuthority,
+        continuation_ids_sha256: [32]u8,
+        continuation_origin_sha256: [32]u8,
+        producer_receipt_sha256: [32]u8,
+        capture_elapsed_ns: u64,
+        native_plan_calls: usize,
+        native_commit_calls: usize,
+        native_copy_bytes: usize,
+        budget_host_scratch_before: usize,
+        budget_backend_scratch_before: usize,
+        budget_host_scratch_after_reserve: usize,
+        budget_backend_scratch_after_reserve: usize,
+        budget: *runtime.tier.memory.RunBudget,
+        host_reservation: runtime.tier.memory.Reservation,
+        backend_reservation: runtime.tier.memory.Reservation,
+        pub fn deinit(self: *@This()) void {
+            self.training.deinit();
+            self.budget.release(self.backend_reservation);
+            self.budget.release(self.host_reservation);
+            self.* = undefined;
+        }
+    };
+
+    /// Builtin-test-only future TRAIN producer. It never exposes HHO and never
+    /// calls a fitter. The saved AFKV is immutable input; all KV appends target a
+    /// fresh exact shadow owned by this method.
+    pub fn diagnoseTeacherForcedFutureTrainPhaseP64(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        config: GenerationConfig,
+        authority_inputs: RecentPrefillCaptureAuthorityInputs,
+        continuation_origin_sha256: [32]u8,
+        budget: *runtime.tier.memory.RunBudget,
+    ) !FutureTrainPhaseP64Diagnostic {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeSoakRoute;
+        if (self.cb.kind() != .metal or self.compiled_partition_backend != .metal or self.compiled_attachment_target != .whole_model or self.graph_cache == null or self.recent_prefill_query_capture != null or saved.logical_length != future_train_phase_p64_capture.source_tokens or saved.tokens.len != future_train_phase_p64_capture.source_tokens) return error.UnsupportedNativeSoakRoute;
+        if (std.mem.allEqual(u8, &continuation_origin_sha256, 0)) return error.InvalidFutureTrainPhaseP64Authority;
+        const budget_host_scratch_before = budget.host_scratch_bytes;
+        const budget_backend_scratch_before = budget.backend_scratch_bytes;
+        const host_reservation = try budget.tryReserveScratch(.host, FutureTrainPhaseP64Diagnostic.host_scratch_envelope_bytes);
+        errdefer budget.release(host_reservation);
+        const backend_reservation = try budget.tryReserveScratch(.backend, FutureTrainPhaseP64Diagnostic.backend_scratch_envelope_bytes);
+        errdefer budget.release(backend_reservation);
+        const budget_host_scratch_after_reserve = budget.host_scratch_bytes;
+        const budget_backend_scratch_after_reserve = budget.backend_scratch_bytes;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        if (!saved.identity.eql(identity)) return error.UnsupportedKvIdentity;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const runtime_raw = compute.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const topology_recent = try recentPrefillCaptureTopology(self.gpt_config);
+        var topology: [future_train_phase_p64_capture.consumer_count]future_train_phase_p64_capture.Consumer = undefined;
+        for (&topology, topology_recent) |*dst, src| dst.* = .{ .donor_layer = src.donor_layer, .consumer_layer = src.consumer_layer };
+        const prompt = try self.allocator.alloc(i64, saved.tokens.len);
+        defer self.allocator.free(prompt);
+        for (saved.tokens, prompt) |token, *dst| dst.* = token;
+        var shadow: AttentionMatchProbeShadow = .{};
+        defer shadow.deinit();
+        try shadow.initEmpty(self);
+        var capture_config = config;
+        capture_config.max_tokens = @max(capture_config.max_tokens, future_train_phase_p64_capture.continuation_rows);
+        const source_output = try self.executePrefill(prompt, prompt.len, 0, &shadow.state.?, capture_config, false, false, false);
+        defer {
+            if (source_output.last_logits) |v| self.allocator.free(v);
+            if (source_output.last_hidden) |v| self.cb.free(v);
+        }
+        const cache = self.graph_cache orelse return error.MissingCompiledModelRuntime;
+        const source_authority = try graph_mod.execution.compiledModelExactPagedKvAuthority(self, cache);
+        try source_authority.validate();
+        const source_token_digest = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(prompt);
+        if (source_authority.logical_tokens != prompt.len or !std.mem.eql(u8, &source_authority.token_stream_sha256, &source_token_digest)) return error.InvalidExactPagedKvHandoffAuthority;
+        const continuation = try runtime.kv.attention_match_queries.studyTokensPass(self.allocator, prompt, future_train_phase_p64_capture.continuation_rows, 0);
+        defer self.allocator.free(continuation);
+        if (continuation.len != future_train_phase_p64_capture.continuation_rows) return error.InvalidFutureTrainPhaseP64Capture;
+        const continuation_sha = runtime.kv.attention_match_self_study_training.hashTokens(continuation);
+        const prefix_sha = runtime.kv.attention_match_self_study_training.hashTokens(prompt);
+        const capture_epoch = try allocateQualityContextInstance();
+        const authority: future_train_phase_p64_capture.Authority = .{ .source_freeze_sha256 = authority_inputs.source_freeze_sha256, .implementation_semantic_sha256 = authority_inputs.implementation_semantic_sha256, .execution_sha256 = authority_inputs.execution_sha256, .source_checkpoint_sha256 = authority_inputs.source_checkpoint_sha256, .source_prefix_sha256 = prefix_sha, .continuation_ids_sha256 = continuation_sha, .continuation_origin_sha256 = continuation_origin_sha256, .profile_sha256 = authority_inputs.profile_sha256, .identity = .{ .weights = identity.weights, .tokenizer = identity.tokenizer, .template = identity.template, .layout = identity.layout }, .source_revision = source_authority.source_revision, .capture_epoch = capture_epoch, .device_registry_id = authority_inputs.device_registry_id, .device_name_sha256 = authority_inputs.device_name_sha256, .compiler_identity_sha256 = authority_inputs.compiler_identity_sha256, .backend_environment_sha256 = authority_inputs.backend_environment_sha256 };
+        var owner = try metal_future_train_phase_p64_capture.Owner.init(self.allocator, @ptrCast(runtime_raw), authority, topology, .{ .context = self, .check_fn = checkAttentionMatchQueryWork });
+        defer owner.deinit();
+        self.recent_prefill_query_capture = owner.descriptor();
+        defer self.recent_prefill_query_capture = null;
+        const started = platform.time.monotonicNs();
+        // This owned diagnostic continuation uses the compiled runtime's
+        // append contract directly. General executePrefill intentionally
+        // rejects prefilled whole-model requests and keeps that guard intact.
+        var branch_runtime = BorrowedDecodeStateRuntime.init(&shadow.state.?);
+        var branch_context = try branch_runtime.preparePrefill(
+            future_train_phase_p64_capture.source_tokens + future_train_phase_p64_capture.continuation_rows,
+            future_train_phase_p64_capture.continuation_rows,
+        );
+        branch_context.recent_prefill_query_capture = self.recent_prefill_query_capture;
+        var branch_output = (try graph_mod.execution.graphForwardCompiledModelOutputSuppress(
+            self,
+            cache,
+            continuation,
+            1,
+            future_train_phase_p64_capture.source_tokens + future_train_phase_p64_capture.continuation_rows,
+            &branch_context,
+            &.{},
+        )) orelse return error.MissingCompiledModelRuntime;
+        defer branch_output.deinit(self.allocator);
+        const branch_logits = try branch_output.takeHostLogits(self.allocator);
+        defer self.allocator.free(branch_logits);
+        for (branch_logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+        const branch_authority = try graph_mod.execution.compiledModelExactPagedKvAuthority(self, cache);
+        try branch_authority.validate();
+        const combined = try self.allocator.alloc(i64, future_train_phase_p64_capture.source_tokens + future_train_phase_p64_capture.continuation_rows);
+        defer self.allocator.free(combined);
+        @memcpy(combined[0..future_train_phase_p64_capture.source_tokens], prompt);
+        @memcpy(combined[future_train_phase_p64_capture.source_tokens..], continuation);
+        const branch_token_digest = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(combined);
+        if (branch_authority.logical_tokens != combined.len or branch_authority.source_sequence != source_authority.source_sequence or branch_authority.source_revision == source_authority.source_revision or !std.mem.eql(u8, &branch_authority.token_stream_sha256, &branch_token_digest)) return error.InvalidExactPagedKvHandoffAuthority;
+        var training = try owner.training(self.allocator);
+        errdefer training.deinit();
+        for (training.batches) |batch| if (batch.heldout.len != 0 or batch.heldout_positions.len != 0 or batch.train.len != future_train_phase_p64_capture.sample_rows * future_train_phase_p64_capture.head_dim) return error.FutureTrainPhaseP64RoleViolation;
+        var receipt_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        receipt_hash.update("antfly.teacher-forced-future-train-phase-p64-producer-receipt.v1\x00");
+        receipt_hash.update(&training.authority_sha256);
+        receipt_hash.update(&training.payload_sha256);
+        receipt_hash.update(&source_authority.model_weights_sha256);
+        receipt_hash.update(&source_authority.model_identity_layout_sha256);
+        receipt_hash.update(&source_authority.context_layout_sha256);
+        receipt_hash.update(&source_authority.token_stream_sha256);
+        receipt_hash.update(&branch_authority.model_weights_sha256);
+        receipt_hash.update(&branch_authority.model_identity_layout_sha256);
+        receipt_hash.update(&branch_authority.context_layout_sha256);
+        receipt_hash.update(&branch_authority.token_stream_sha256);
+        receipt_hash.update(&continuation_sha);
+        receipt_hash.update(&continuation_origin_sha256);
+        inline for (.{ source_authority.source_revision, branch_authority.source_revision, @as(u64, source_authority.source_sequence), @as(u64, branch_authority.source_sequence) }) |value| {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, value, .little);
+            receipt_hash.update(&bytes);
+        }
+        return .{ .training = training, .source_authority = source_authority, .branch_authority = branch_authority, .continuation_ids_sha256 = continuation_sha, .continuation_origin_sha256 = continuation_origin_sha256, .producer_receipt_sha256 = receipt_hash.finalResult(), .capture_elapsed_ns = platform.time.monotonicNs() -| started, .native_plan_calls = owner.native_plan_calls, .native_commit_calls = owner.native_commit_calls, .native_copy_bytes = owner.native_copy_bytes, .budget_host_scratch_before = budget_host_scratch_before, .budget_backend_scratch_before = budget_backend_scratch_before, .budget_host_scratch_after_reserve = budget_host_scratch_after_reserve, .budget_backend_scratch_after_reserve = budget_backend_scratch_after_reserve, .budget = budget, .host_reservation = host_reservation, .backend_reservation = backend_reservation };
+    }
+
+    pub const FutureHhoEquivalenceTuple = struct {
+        consumer_layer: u32,
+        query_head: u32,
+        compared_values: usize,
+        mismatches: usize,
+        maximum_absolute_delta: f64,
+        rmse: f64,
+        bit_identical: bool,
+    };
+    pub const FutureHhoEquivalenceDiagnostic = struct {
+        pub const host_scratch_envelope_bytes: usize = 32 * 1024 * 1024;
+        pub const backend_scratch_envelope_bytes: usize = 8 * 1024 * 1024;
+        role: []const u8 = "HHO_EQ",
+        source_authority: graph_mod.model_runtime.ExactPagedKvSourceAuthority,
+        branch_authority: graph_mod.model_runtime.ExactPagedKvSourceAuthority,
+        continuation_ids: [future_hho_equivalence_capture.continuation_rows]i64,
+        continuation_ids_sha256: [32]u8,
+        captured_authority_sha256: [32]u8,
+        retained_authority_sha256: [32]u8,
+        tuples: [future_hho_equivalence_capture.batch_count]FutureHhoEquivalenceTuple,
+        total_mismatches: usize,
+        compared_values: usize,
+        maximum_absolute_delta: f64,
+        rmse: f64,
+        all_f32_bit_identical: bool,
+        native_plan_calls: usize,
+        native_commit_calls: usize,
+        native_copy_bytes: usize,
+        capture_elapsed_ns: u64,
+        budget: *runtime.tier.memory.RunBudget,
+        host_reservation: runtime.tier.memory.Reservation,
+        backend_reservation: runtime.tier.memory.Reservation,
+        pub fn deinit(self: *@This()) void {
+            self.budget.release(self.backend_reservation);
+            self.budget.release(self.host_reservation);
+            self.* = undefined;
+        }
+    };
+
+    /// Diagnostic-only replay of the original heldout sampling domain. The
+    /// captured values never become TRAIN input and no fitter is reachable.
+    pub fn diagnoseFutureHhoEquivalence(
+        self: *NativeGenerationPipeline,
+        saved: runtime.kv.attention_match_checkpoint.State,
+        config: GenerationConfig,
+        authority_inputs: RecentPrefillCaptureAuthorityInputs,
+        retained: *const @import("../runtime/kv/attention_match_prepared_heldout_bundle.zig").Owned,
+        budget: *runtime.tier.memory.RunBudget,
+    ) !FutureHhoEquivalenceDiagnostic {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeSoakRoute;
+        if (self.cb.kind() != .metal or self.compiled_partition_backend != .metal or self.compiled_attachment_target != .whole_model or self.graph_cache == null or self.recent_prefill_query_capture != null or saved.logical_length != 8128 or saved.tokens.len != 8128) return error.UnsupportedNativeSoakRoute;
+        var expected_retained_authority: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&expected_retained_authority, "f530a2101e22689940dfff51e5f08dcefd158c295c9e3e9237f2bbe671ef8954");
+        if (!std.mem.eql(u8, &retained.authority_sha256, &expected_retained_authority) or retained.batches.len != future_hho_equivalence_capture.batch_count) return error.InvalidPreparedHeldoutBundle;
+        const host_reservation = try budget.tryReserveScratch(.host, FutureHhoEquivalenceDiagnostic.host_scratch_envelope_bytes);
+        errdefer budget.release(host_reservation);
+        const backend_reservation = try budget.tryReserveScratch(.backend, FutureHhoEquivalenceDiagnostic.backend_scratch_envelope_bytes);
+        errdefer budget.release(backend_reservation);
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        if (!saved.identity.eql(identity)) return error.UnsupportedKvIdentity;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const runtime_raw = compute.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const topology_recent = try recentPrefillCaptureTopology(self.gpt_config);
+        var topology: [future_hho_equivalence_capture.consumer_count]future_hho_equivalence_capture.Consumer = undefined;
+        for (&topology, topology_recent) |*dst, src| dst.* = .{ .donor_layer = src.donor_layer, .consumer_layer = src.consumer_layer };
+        const prompt = try self.allocator.alloc(i64, saved.tokens.len);
+        defer self.allocator.free(prompt);
+        for (saved.tokens, prompt) |token, *dst| dst.* = token;
+        var shadow: AttentionMatchProbeShadow = .{};
+        defer shadow.deinit();
+        try shadow.initEmpty(self);
+        var capture_config = config;
+        capture_config.max_tokens = @max(capture_config.max_tokens, future_hho_equivalence_capture.continuation_rows);
+        const source_output = try self.executePrefill(prompt, prompt.len, 0, &shadow.state.?, capture_config, false, false, false);
+        defer {
+            if (source_output.last_logits) |v| self.allocator.free(v);
+            if (source_output.last_hidden) |v| self.cb.free(v);
+        }
+        const cache = self.graph_cache orelse return error.MissingCompiledModelRuntime;
+        const source_authority = try graph_mod.execution.compiledModelExactPagedKvAuthority(self, cache);
+        try source_authority.validate();
+        const source_token_digest = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(prompt);
+        if (source_authority.logical_tokens != prompt.len or !std.mem.eql(u8, &source_authority.token_stream_sha256, &source_token_digest)) return error.InvalidExactPagedKvHandoffAuthority;
+        const continuation = try runtime.kv.attention_match_queries.studyTokensPass(self.allocator, prompt, 512, 0);
+        defer self.allocator.free(continuation);
+        if (continuation.len != 512) return error.InvalidFutureHhoEquivalenceCapture;
+        const continuation_sha = runtime.kv.attention_match_self_study_training.hashTokens(continuation);
+        var expected_continuation_sha: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&expected_continuation_sha, "0f5d2504ad4c4b496117f9f488eb3e1606cba318c8494fd3dc70f99e8ca22a62");
+        if (!std.mem.eql(u8, &continuation_sha, &expected_continuation_sha)) return error.InvalidFutureHhoEquivalenceAuthority;
+        const authority: future_hho_equivalence_capture.Authority = .{ .source_freeze_sha256 = authority_inputs.source_freeze_sha256, .implementation_semantic_sha256 = authority_inputs.implementation_semantic_sha256, .execution_sha256 = authority_inputs.execution_sha256, .source_checkpoint_sha256 = authority_inputs.source_checkpoint_sha256, .source_prefix_sha256 = runtime.kv.attention_match_self_study_training.hashTokens(prompt), .continuation_ids_sha256 = continuation_sha, .continuation_origin_sha256 = continuation_sha, .profile_sha256 = authority_inputs.profile_sha256, .identity = .{ .weights = identity.weights, .tokenizer = identity.tokenizer, .template = identity.template, .layout = identity.layout }, .source_revision = source_authority.source_revision, .capture_epoch = try allocateQualityContextInstance(), .device_registry_id = authority_inputs.device_registry_id, .device_name_sha256 = authority_inputs.device_name_sha256, .compiler_identity_sha256 = authority_inputs.compiler_identity_sha256, .backend_environment_sha256 = authority_inputs.backend_environment_sha256 };
+        var owner = try metal_future_hho_equivalence_capture.Owner.init(self.allocator, @ptrCast(runtime_raw), authority, topology, .{ .context = self, .check_fn = checkAttentionMatchQueryWork });
+        defer owner.deinit();
+        self.recent_prefill_query_capture = owner.descriptor();
+        defer self.recent_prefill_query_capture = null;
+        const started = platform.time.monotonicNs();
+        var branch_runtime = BorrowedDecodeStateRuntime.init(&shadow.state.?);
+        var branch_context = try branch_runtime.preparePrefill(8640, 512);
+        branch_context.recent_prefill_query_capture = self.recent_prefill_query_capture;
+        var branch_output = (try graph_mod.execution.graphForwardCompiledModelOutputSuppress(self, cache, continuation, 1, 8640, &branch_context, &.{})) orelse return error.MissingCompiledModelRuntime;
+        defer branch_output.deinit(self.allocator);
+        const branch_logits = try branch_output.takeHostLogits(self.allocator);
+        defer self.allocator.free(branch_logits);
+        for (branch_logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+        const branch_authority = try graph_mod.execution.compiledModelExactPagedKvAuthority(self, cache);
+        try branch_authority.validate();
+        const combined = try self.allocator.alloc(i64, 8640);
+        defer self.allocator.free(combined);
+        @memcpy(combined[0..8128], prompt);
+        @memcpy(combined[8128..], continuation);
+        const branch_token_digest = graph_mod.model_runtime.exactPagedKvTokenStreamDigest(combined);
+        if (branch_authority.logical_tokens != combined.len or branch_authority.source_sequence != source_authority.source_sequence or branch_authority.source_revision == source_authority.source_revision or !std.mem.eql(u8, &branch_authority.token_stream_sha256, &branch_token_digest)) return error.InvalidExactPagedKvHandoffAuthority;
+        var captured = try owner.heldout(self.allocator);
+        defer captured.deinit();
+        var tuples: [future_hho_equivalence_capture.batch_count]FutureHhoEquivalenceTuple = undefined;
+        var total_mismatches: usize = 0;
+        var compared_values: usize = 0;
+        var maximum: f64 = 0;
+        var square_sum: f64 = 0;
+        for (captured.batches, retained.batches, &tuples) |actual, expected, *summary| {
+            if (actual.consumer_layer != expected.consumer_layer or actual.query_head != expected.query_head or !std.mem.eql(u64, actual.heldout_positions, expected.heldout_positions) or actual.heldout.len != expected.heldout.len) return error.InvalidPreparedHeldoutBundle;
+            var mismatches: usize = 0;
+            var local_maximum: f64 = 0;
+            var local_square_sum: f64 = 0;
+            for (actual.heldout, expected.heldout) |a, e| {
+                if (!std.math.isFinite(a) or !std.math.isFinite(e)) return error.NonFiniteAttentionInput;
+                mismatches += @intFromBool(@as(u32, @bitCast(a)) != @as(u32, @bitCast(e)));
+                const delta = @as(f64, a) - @as(f64, e);
+                local_maximum = @max(local_maximum, @abs(delta));
+                local_square_sum += delta * delta;
+            }
+            total_mismatches += mismatches;
+            compared_values += actual.heldout.len;
+            maximum = @max(maximum, local_maximum);
+            square_sum += local_square_sum;
+            summary.* = .{ .consumer_layer = actual.consumer_layer, .query_head = actual.query_head, .compared_values = actual.heldout.len, .mismatches = mismatches, .maximum_absolute_delta = local_maximum, .rmse = @sqrt(local_square_sum / @as(f64, @floatFromInt(actual.heldout.len))), .bit_identical = mismatches == 0 };
+        }
+        var continuation_ids: [512]i64 = undefined;
+        @memcpy(&continuation_ids, continuation);
+        return .{ .source_authority = source_authority, .branch_authority = branch_authority, .continuation_ids = continuation_ids, .continuation_ids_sha256 = continuation_sha, .captured_authority_sha256 = captured.authority_sha256, .retained_authority_sha256 = retained.authority_sha256, .tuples = tuples, .total_mismatches = total_mismatches, .compared_values = compared_values, .maximum_absolute_delta = maximum, .rmse = @sqrt(square_sum / @as(f64, @floatFromInt(compared_values))), .all_f32_bit_identical = total_mismatches == 0, .native_plan_calls = owner.native_plan_calls, .native_commit_calls = owner.native_commit_calls, .native_copy_bytes = owner.native_copy_bytes, .capture_elapsed_ns = platform.time.monotonicNs() -| started, .budget = budget, .host_reservation = host_reservation, .backend_reservation = backend_reservation };
+    }
+
+    /// Builtin-test-only single-owner replay of an already hash-checked AFKV.
+    /// This is not an import authority and never consumes producer metadata.
+    pub fn diagnoseSavedAfkvDecode(self: *NativeGenerationPipeline, saved: runtime.kv.attention_match_checkpoint.State, budget: *runtime.tier.memory.RunBudget) !SavedAfkvDecodeDiagnostic {
+        if (comptime !builtin.is_test or !build_options.enable_metal) return error.UnsupportedNativeSoakRoute;
+        if (self.io == null or self.cb.kind() != .metal or self.kv_dtype != .f16 or
+            self.scheduler != null or self.scheduler_lease != null or self.execution_gate != null or self.checkpoint_prepare != null or
+            self.checkpoint_resume != null or self.load_generation == 0)
+            return error.UnsupportedNativeSoakRoute;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        if (!std.meta.eql(saved.identity, identity) or saved.logical_length != saved.tokens.len or saved.tokens.len != 8128)
+            return error.InvalidNativeSoakRequest;
+        const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const previous_execution = compute.attention_match_execution;
+        const previous_prepared_identity = compute.resident_ffn_prepared_identity;
+        const previous_active_identity = compute.resident_ffn_active_identity;
+        if (previous_prepared_identity != null or previous_active_identity != null) return error.UnsupportedNativeSoakRoute;
+        defer {
+            compute.attention_match_execution = previous_execution;
+            compute.resident_ffn_prepared_identity = previous_prepared_identity;
+            compute.resident_ffn_active_identity = previous_active_identity;
+        }
+        compute.attention_match_execution = .{ .forward_frame = true, .precomputed_tail = true, .retain_hidden = true, .matrix_stage = true, .coalesced_stage = true, .resident_gated_ffn_fusion = true, .ple_tail = true, .resource_barriers = true, .concurrent_frame = false };
+        const estimate = try runtime.tier.memory.estimateGptGeneration(.metal, .f16, self.gpt_config, saved.tokens.len, 64, 1);
+        const admission = makeE2bF16MirrorAdmission(budget, estimate, 1, self.gpt_config) orelse return error.CompactionWorkspaceLimit;
+        {
+            var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
+            try compute.prepareAuthenticatedResidentFfnSlots(self.gpt_config, admission, identity, 1);
+            try compute.activateAuthenticatedResidentFfnIdentity(identity);
+        }
+        const allocation = runtime.kv.host_allocation_tracker;
+        var owner = try allocation.RequestAllocationOwner.init(null);
+        var owner_live = true;
+        defer if (owner_live) {
+            _ = owner.release();
+        };
+        var shadow: AttentionMatchProbeShadow = .{};
+        defer shadow.deinit();
+        try shadow.initEmptyAllocated(self, owner.allocator(), owner.tracker);
+        const logits = try self.restoreAttentionMatchState(saved, saved.tokens, 64, true, &shadow.state.?, null);
+        defer self.allocator.free(logits);
+        for (logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+        applySuppressTokenMask(logits, self.gpt_config.suppressTokenIds());
+        var token: i64 = @intCast(activations.argmax(logits));
+        var result: SavedAfkvDecodeDiagnostic = .{
+            .output_tokens = undefined,
+            .decode_steps = 0,
+            .attention_calls = 0,
+            .donor_appends = 0,
+            .direct_ffn_successes = 0,
+            .direct_ffn_fallbacks = 0,
+            .canonical_last_logits_calls = 0,
+            .prepared_greedy_successes = 0,
+            .invalid = true,
+            .owner_released = false,
+            .post_release_live_bytes = std.math.maxInt(usize),
+        };
+        result.output_tokens[0] = @intCast(token);
+        const direct_before = compute.timing_stats.quantized_gated_ffn_direct_successes;
+        const fallback_before = compute.timing_stats.quantized_gated_ffn_direct_fallbacks;
+        const debug_before = decoder_runtime_debug_stats;
+        for (1..64) |index| {
+            // Deliberately use the canonical serving wrapper. This reaches
+            // gpt.forwardFinalHiddenWithSharedKvOutput and its GPT-owned frame;
+            // the prepared-greedy decoder shortcut would not test that order.
+            var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
+            try shadow.state.?.appendPrefillChunk(1);
+            var context = shadow.state.?.gptDecodeContext(shadow.state.?.total_tokens, 1);
+            const one = [_]i64{token};
+            const step_logits = try self.forwardLastLogits(&one, 1, shadow.state.?.total_tokens, &context);
+            defer self.allocator.free(step_logits);
+            for (step_logits) |value| if (!std.math.isFinite(value)) return error.NonFiniteTeacherForcedLogits;
+            result.decode_steps += 1;
+            applySuppressTokenMask(step_logits, self.gpt_config.suppressTokenIds());
+            token = @intCast(activations.argmax(step_logits));
+            result.output_tokens[index] = @intCast(token);
+        }
+        const activity = (try compute.installedAttentionMatchActivity(&shadow.storage.?, shadow.state.?.sequence_id.?)) orelse
+            return error.InvalidNativeSoakProgress;
+        result.attention_calls = activity.attention_calls;
+        result.donor_appends = activity.donor_appends;
+        result.direct_ffn_successes = compute.timing_stats.quantized_gated_ffn_direct_successes - direct_before;
+        result.direct_ffn_fallbacks = compute.timing_stats.quantized_gated_ffn_direct_fallbacks - fallback_before;
+        result.canonical_last_logits_calls = decoder_runtime_debug_stats.canonical_last_logits_calls - debug_before.canonical_last_logits_calls;
+        result.prepared_greedy_successes = decoder_runtime_debug_stats.prepared_token_successes - debug_before.prepared_token_successes;
+        result.invalid = activity.invalid;
+        std.debug.print("saved_afkv_canonical_decode steps={d} canonical_last_logits={d} prepared_greedy={d} attention_calls={d} donor_appends={d} direct_ffn={d} direct_fallbacks={d} invalid={}\n", .{ result.decode_steps, result.canonical_last_logits_calls, result.prepared_greedy_successes, result.attention_calls, result.donor_appends, result.direct_ffn_successes, result.direct_ffn_fallbacks, result.invalid });
+        if (activity.invalid or activity.logical_tokens != saved.logical_length + 63 or
+            activity.attention_calls != 63 * self.gpt_config.num_hidden_layers or
+            activity.donor_appends != 63 * saved.donors.len or
+            result.direct_ffn_successes != 63 * self.gpt_config.num_hidden_layers or result.direct_ffn_fallbacks != 0 or
+            result.canonical_last_logits_calls != 63 or result.prepared_greedy_successes != 0)
+            return error.InvalidNativeSoakProgress;
+        try compute.synchronizeAttentionMatchKv();
+        _ = owner.captureCommitted();
+        shadow.deinit();
+        const release = owner.release();
+        owner_live = false;
+        result.owner_released = release.released;
+        result.post_release_live_bytes = std.math.cast(usize, release.post_release_live_bytes orelse return error.ContextPhysicalAccountingUnavailable) orelse return error.ContextPhysicalAccountingUnavailable;
+        if (!result.owner_released or result.post_release_live_bytes != 0) return error.ContextPhysicalAccountingUnavailable;
+        return result;
     }
 
     /// Test-driver-only sustained decode on two owners installed exactly once.
@@ -6988,6 +15232,7 @@ pub const NativeGenerationPipeline = struct {
     pub fn qualifyMetalCheckpointSoak(
         self: *NativeGenerationPipeline,
         saved: [2]runtime.kv.attention_match_checkpoint.State,
+        saved_policy_sha256: [2][32]u8,
         request: @import("../runtime/kv/metal_checkpoint_soak.zig").Request,
         journal: *std.Io.File,
     ) !@import("../runtime/kv/metal_checkpoint_soak.zig").Report {
@@ -6996,6 +15241,8 @@ pub const NativeGenerationPipeline = struct {
         const checkpoint = runtime.kv.attention_match_checkpoint;
         const allocation = runtime.kv.host_allocation_tracker;
         try request.validate();
+        for (saved_policy_sha256) |digest| if (!std.meta.eql(digest, request.producer_policy.digest()))
+            return error.InvalidNativeSoakRequest;
         if (self.io == null or self.cb.kind() != .metal or self.kv_dtype != .f16 or
             self.scheduler != null or self.scheduler_lease != null or self.checkpoint_prepare != null or
             self.checkpoint_resume != null or self.load_generation == 0)
@@ -7116,7 +15363,7 @@ pub const NativeGenerationPipeline = struct {
             std.crypto.hash.sha2.Sha256.hash(wire, digest, .{});
         }
         if (!std.meta.eql(prefix_sha, prefix_after)) return error.NativeSoakPrefixChanged;
-        var report: soak.Report = .{ .diagnostic_only = request.duration_seconds < soak.formal_seconds, .load_generation = self.load_generation, .batches = batches, .forward_steps = batches * soak.steps_per_batch, .active_ns = active_ns, .window_elapsed_ns = window_elapsed, .journal_sha256 = hash.finalResult(), .output_tokens = output_tokens, .initial = initial, .final = previous, .prefix_sha256_before = prefix_sha, .prefix_sha256_after = prefix_after, .runtime_kv_bytes_before = runtime_kv_before, .runtime_kv_bytes_after = metal_runtime.runtimeMemorySnapshot(model_runtime).attention_span_bytes, .release = undefined };
+        var report: soak.Report = .{ .diagnostic_only = request.duration_seconds < soak.formal_seconds, .producer_policy = request.producer_policy, .producer_policy_sha256 = request.producer_policy.digest(), .load_generation = self.load_generation, .batches = batches, .forward_steps = batches * soak.steps_per_batch, .active_ns = active_ns, .window_elapsed_ns = window_elapsed, .journal_sha256 = hash.finalResult(), .output_tokens = output_tokens, .initial = initial, .final = previous, .prefix_sha256_before = prefix_sha, .prefix_sha256_after = prefix_after, .runtime_kv_bytes_before = runtime_kv_before, .runtime_kv_bytes_after = metal_runtime.runtimeMemorySnapshot(model_runtime).attention_span_bytes, .release = undefined };
         try compute.synchronizeAttentionMatchKv();
         for (&shadows, &owners, &report.release, &owners_live) |*shadow, *owner, *receipt, *live| {
             _ = owner.captureCommitted();
@@ -7126,6 +15373,7 @@ pub const NativeGenerationPipeline = struct {
             if (!receipt.released or receipt.post_release_live_bytes != 0) return error.ContextPhysicalAccountingUnavailable;
         }
         report.collection_complete = true;
+        try report.validateProducerPolicy(request);
         return report;
     }
 
@@ -7168,6 +15416,15 @@ pub const NativeGenerationPipeline = struct {
         const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
         for (tokens) |token| if (token < 0 or token >= self.gpt_config.vocab_size) return error.InvalidCompactionQueries;
         const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const raw_runtime = compute.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const device_cap: u64 = 8 * 1024 * 1024 * 1024;
+        const device_scope_owner = metal_runtime.beginObservedDeviceScope(raw_runtime, device_cap) orelse
+            return error.CompactionWorkspaceLimit;
+        defer if (!metal_runtime.endObservedDeviceScope(device_scope_owner))
+            @panic("Metal checkpoint device observation scope ownership lost");
+        const device_start = metal_runtime.observedDeviceMemory(raw_runtime);
+        if (device_start.exceeded or device_start.current > device_cap or device_start.peak > device_cap)
+            return error.CompactionWorkspaceLimit;
         const limits = checkpoint.serving_limits;
         const auxiliary = NativeCheckpointPrepare.auxiliary_host_bytes;
         const generation_estimate = try runtime.tier.memory.estimateGptGeneration(.metal, .f16, self.gpt_config, capacity + cycles.query_tail_tokens, 1, 256);
@@ -7189,7 +15446,7 @@ pub const NativeGenerationPipeline = struct {
         phase = "exact_prefill";
         try exact.initEmptyAllocated(self, exact_owner.allocator(), exact_owner.tracker);
         std.log.info("metal_checkpoint_cycle_prefill tokens={d}", .{tokens.len});
-        var exact_logits = try self.appendAttentionMatchProbeTokens(&exact.state.?, tokens);
+        var exact_logits = try self.appendAttentionMatchProbeTokens(&exact.state.?, tokens, null);
         defer self.allocator.free(exact_logits);
         _ = try (cycles.PhasePlan{ .owners = try cycleOwnerBytes(exact_owner.tracker, compacted_owner.tracker), .host = auxiliary, .device = try std.math.add(usize, 4 * 1024 * 1024 * 1024, generation_estimate.scratch_bytes) }).admit();
         phase = "initial_clone";
@@ -7203,20 +15460,21 @@ pub const NativeGenerationPipeline = struct {
         defer self.allocator.free(ids);
         @memcpy(history[0..tokens.len], tokens);
         var length = tokens.len;
-        var report: cycles.Report = .{ .initial_tokens = length, .frozen_reference = request.reference.len != 0 };
+        var report: cycles.Report = .{ .initial_tokens = length, .frozen_reference = request.reference.len != 0, .device_memory_cap_bytes = device_cap, .device_current_bytes = device_start.current, .device_observed_peak_bytes = device_start.peak, .device_cap_exceeded = device_start.exceeded };
         const owner_id = compacted_owner.tracker.snapshot().owner_identity;
         var total_exact_nll: f64 = 0;
         var total_compacted_nll: f64 = 0;
         var total_comparisons: usize = 0;
+        var installed_fit_policy: ?[32]u8 = null;
         for (0..request.cycles) |cycle| {
             try control.check();
             std.log.info("metal_checkpoint_cycle_started cycle={d} logical_tokens={d} encoding={s} owner_id={d}", .{ cycle + 1, length, @tagName(request.encoding), owner_id });
             if (cycle != 0) {
                 const suffix = tokens[tokens.len - request.append_tokens ..];
-                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, suffix);
+                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, suffix, null);
                 self.allocator.free(exact_logits);
                 exact_logits = next_exact;
-                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, suffix);
+                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, suffix, null);
                 self.allocator.free(compacted_logits);
                 compacted_logits = next_compacted;
                 @memcpy(history[length..][0..suffix.len], suffix);
@@ -7235,7 +15493,7 @@ pub const NativeGenerationPipeline = struct {
                 defer snapshot.deinit();
                 descriptor_count = (try cycles.capture(snapshot.state, NativeCheckpointPrepare.fittingOptions().prefix_rows, &descriptors, control)).len;
                 immutable = try cycles.immutableDigest(snapshot.state, descriptors[0..descriptor_count], control);
-                break :plan try NativeCheckpointPrepare.hostPlanForState(self.gpt_config, snapshot.state, request.encoding, control);
+                break :plan try NativeCheckpointPrepare.hostPlanForStateWithQualityPolicy(self.gpt_config, snapshot.state, request.encoding, request.fit_policy.admission, request.fit_policy.chunk_rows, request.fit_policy.reject_exact_active_fixed_point, control);
             };
             // Bound the private query clone by the remaining aggregate, then
             // let its backend enforce that exact allowance during allocation.
@@ -7272,11 +15530,21 @@ pub const NativeGenerationPipeline = struct {
             admitted = @max(admitted, try (cycles.PhasePlan{ .owners = owners, .host = try std.math.add(usize, auxiliary, plan.fit_bytes), .queries = queries.peak_bytes }).admit());
             var prepare: NativeCheckpointPrepare = .{
                 .encoding = request.encoding,
+                .admission = request.fit_policy.admission,
+                .chunk_rows = request.fit_policy.chunk_rows,
+                .reject_exact_active_fixed_point = request.fit_policy.reject_exact_active_fixed_point,
                 .minimum_savings_ratio = if (cycle == 0) request.initial_minimum_savings_ratio else request.incremental_minimum_savings_ratio,
                 .planned_fit_host_bytes = plan.fit_bytes,
                 .planned_fit_workers = plan.workers,
                 .planned_fit_head_workspace_bytes = plan.head_workspace_bytes,
             };
+            const policy_digest = request.fit_policy.digest();
+            if (cycle == 0) {
+                if (prepare.minimum_savings_ratio < 1.5) return error.InvalidCompactionProbe;
+            } else {
+                if (prepare.minimum_savings_ratio <= 1 or installed_fit_policy == null or
+                    !std.meta.eql(installed_fit_policy.?, policy_digest)) return error.InvalidCompactionProbe;
+            }
             defer prepare.deinit();
             phase = "fit";
             const stats = try self.prepareMetalAttentionMatchFit(history[0..length], compacted_logits, &compacted.state.?, &queries, mtpProfileElapsedNs(true, self.io, query_started), &prepare);
@@ -7284,13 +15552,17 @@ pub const NativeGenerationPipeline = struct {
             queries_live = false;
             if (prepare.result == null or prepare.result.?.outcome != .compacted or stats.completed_chunks == 0 or
                 stats.candidate_global_bytes >= stats.source_global_bytes) return error.CompactionCycleDidNotCompact;
-            if (!std.mem.eql(u8, &immutable, &try cycles.immutableDigest(prepare.result.?.checkpoint.state, descriptors[0..descriptor_count], control)))
+            const candidate_state = switch (prepare.result.?.payload) {
+                .host => |owned| owned.state,
+                .device => return error.UnsupportedNativeQualityRoute,
+            };
+            if (!std.mem.eql(u8, &immutable, &try cycles.immutableDigest(candidate_state, descriptors[0..descriptor_count], control)))
                 return error.CompactionHistoryChanged;
             phase = "transport";
-            const candidate_bytes = try prepare.result.?.checkpoint.state.residentBytes();
-            const wire_bytes = try checkpoint.encodedSize(prepare.result.?.checkpoint.state, limits, request.encoding, control);
+            const candidate_bytes = try candidate_state.residentBytes();
+            const wire_bytes = try checkpoint.encodedSize(candidate_state, limits, request.encoding, control);
             admitted = @max(admitted, try (cycles.PhasePlan{ .owners = owners, .host = try std.math.add(usize, auxiliary, candidate_bytes), .wire = wire_bytes, .import = limits.max_state_bytes }).admit());
-            const wire = try checkpoint.encodeWithEncoding(self.allocator, prepare.result.?.checkpoint.state, limits, request.encoding, control);
+            const wire = try checkpoint.encodeWithEncoding(self.allocator, candidate_state, limits, request.encoding, control);
             var wire_live = true;
             defer if (wire_live) self.allocator.free(wire);
             var wire_sha256: [32]u8 = undefined;
@@ -7357,10 +15629,10 @@ pub const NativeGenerationPipeline = struct {
                 row.compacted_nll -= try context_teacher_forced.logProbability(compacted_logits, target_id);
                 row.comparisons += 1;
                 const next = [_]i64{target};
-                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, &next);
+                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, &next, null);
                 self.allocator.free(exact_logits);
                 exact_logits = next_exact;
-                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, &next);
+                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, &next, null);
                 self.allocator.free(compacted_logits);
                 compacted_logits = next_compacted;
                 history[length] = target;
@@ -7378,7 +15650,17 @@ pub const NativeGenerationPipeline = struct {
             row.donor_appends = activity.donor_appends;
             report.rows[cycle] = row;
             report.completed += 1;
+            installed_fit_policy = policy_digest;
+            report.fit_policy_sha256 = policy_digest;
+            report.producer_policy = request.fit_policy;
             report.final_tokens = length;
+            const device_phase = metal_runtime.observedDeviceMemory(raw_runtime);
+            report.device_current_bytes = device_phase.current;
+            report.device_observed_peak_bytes = @max(report.device_observed_peak_bytes, device_phase.peak);
+            report.device_cap_exceeded = report.device_cap_exceeded or device_phase.exceeded;
+            if (report.device_cap_exceeded or report.device_current_bytes > report.device_memory_cap_bytes or
+                report.device_observed_peak_bytes > report.device_memory_cap_bytes)
+                return error.CompactionWorkspaceLimit;
             total_exact_nll += row.exact_nll;
             total_compacted_nll += row.compacted_nll;
             total_comparisons += row.comparisons;
@@ -7393,6 +15675,13 @@ pub const NativeGenerationPipeline = struct {
         compacted_owner_live = false;
         report.exact_release = exact_owner.release();
         exact_owner_live = false;
+        const device_release = metal_runtime.observedDeviceMemory(raw_runtime);
+        report.device_current_bytes = device_release.current;
+        report.device_observed_peak_bytes = @max(report.device_observed_peak_bytes, device_release.peak);
+        report.device_cap_exceeded = report.device_cap_exceeded or device_release.exceeded;
+        if (report.device_cap_exceeded or report.device_current_bytes > report.device_memory_cap_bytes or
+            report.device_observed_peak_bytes > report.device_memory_cap_bytes)
+            return error.CompactionWorkspaceLimit;
         if (report.compacted_release.post_release_live_bytes != 0 or report.exact_release.post_release_live_bytes != 0 or
             total_comparisons == 0 or (total_compacted_nll - total_exact_nll) / @as(f64, @floatFromInt(total_comparisons)) > @log(@as(f64, 1.05)))
             return error.CompactionCycleQualityRejected;
@@ -7450,10 +15739,10 @@ pub const NativeGenerationPipeline = struct {
             try checkAttentionMatchQueryWork(self);
             if (cycle > 0) {
                 const suffix = tokens[tokens.len - append_tokens ..];
-                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, suffix);
+                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, suffix, null);
                 self.allocator.free(exact_logits);
                 exact_logits = next_exact;
-                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, suffix);
+                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, suffix, null);
                 self.allocator.free(compacted_logits);
                 compacted_logits = next_compacted;
                 @memcpy(history[length..][0..suffix.len], suffix);
@@ -7500,10 +15789,10 @@ pub const NativeGenerationPipeline = struct {
                 comparisons += 1;
                 if (self.gpt_config.isEosToken(expected)) break;
                 const next_token: [1]i64 = .{@intCast(expected)};
-                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, &next_token);
+                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, &next_token, null);
                 self.allocator.free(exact_logits);
                 exact_logits = next_exact;
-                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, &next_token);
+                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, &next_token, null);
                 self.allocator.free(compacted_logits);
                 compacted_logits = next_compacted;
                 history[length] = @intCast(expected);
@@ -7638,12 +15927,15 @@ pub const NativeGenerationPipeline = struct {
             options.chunk_size == 0 or options.chunk_size > 512 or
             options.chunk_size > options.collection.max_capture_rows or self.gpt_config.num_hidden_layers > 256)
             return error.CompactionQueryLimit;
-        const study = if (options.representative_repeat)
-            try queries.studyTokens(self.allocator, source_tokens, options.max_repeat_tokens orelse source_tokens.len)
-        else
-            null;
-        defer if (study) |tokens| self.allocator.free(tokens);
-        const repeat_tokens = study orelse source_tokens[source_tokens.len - @min(source_tokens.len, options.max_repeat_tokens orelse source_tokens.len) ..];
+        try validateAttentionMatchRepeatAuthority(options);
+        const study = if (options.representative_repeat) try queries.studyTokensPass(self.allocator, source_tokens, options.max_repeat_tokens orelse source_tokens.len, options.study_pass) else null;
+        defer if (study) |owned| self.allocator.free(owned);
+        const repeat_tokens = options.explicit_repeat_tokens orelse study orelse source_tokens[source_tokens.len - @min(source_tokens.len, options.max_repeat_tokens orelse source_tokens.len) ..];
+        if (options.explicit_repeat_sha256) |expected| {
+            var actual: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(repeat_tokens), &actual, .{});
+            if (!std.mem.eql(u8, &actual, &expected)) return error.InvalidCompactionQueries;
+        }
         if (repeat_tokens.len < 2) return error.CompactionQueryLimit;
         for (source_tokens) |token| if (token < 0 or token >= self.gpt_config.vocab_size) return error.InvalidCompactionQueries;
 
@@ -7676,7 +15968,9 @@ pub const NativeGenerationPipeline = struct {
         // required capacity. Page tables/activations are charged by the backend.
         const shadow_kv_bytes = try std.math.mul(usize, try std.math.mul(usize, shadow_rows, 4), kv_row_bytes);
         if (options.prefix_mode == .replay and shadow_kv_bytes > options.max_shadow_kv_bytes) return error.CompactionQueryLimit;
-        var collector = try queries.Collector.init(self.allocator, consumers[0..count], source_tokens.len, repeat_tokens.len, options.collection);
+        var collection = options.collection;
+        collection.explicit_sample_offsets = options.explicit_sample_offsets;
+        var collector = try queries.Collector.init(self.allocator, consumers[0..count], source_tokens.len, repeat_tokens.len, collection);
         errdefer collector.deinit();
         var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
         defer if (execution_scope) |*scope| scope.deinit();
@@ -7694,6 +15988,14 @@ pub const NativeGenerationPipeline = struct {
             if (source.kv_storage) |source_storage| source_storage.ownerAllocationTracker() else null
         else
             null;
+        // The child is attribution-only. All backing, admission limits, fault
+        // injection and aggregate peaks remain authoritative on source_tracker.
+        // Only manager/storage/decode-state allocations use its allocator;
+        // collector output and canonical forward allocations remain parent-owned.
+        var forwarding_tracker = if (source_tracker) |tracker|
+            try runtime.kv.host_allocation_tracker.HostAllocationTracker.initForwardingScope(tracker)
+        else
+            null;
         var shadow_owner: ?runtime.kv.host_allocation_tracker.RequestAllocationOwner =
             if (self.cb.kind() == .metal and source_tracker == null)
                 try runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null)
@@ -7702,23 +16004,56 @@ pub const NativeGenerationPipeline = struct {
         defer if (shadow_owner) |*owner| {
             _ = owner.release();
         };
-        const shadow_tracker = if (source_tracker) |tracker| tracker else if (shadow_owner) |owner| owner.tracker else null;
+        const shadow_tracker = if (forwarding_tracker) |*tracker| tracker else if (shadow_owner) |owner| owner.tracker else null;
         const shadow_allocator = if (shadow_tracker) |tracker| tracker.allocator() else self.allocator;
         const shadow_before = if (shadow_tracker) |tracker| tracker.snapshot() else null;
+        const parent_before = if (source_tracker) |tracker| tracker.snapshot() else shadow_before;
         defer if (shadow_tracker) |tracker| {
             const before = shadow_before.?;
-            const after = tracker.snapshot();
-            const released = before.tracked_combined_physical_available and after.tracked_combined_physical_available and
-                before.logical_live_bytes == after.logical_live_bytes and before.physical_live_bytes == after.physical_live_bytes and
-                before.shared_backing_live_bytes == after.shared_backing_live_bytes and before.private_device_live_bytes == after.private_device_live_bytes;
+            const child_after = tracker.snapshot();
+            const scope_receipt = if (forwarding_tracker != null)
+                tracker.closeForwardingScope(tracker.forwarding_generation) catch
+                    @panic("attention-match forwarding scope retained live allocation")
+            else
+                null;
+            const authoritative_after = if (source_tracker) |parent| parent.snapshot() else child_after;
+            const authoritative_before = parent_before.?;
+            const released = if (scope_receipt) |receipt|
+                receipt.completed and child_after.logical_live_bytes == 0 and
+                    child_after.physical_live_bytes == 0 and child_after.shared_backing_live_bytes == 0 and
+                    child_after.private_device_live_bytes == 0
+            else
+                before.tracked_combined_physical_available and child_after.tracked_combined_physical_available and
+                    before.logical_live_bytes == child_after.logical_live_bytes and before.physical_live_bytes == child_after.physical_live_bytes and
+                    before.shared_backing_live_bytes == child_after.shared_backing_live_bytes and before.private_device_live_bytes == child_after.private_device_live_bytes;
             if (options.stats) |stats| {
-                stats.shadow_owner_id = after.owner_identity;
-                stats.shadow_owner_peak_bytes = after.tracked_combined_peak_bytes;
+                stats.shadow_owner_id = authoritative_after.owner_identity;
+                stats.shadow_scope_generation = if (scope_receipt) |receipt| receipt.scope_generation else 0;
+                stats.shadow_owner_peak_bytes = child_after.tracked_combined_peak_bytes;
                 stats.shadow_scope_released = released;
                 stats.shadow_scope_delta_bytes = if (released) 0 else null;
                 stats.shadow_uses_source_owner = source_tracker != null;
                 stats.shadow_scope_before_bytes = before.tracked_combined_live_bytes;
-                stats.shadow_scope_after_bytes = after.tracked_combined_live_bytes;
+                stats.shadow_scope_after_bytes = child_after.tracked_combined_live_bytes;
+                stats.shadow_scope_before_logical_bytes = before.logical_live_bytes;
+                stats.shadow_scope_after_logical_bytes = child_after.logical_live_bytes;
+                stats.shadow_scope_before_physical_bytes = before.physical_live_bytes;
+                stats.shadow_scope_after_physical_bytes = child_after.physical_live_bytes;
+                stats.shadow_scope_before_shared_bytes = before.shared_backing_live_bytes;
+                stats.shadow_scope_after_shared_bytes = child_after.shared_backing_live_bytes;
+                stats.shadow_scope_before_private_bytes = before.private_device_live_bytes;
+                stats.shadow_scope_after_private_bytes = child_after.private_device_live_bytes;
+                stats.parent_retained_before_bytes = authoritative_before.tracked_combined_live_bytes;
+                stats.parent_retained_after_bytes = authoritative_after.tracked_combined_live_bytes;
+                stats.parent_retained_delta_bytes = signedByteDelta(authoritative_before.tracked_combined_live_bytes, authoritative_after.tracked_combined_live_bytes);
+                stats.parent_retained_before_logical_bytes = authoritative_before.logical_live_bytes;
+                stats.parent_retained_after_logical_bytes = authoritative_after.logical_live_bytes;
+                stats.parent_retained_before_physical_bytes = authoritative_before.physical_live_bytes;
+                stats.parent_retained_after_physical_bytes = authoritative_after.physical_live_bytes;
+                stats.parent_retained_before_shared_bytes = authoritative_before.shared_backing_live_bytes;
+                stats.parent_retained_after_shared_bytes = authoritative_after.shared_backing_live_bytes;
+                stats.parent_retained_before_private_bytes = authoritative_before.private_device_live_bytes;
+                stats.parent_retained_after_private_bytes = authoritative_after.private_device_live_bytes;
             }
         };
         var manager = runtime.kv.manager.KvManager.init(shadow_allocator);
@@ -7737,7 +16072,21 @@ pub const NativeGenerationPipeline = struct {
         shadow.configureForGptConfig(self.gpt_config);
         shadow.allow_swa_ring = false;
         defer shadow.deinit();
+        // Hidden-only Metal forwards do not materialize a host result. Fence
+        // their terminal command buffer before the shadow KV/storage leases
+        // are destroyed and before the owner snapshot verifies full release.
+        // On an earlier failure cleanup still fences, but never replaces the
+        // primary error with a secondary synchronization failure.
+        var metal_shadow_completion_pending = self.cb.kind() == .metal;
+        defer if (metal_shadow_completion_pending) {
+            if (comptime build_options.enable_metal) {
+                const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+                compute.synchronizeAttentionMatchKv() catch {};
+            }
+        };
         if (options.stats) |stats| stats.setup_ns = mtpProfileElapsedNs(true, self.io, collection_started);
+        if (options.owner_component_diagnostic_request != 0)
+            self.logOwnerComponent(shadow_tracker.?.snapshot(), options.owner_component_diagnostic_request, "before_query_clone", false);
         const prefix_started = mtpProfileTimestamp(true, self.io);
         var ragged_shadow = false;
         if (options.prefix_mode == .clone) {
@@ -7750,7 +16099,7 @@ pub const NativeGenerationPipeline = struct {
                 source.sequence_id != source_view.sequence_id) return error.UnsupportedDeviceKvCloneLayout;
             const source_blocks = source_view.logical_blocks orelse return error.UnsupportedDeviceKvCloneLayout;
             try shadow.notePrefill(source_tokens.len);
-            const clone_request: runtime.kv.device_clone.Request = .{ .source_sequence = source_view.sequence_id, .destination_sequence = shadow.sequence_id.?, .tokens = source_tokens.len, .capacity = shadow_rows, .page_size = pool_config.page_size_tokens, .source_blocks = source_blocks, .destination_blocks = shadow.kv_block_ids.items, .donors = donors[0..donor_count], .max_bytes = options.max_shadow_kv_bytes, .check_ctx = self, .check_fn = checkAttentionMatchQueryWork };
+            const clone_request: runtime.kv.device_clone.Request = .{ .source_sequence = source_view.sequence_id, .destination_sequence = shadow.sequence_id.?, .tokens = source_tokens.len, .capacity = shadow_rows, .page_size = pool_config.page_size_tokens, .source_blocks = source_blocks, .destination_blocks = shadow.kv_block_ids.items, .logical_block_policy = if (self.cb.kind() == .metal) .metal_sequence_slot_owned else .identity_only, .donors = donors[0..donor_count], .max_bytes = options.max_shadow_kv_bytes, .check_ctx = self, .check_fn = checkAttentionMatchQueryWork };
             const fitted_clone = switch (self.cb.kind()) {
                 .cuda => if (comptime build_options.enable_cuda) blk: {
                     const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
@@ -7774,6 +16123,8 @@ pub const NativeGenerationPipeline = struct {
                 stats.cloned_bytes = clone.copied_bytes;
                 stats.shadow_allocation_bound_bytes = clone.allocation_bound_bytes;
             }
+            if (options.owner_component_diagnostic_request != 0)
+                self.logOwnerComponent(shadow_tracker.?.snapshot(), options.owner_component_diagnostic_request, "after_query_clone", false);
         } else if (options.stats) |stats| stats.shadow_allocation_bound_bytes = shadow_kv_bytes;
         const first_pass: usize = if (options.prefix_mode == .clone) 1 else 0;
         const profile_repeat = self.cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_PROFILE_PREFILL_OPS");
@@ -7814,6 +16165,9 @@ pub const NativeGenerationPipeline = struct {
                     .metrics = if (profile_repeat) &capture_metrics else null,
                 };
                 try gpt_arch.forwardHiddenOnly(&self.cb, self.allocator, self.gpt_config, pass_tokens[offset..end], 1, shadow.total_tokens, &context);
+                if (options.stats) |stats| stats.forward_calls += 1;
+                if (options.owner_component_diagnostic_request != 0)
+                    self.logOwnerComponent(shadow_tracker.?.snapshot(), options.owner_component_diagnostic_request, "after_hidden_forward", false);
                 offset = end;
             }
             if (ragged_shadow) {
@@ -7866,7 +16220,16 @@ pub const NativeGenerationPipeline = struct {
         }
         _ = try collector.finish();
         if (self.execution_control) |control| try control.check();
+        if (comptime build_options.enable_metal) {
+            if (metal_shadow_completion_pending) {
+                const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+                try compute.synchronizeAttentionMatchKv();
+                metal_shadow_completion_pending = false;
+            }
+        }
         cleanup_started = mtpProfileTimestamp(true, self.io);
+        if (options.owner_component_diagnostic_request != 0)
+            self.logOwnerComponent(shadow_tracker.?.snapshot(), options.owner_component_diagnostic_request, "before_query_cleanup", false);
         return collector;
     }
 
@@ -8046,6 +16409,58 @@ pub const NativeGenerationPipeline = struct {
             &dc,
             require_output,
         );
+        try cb.checkExecutionControl();
+        return result;
+    }
+
+    fn runCompactionStudyPreparedModelGreedyTokenAtomic(ctx: *anyopaque, allocator: std.mem.Allocator, hook: runtime.kv.context_session.Hook, position: u32, token: i64) !i64 {
+        const adapter: *CompactionStudyForwardContext = @ptrCast(@alignCast(ctx));
+        if (!adapter.singleton_paged_decode or position < adapter.decode_start)
+            return error.PreparedStudyRouteUnsupported;
+        const self = adapter.pipeline;
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
+        var cb = self.cb;
+        cb.execution_control = self.execution_control orelse cb.execution_control;
+        try cb.checkExecutionControl();
+        const end = try std.math.add(usize, position, 1);
+        const mode = try compactionStudyAttentionMode(adapter, hook, position, 1);
+        if (mode != .paged_decode) return error.PreparedStudyRouteUnsupported;
+        const dc = gpt_arch.DecodeContext{
+            .context_session = hook,
+            .attention_mode = .paged_decode,
+            .qualification_require_context_decode_frame = true,
+            .total_sequence_len = end,
+            .query_sequence_len = 1,
+            .kv_sequence_len = end,
+            .gemma4_layer_spec_cache = if (self.decode_state) |state| &state.gemma4_layer_spec_cache else null,
+        };
+        const result = try decoder_gated_runtime.forwardQualificationPreparedModelGreedyTokenAtomic(
+            &cb,
+            allocator,
+            self.gpt_config,
+            self.gpt_config.num_hidden_layers,
+            token,
+            end,
+            &dc,
+        );
+        try cb.checkExecutionControl();
+        return result;
+    }
+
+    fn runCompactionStudyPreparedModelGreedyTokenTerminal(ctx: *anyopaque, allocator: std.mem.Allocator, hook: runtime.kv.context_session.Hook, position: u32, token: i64) !i64 {
+        const adapter: *CompactionStudyForwardContext = @ptrCast(@alignCast(ctx));
+        if (!adapter.singleton_paged_decode or position < adapter.decode_start) return error.PreparedStudyRouteUnsupported;
+        const self = adapter.pipeline;
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
+        var cb = self.cb;
+        cb.execution_control = self.execution_control orelse cb.execution_control;
+        try cb.checkExecutionControl();
+        const end = try std.math.add(usize, position, 1);
+        if (try compactionStudyAttentionMode(adapter, hook, position, 1) != .paged_decode) return error.PreparedStudyRouteUnsupported;
+        const dc = gpt_arch.DecodeContext{ .context_session = hook, .attention_mode = .paged_decode, .qualification_require_context_decode_frame = true, .total_sequence_len = end, .query_sequence_len = 1, .kv_sequence_len = end, .gemma4_layer_spec_cache = if (self.decode_state) |state| &state.gemma4_layer_spec_cache else null };
+        const result = try decoder_gated_runtime.forwardDiagnosticPreparedModelGreedyTokenTerminal(&cb, allocator, self.gpt_config, self.gpt_config.num_hidden_layers, token, end, &dc);
         try cb.checkExecutionControl();
         return result;
     }
@@ -8247,6 +16662,86 @@ pub const NativeGenerationPipeline = struct {
         if (decode_state.total_tokens != prompt_ids.len) return error.InvalidCompactionCapturePrefill;
     }
 
+    /// Genuine capture-only formal E2 issuer. It performs the same compiled
+    /// prefill handoff and source discard as production, inventories that raw
+    /// destination, and returns an artifact. It
+    /// never invokes fitting, candidate construction, installation, or publish.
+    pub fn diagnoseE2FormalOwnerInventory(
+        self: *NativeGenerationPipeline,
+        prompt_ids: []const i64,
+        decode_state: *NativeDecodeState,
+        config: GenerationConfig,
+        admitted_chunk_rows: u32,
+        layout: runtime.context_policy.Layout,
+        grant: FormalE2InventoryCaptureGrant,
+    ) !@import("../runtime/kv/attention_match_e2_formal_owner_inventory.zig").Artifact {
+        if (comptime !builtin.is_test) return error.QualificationOnly;
+        try grant.validate(self.attention_match_identity orelse return error.UnsupportedKvIdentity, prompt_ids);
+        if (prompt_ids.len != 7_936 and prompt_ids.len != 32_512) return error.UnqualifiedCompactionArtifact;
+        if (decode_state.context_session != null or !decode_state.isPaged() or decode_state.total_tokens != 0 or
+            decode_state.sequence_id != null or admitted_chunk_rows == 0 or config.prefill_chunk_size != admitted_chunk_rows or
+            self.scheduler != null or self.scheduler_lease != null or self.graph_cache == null or
+            self.compiled_partition_backend != .metal or self.compiled_attachment_target != .whole_model)
+            return error.UnsupportedCompactionCapturePrefill;
+        try setWorkloadProfileRegime(&self.cb, .prefill);
+        var capture_config = config;
+        // Match checkpoint preparation's uniform full-history allocation
+        // without constructing a qualification grant or fitting request.
+        capture_config.native_checkpoint_prepare_full_history = true;
+        const output = try self.executePrefill(prompt_ids, prompt_ids.len, 0, decode_state, capture_config, false, false, false);
+        if (output.greedy_token != null or output.last_hidden != null or output.last_hidden_rows != 0 or
+            output.last_logits == null or output.last_logits.?.len != @as(usize, @intCast(self.gpt_config.vocab_size)))
+        {
+            if (output.last_logits) |values| self.allocator.free(values);
+            if (output.last_hidden) |hidden| self.cb.free(hidden);
+            return error.InvalidCompactionCapturePrefill;
+        }
+        self.allocator.free(output.last_logits.?);
+        if (decode_state.total_tokens != prompt_ids.len) return error.InvalidCompactionCapturePrefill;
+        const storage = decode_state.kv_storage orelse return error.OrdinaryExactMetalKvRequired;
+        const tracker = storage.ownerAllocationTracker() orelse return error.ContextPhysicalAccountingUnavailable;
+        const pre_handoff_owner = tracker.snapshot();
+        if (!pre_handoff_owner.available or pre_handoff_owner.owner_identity == 0)
+            return error.ContextPhysicalAccountingUnavailable;
+        var capture_authority = std.crypto.hash.sha2.Sha256.init(.{});
+        capture_authority.update("antfly.e2.formal-owner-compiled-handoff-capture.v1");
+        capture_authority.update(&grant.binary_sha256);
+        capture_authority.update(&grant.context_binary_sha256);
+        capture_authority.update(&grant.hardware_profile_sha256);
+        capture_authority.update(&grant.source_freeze_sha256);
+        capture_authority.update(&grant.prompt_tokens_sha256);
+        var capture_authority_sha256: [32]u8 = undefined;
+        capture_authority.final(&capture_authority_sha256);
+        const handoff: NativeCheckpointPrepare.CompiledPrefillExactKvHandoff = .{
+            .max_copy_bytes = 4 * 1024 * 1024 * 1024,
+            .max_host_staging_bytes = 256 * 1024 * 1024,
+            .codec_scope = .f16_fp8_rotated4,
+            .max_logical_tokens = 32_768,
+            .layout_policy = .full_history_exact,
+        };
+        const receipt = try self.handoffValidatedCompiledPrefill(
+            handoff,
+            prompt_ids,
+            decode_state,
+            capture_authority_sha256,
+            pre_handoff_owner.owner_identity,
+        );
+        if (receipt.copied_bytes == 0 or receipt.source_live_bytes_before == 0 or
+            receipt.source_live_bytes_after != 0 or
+            receipt.source_live_bytes_before != receipt.source_physically_released_bytes)
+            return error.InvalidExactPagedKvSourceDiscardReceipt;
+        var raw = try decode_state.qualificationOrdinaryExactInventory(self.allocator, prompt_ids.len, layout);
+        defer raw.deinit();
+        const owner = tracker.snapshot();
+        if (!owner.available or !owner.physical_available or owner.owner_identity == 0 or owner.logical_live_bytes == 0 or owner.tracked_combined_live_bytes == 0)
+            return error.ContextPhysicalAccountingUnavailable;
+        const RawEntry = @import("../runtime/kv/attention_match_e2_formal_owner_inventory.zig").RawEntry;
+        const raw_entries = try self.allocator.alloc(RawEntry, raw.entries.len);
+        defer self.allocator.free(raw_entries);
+        for (raw.entries, raw_entries) |entry, *out| out.* = .{ .layer = entry.layer, .window = entry.window, .rows = entry.rows, .capacity_rows = entry.capacity_rows, .kv_heads = entry.kv_heads, .head_dim = entry.head_dim, .key_row_bytes = entry.key_row_bytes, .value_row_bytes = entry.value_row_bytes, .key_capacity_bytes = entry.key_capacity_bytes, .value_capacity_bytes = entry.value_capacity_bytes, .installed_physical_bytes = entry.installed_physical_bytes };
+        return captureFormalE2OwnerInventory(self.attention_match_identity orelse return error.UnsupportedKvIdentity, .{ .context_instance_id = raw.context_instance_id, .sequence_id = raw.sequence_id, .source_revision = raw.source_revision, .logical_tokens = raw.logical_tokens, .entries = raw_entries, .installed_physical_bytes = raw.installed_physical_bytes, .descriptor_sha256 = raw.descriptor_sha256 }, grant, prompt_ids.len, owner.owner_identity, owner.logical_live_bytes, owner.tracked_combined_live_bytes);
+    }
+
     pub fn scoreTeacherForcedContinuation(
         self: *NativeGenerationPipeline,
         token_ids: []i64,
@@ -8373,11 +16868,19 @@ pub const NativeGenerationPipeline = struct {
         requested_on_token_ctx: ?*anyopaque,
     ) !GenerationResult {
         var config = requested_config;
+        var request_suppress_storage: [max_request_suppress_token_ids]i32 = undefined;
+        config.request_suppress_token_ids = try buildRequestSuppressTokenIds(self.gpt_config, config, &request_suppress_storage);
+        if (config.fixed_length_mask_eos and (platform.env.getenvBool("ANTFLY_INFERENCE_PROMPT_LOOKUP") or self.draft_cb != null))
+            return error.UnsupportedFixedLengthEosMask;
         try validateKvCachePolicy(config);
         const native_checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null;
+        const compiled_checkpoint_handoff = if (self.checkpoint_prepare) |request|
+            request.compiled_prefill_exact_kv_handoff != null
+        else
+            false;
         var selected_checkpoint_certificate: ?*const native_checkpoint_release.Certificate = null;
         const checkpoint_compute: ?*metal_compute.MetalCompute = if (comptime build_options.enable_metal)
-            (if (native_checkpoint and self.cb.kind() == .metal) @ptrCast(@alignCast(self.cb.ptr)) else null)
+            (if ((native_checkpoint or config.native_checkpoint_operator_grant != null) and self.cb.kind() == .metal) @ptrCast(@alignCast(self.cb.ptr)) else null)
         else
             null;
         const previous_checkpoint_execution: ?native_checkpoint_release.Execution = if (comptime build_options.enable_metal)
@@ -8385,18 +16888,86 @@ pub const NativeGenerationPipeline = struct {
         else
             null;
         defer if (comptime build_options.enable_metal) {
-            if (checkpoint_compute) |compute| compute.attention_match_execution = previous_checkpoint_execution;
+            if (checkpoint_compute) |compute| {
+                compute.clearAuthenticatedResidentFfnIdentity();
+                compute.attention_match_execution = previous_checkpoint_execution;
+            }
         };
         if (native_checkpoint and (self.checkpoint_prepare != null and self.checkpoint_resume != null or
             (self.cb.kind() != .cuda and self.cb.kind() != .metal) or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
             !self.gpt_config.usesGemma4Channels() or self.gpt_config.gemma4_mtp_assistant or
             self.attention_match_identity == null or self.scheduler != null or self.scheduler_lease != null or
-            self.graph_cache != null or self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null or
+            ((!compiled_checkpoint_handoff and (self.graph_cache != null or self.compiled_partition_backend != null)) or
+                (compiled_checkpoint_handoff and (self.graph_cache == null or self.compiled_partition_backend != .metal or
+                    self.compiled_attachment_target != .whole_model or self.cb.kind() != .metal or self.checkpoint_resume != null))) or
+            self.draft_cb != null or self.prompt_cache != null or
             messagesHaveImages(messages) or messagesHaveAudio(messages) or config.kv_cache_mode != .exact_hybrid or
             config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.speculation_requested))
             return error.UnsupportedAttentionMatchRoute;
+        if (!native_checkpoint) {
+            if (config.native_checkpoint_operator_grant) |grant| {
+                if (self.cb.kind() != .metal or config.metal_checkpoint_qualification_route != .exact or
+                    config.metal_checkpoint_qualification_request != grant.request_id)
+                    return error.UnqualifiedCompactionArtifact;
+                try grant.validate(
+                    self.attention_match_identity orelse return error.UnsupportedKvIdentity,
+                    grant.policy,
+                    grant.profile_sha256,
+                    grant.profile_semantic_sha256,
+                );
+                if (self.checkpoint_prepare) |request| {
+                    if (request.quality_fit_strategy != grant.fit_strategy or request.training_policy != grant.training_policy or
+                        request.staged_operator_strategy != (grant.fit_strategy != .legacy))
+                        return error.UnqualifiedCompactionArtifact;
+                }
+                if (comptime build_options.enable_metal) {
+                    const compute = checkpoint_compute orelse return error.UnqualifiedCompactionArtifact;
+                    _ = try compute.provider_impl.nativeCheckpointObserved();
+                    compute.attention_match_execution = grant.execution;
+                } else return error.UnqualifiedCompactionArtifact;
+            }
+        }
         if (native_checkpoint and self.cb.kind() == .metal) {
-            const qualification = if (comptime builtin.is_test) config.metal_native_checkpoint_qualification else false;
+            const operator_grant = config.native_checkpoint_operator_grant;
+            if (operator_grant) |grant| {
+                const request_policy = if (self.checkpoint_prepare) |request|
+                    request.fitPolicy()
+                else
+                    self.checkpoint_resume.?.fitPolicy();
+                const profile_sha256 = if (self.checkpoint_prepare) |request|
+                    request.producer_profile_sha256
+                else
+                    self.checkpoint_resume.?.producer_profile_sha256;
+                const profile_semantic_sha256 = if (self.checkpoint_prepare) |request|
+                    request.producer_profile_semantic_sha256
+                else
+                    self.checkpoint_resume.?.producer_profile_semantic_sha256;
+                try grant.validate(
+                    self.attention_match_identity orelse return error.UnsupportedKvIdentity,
+                    request_policy,
+                    profile_sha256,
+                    profile_semantic_sha256,
+                );
+                if (self.checkpoint_resume) |request| {
+                    request.local_capacity_policy = if (grant.usesExactLocalWindowCapacity())
+                        .exact_window_causal_union_v1
+                    else
+                        .legacy_spare512_v1;
+                }
+                if (self.checkpoint_prepare) |request| {
+                    if (request.quality_fit_strategy != grant.fit_strategy or request.training_policy != grant.training_policy or
+                        request.staged_operator_strategy != (grant.fit_strategy != .legacy))
+                        return error.UnqualifiedCompactionArtifact;
+                }
+                if (!config.metal_native_checkpoint_qualification or
+                    config.metal_checkpoint_qualification_route == .none or
+                    config.metal_checkpoint_qualification_request != grant.request_id)
+                    return error.UnqualifiedCompactionArtifact;
+            }
+            const qualification = config.metal_native_checkpoint_qualification;
+            if (comptime !builtin.is_test) {
+                if (qualification and operator_grant == null) return error.UnqualifiedCompactionArtifact;
+            }
             const encoding = if (self.checkpoint_prepare) |request|
                 request.encoding
             else
@@ -8404,7 +16975,11 @@ pub const NativeGenerationPipeline = struct {
             if (qualification) {
                 if (comptime build_options.enable_metal) {
                     const compute = checkpoint_compute orelse return error.UnqualifiedCompactionArtifact;
-                    compute.attention_match_execution = native_checkpoint_release.Execution.diagnosticFromEnvironment();
+                    _ = try compute.provider_impl.nativeCheckpointObserved();
+                    compute.attention_match_execution = grant_execution: {
+                        const grant = operator_grant orelse break :grant_execution native_checkpoint_release.Execution.diagnosticFromEnvironment();
+                        break :grant_execution grant.execution;
+                    };
                 }
             }
             if (!qualification) {
@@ -8451,15 +17026,14 @@ pub const NativeGenerationPipeline = struct {
             (self.scheduler != null or self.graph_cache != null or self.compiled_partition_backend != null))
             return error.UnsupportedKvCachePolicy;
 
-        if (comptime builtin.is_test) {
-            self.last_quality_generation_binding = null;
-            self.metal_qualification_completion = null;
-            self.metal_qualification_binding_baseline = null;
-        }
+        if (comptime builtin.is_test) self.last_quality_generation_binding = null;
+        self.metal_qualification_completion = null;
+        self.metal_qualification_binding_baseline = null;
         if (self.decode_state) |state| {
             state.last_context_metrics = null;
             state.last_context_split_decode_dispatches = 0;
             state.last_context_flash_prefill_dispatches = 0;
+            state.last_context_optimization_dispatches_available = false;
             state.last_context_framed_attention_dispatches = 0;
             state.last_context_standalone_attention_dispatches = 0;
             state.last_context_device_allocation_start = if (state.kv_storage) |storage| storage.deviceAllocationSnapshot() else .{};
@@ -8467,6 +17041,7 @@ pub const NativeGenerationPipeline = struct {
             state.last_context_session_allocation_start = .{};
             state.last_context_session_allocation_end = .{};
             state.last_context_owner_committed = null;
+            state.last_context_packed_singleton_seal = .{};
             if (comptime @import("builtin").is_test) {
                 state.last_context_fault_before = null;
                 state.last_context_fault_after = null;
@@ -8555,7 +17130,7 @@ pub const NativeGenerationPipeline = struct {
             // Prepared graphs, shared scheduler batches and prompt caches have
             // independent KV ownership; they must not bypass this session.
             if (self.cb.kind() != .metal or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
-                self.scheduler != null or self.graph_cache != null or self.compiled_partition_backend != null or
+                self.scheduler != null or ((self.graph_cache != null or self.compiled_partition_backend != null) and config.compiled_packed_prefill_bridge == null) or
                 config.prefill_chunk_plan != null or config.prompt_cache_enabled or config.speculation_requested or
                 self.draft_decode_state != null or messagesHaveImages(messages) or messagesHaveAudio(messages))
                 return error.UnsupportedContextCombination;
@@ -8663,6 +17238,7 @@ pub const NativeGenerationPipeline = struct {
             !target_speculative_verification_unavailable and
             loaded_draft_requested and
             !disable_unshared_gemma4_mtp;
+        const prompt_lookup_requested = getenvBool("ANTFLY_INFERENCE_PROMPT_LOOKUP");
         const multimodal_mtp = (has_images or has_audio) and use_speculative and draft_is_gemma4_mtp and
             self.cb.kind() == .metal and self.gpt_config.usesGemma4Channels() and self.gpt_config.hasPle() and
             self.gguf_projector_path != null and gemma4MtpTargetHiddenSource() == .final and
@@ -9135,6 +17711,7 @@ pub const NativeGenerationPipeline = struct {
 
         var owned_context: ?@import("../backends/metal_context_session.zig").Session = null;
         var owned_packed: ?@import("../backends/packed_context_session.zig").Session = null;
+        var deferred_compiled_packed_config: ?@import("../backends/packed_context_session.zig").Config = null;
         defer if (comptime @import("build_options").enable_metal) {
             if (owned_packed) |*context| {
                 // Capture while the complete context is still live. The
@@ -9145,6 +17722,8 @@ pub const NativeGenerationPipeline = struct {
                 decode_state.last_context_metrics = m;
                 decode_state.last_context_split_decode_dispatches = context.split_decode_dispatches;
                 decode_state.last_context_flash_prefill_dispatches = context.flash_prefill_dispatches;
+                decode_state.last_context_optimization_dispatches_available = true;
+                decode_state.last_context_packed_singleton_seal = context.singletonDecodeSealEvidence();
                 decode_state.last_context_framed_attention_dispatches = context.framed_attention_dispatches;
                 decode_state.last_context_standalone_attention_dispatches = context.attention.standalone_dispatches;
                 const session_allocation = context.ownerAllocationSnapshot();
@@ -9188,12 +17767,17 @@ pub const NativeGenerationPipeline = struct {
             packed_config.execution_control = self.execution_control;
             packed_config.owner_allocation_tracker = config.context_owner_allocation_tracker;
             packed_config.execution_lease = config.context_execution_lease;
-            owned_packed = try @import("../backends/packed_context_session.zig").Session.init(allocator, packed_config);
-            const session_allocation = owned_packed.?.ownerAllocationStart();
-            decode_state.last_context_session_allocation_start = session_allocation.allocation;
-            decode_state.last_context_session_allocation_exclusive = session_allocation.session_scope_exclusive;
-            decode_state.last_context_full_owner_physical_available = session_allocation.full_owner_physical_available;
-            decode_state.context_session = owned_packed.?.hook();
+            if (deferPackedSessionInitialization(config)) {
+                deferred_compiled_packed_config = packed_config;
+            } else {
+                owned_packed = try @import("../backends/packed_context_session.zig").Session.init(allocator, packed_config);
+                const session_allocation = owned_packed.?.ownerAllocationStart();
+                decode_state.last_context_session_allocation_start = session_allocation.allocation;
+                decode_state.last_context_session_allocation_exclusive = session_allocation.session_scope_exclusive;
+                decode_state.last_context_full_owner_physical_available = session_allocation.full_owner_physical_available;
+                if (attachPackedHookBeforePrefill(config))
+                    decode_state.context_session = owned_packed.?.hook();
+            }
         }
         if (config.context_policy.mode == .rolling and borrowed_context == null) {
             if (comptime !@import("build_options").enable_metal) return error.BackendUnavailable;
@@ -9206,6 +17790,21 @@ pub const NativeGenerationPipeline = struct {
             });
             decode_state.context_session = owned_context.?.hook();
         }
+        // Decide only after borrowed, packed, coordinated, or rolling context
+        // ownership has been installed. Prompt lookup needs transactional KV
+        // rollback, which context-session hooks deliberately do not provide.
+        const use_prompt_lookup = promptLookupRequestEligible(
+            prompt_lookup_requested,
+            draft_requested,
+            has_images or has_audio,
+            config.grammar != null or config.token_observer != null,
+            isPureGreedyConfig(config),
+            config.context_policy.mode == .exact,
+            !target_speculative_verification_unavailable,
+            self.scheduler == null and self.executor_sequence_control == null,
+            decode_state.context_session == null and decode_state.isPaged() and
+                config.kv_cache_mode == .exact_hybrid,
+        );
 
         // Build token sequence. Add slack only when speculative decoding is
         // active; the bonus token can write one position past max_tokens.
@@ -9233,6 +17832,11 @@ pub const NativeGenerationPipeline = struct {
             .{ prompt_token_count, seq_len, prepared_multimodal_prompt != null or prepared_qwen3vl_prompt != null },
         );
 
+        if (self.checkpoint_prepare) |request| if (request.compiled_prefill_exact_kv_handoff != null) {
+            if (request.compiled_prefill_preparation_wall_started_at != null or request.compiled_prefill_preparation_wall_ns != 0)
+                return error.InvalidNativeCheckpointRequest;
+            request.compiled_prefill_preparation_wall_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        };
         const runtime_prepare_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         if (config.kv_cache_mode == .select_v1) {
             decode_state.selection_protected_spans = config.kv_protected_spans;
@@ -9274,6 +17878,11 @@ pub const NativeGenerationPipeline = struct {
         else
             prompt_token_count;
         debugGenerationStage("prepare compiled generation runtime begin prompt_token_count={d} token_hint={d}", .{ prompt_token_count, runtime_prepare_token_hint });
+        var compiled_packed_runtime_cleanup = CompiledPackedRuntimeCleanupGuard{
+            .cache = self.graph_cache,
+            .armed = config.compiled_packed_prefill_bridge != null and self.graph_cache != null,
+        };
+        defer compiled_packed_runtime_cleanup.deinit();
         const runtime_prepared = try self.prepareCompiledGenerationRuntime(runtime_prepare_token_hint);
         debugGenerationStage("prepare compiled generation runtime end prepared={}", .{runtime_prepared});
         const prefill_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
@@ -9329,10 +17938,51 @@ pub const NativeGenerationPipeline = struct {
         }
 
         // Prefill
+        if (config.native_checkpoint_operator_grant) |grant| {
+            const prefix: []const u32 = if (self.checkpoint_resume) |request|
+                (request.checkpoint orelse return error.InvalidNativeCheckpointRequest).state.tokens
+            else
+                &.{};
+            const prompt_binding = try resolveNativeCheckpointPromptBinding(prefix, token_ids[0..seq_len]);
+            const digest = try operatorQualificationTokenDigest(prompt_binding.restored_prefix, prompt_binding.appended_prompt);
+            const expected_reserved: usize = if (self.checkpoint_prepare != null) 0 else max_tokens;
+            const reserved_count = std.math.cast(u32, expected_reserved) orelse return error.UnqualifiedCompactionArtifact;
+            if (!std.mem.eql(u8, &grant.prompt_tokens_sha256, &digest) or
+                grant.prompt_tokens != prompt_binding.total_tokens or
+                grant.restored_prefix_tokens != prompt_binding.restored_tokens or
+                grant.appended_prompt_tokens != prompt_binding.appended_tokens or
+                grant.reserved_output_tokens != reserved_count or
+                grant.route != config.metal_checkpoint_qualification_route)
+                return error.UnqualifiedCompactionArtifact;
+        }
+        const packed_grant_profile = if (config.native_checkpoint_operator_grant) |grant|
+            grant.authority_kind == .staged_exact_baseline and grant.arm == .packed_exact and config.context_storage == .packed_exact
+        else
+            false;
+        const packed_profile_before = if (packed_grant_profile) packedGrantProfileSnapshot(self) else null;
+        if (config.native_checkpoint_operator_grant) |grant| {
+            const compiled_runtime_ready = self.graph_cache != null and self.compiled_partition_backend == .metal and self.compiled_attachment_target == .whole_model;
+            const disposition = residentFfnPreparationDisposition(grant, native_checkpoint, config.context_storage == .packed_exact, self.cb.kind(), @import("../architectures/gemma4_runtime.zig").isExactE4bDenseRuntimeConfig(self.gpt_config), compiled_runtime_ready);
+            switch (disposition) {
+                .disabled, .compiled_bypass => {},
+                .reject => return error.UnqualifiedCompactionArtifact,
+                .prepare => |maximum_rows| {
+                    const compute = checkpoint_compute orelse return error.UnqualifiedCompactionArtifact;
+                    const admission = self.e2b_f16_mirror_admission orelse return error.CompactionWorkspaceLimit;
+                    var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+                    defer if (execution_scope) |*scope| scope.deinit();
+                    try compute.prepareAuthenticatedResidentFfnSlots(self.gpt_config, admission, grant.checkpoint_identity, maximum_rows);
+                    try compute.activateAuthenticatedResidentFfnIdentity(self.attention_match_identity orelse return error.UnsupportedKvIdentity);
+                },
+            }
+        }
         try setWorkloadProfileRegime(&self.cb, .prefill);
         try self.logMetalCheckpointQualificationPhase(decode_state, config, "prefill_started", null);
         const quality_requested = if (comptime builtin.is_test) config.context_quality_request != null else false;
-        const allow_prefill_greedy_token = !quality_requested and (!use_speculative or (use_speculative and draft_is_gemma4_mtp));
+        // Checkpoint preparation consumes the final host-logit row after the
+        // exact compiled-KV handoff. Never replace that owned output with the
+        // resident greedy-token shortcut; ordinary generation keeps it.
+        const allow_prefill_greedy_token = self.checkpoint_prepare == null and !quality_requested and (!use_speculative or (use_speculative and draft_is_gemma4_mtp));
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
         const prefill_output = if (self.checkpoint_resume) |request|
             try self.resumeNativeCheckpoint(request, token_ids[0..seq_len], max_tokens, decode_state, config)
@@ -9362,14 +18012,47 @@ pub const NativeGenerationPipeline = struct {
                 };
                 return err;
             };
-        if (self.checkpoint_resume) |request| cached_prompt_tokens = request.restored_tokens;
         var prefill_last_logits = prefill_output.last_logits;
         var prefill_greedy_token = prefill_output.greedy_token;
         const prefill_last_hidden = prefill_output.last_hidden;
         const prefill_last_hidden_rows = prefill_output.last_hidden_rows;
-        const finished_prefill_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         defer if (prefill_last_logits) |logits| allocator.free(logits);
         defer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
+        if (config.compiled_packed_prefill_bridge != null) {
+            const packed_config = deferred_compiled_packed_config orelse return error.InvalidCompiledExactImportState;
+            owned_packed = try @import("../backends/packed_context_session.zig").Session.init(allocator, packed_config);
+            const session_allocation = owned_packed.?.ownerAllocationStart();
+            decode_state.last_context_session_allocation_start = session_allocation.allocation;
+            decode_state.last_context_session_allocation_exclusive = session_allocation.session_scope_exclusive;
+            decode_state.last_context_full_owner_physical_available = session_allocation.full_owner_physical_available;
+            const packed_session = if (owned_packed) |*session| session else return error.InvalidCompiledExactImportState;
+            try self.bridgeCompiledPrefillIntoPacked(packed_session, token_ids[0..seq_len], config);
+            compiled_packed_runtime_cleanup.handoffComplete();
+            decode_state.context_session = packed_session.hook();
+            if (config.metal_checkpoint_packed_singleton_evidence_sink) |sink| sink.* = packed_session.singletonDecodeSealEvidence();
+        }
+        if (config.native_checkpoint_operator_grant) |grant| {
+            if (grant.authority_kind == .staged_exact_baseline and grant.arm == .optimal_compiled_exact) {
+                if (self.qualification_matrix_compiled_source_authority != null) return error.InvalidExactPagedKvHandoffState;
+                const cache = self.graph_cache orelse return error.MissingCompiledModelRuntime;
+                self.qualification_matrix_compiled_source_authority = try graph_mod.execution.compiledModelExactPagedKvAuthority(self, cache);
+            }
+            if (grant.authority_kind == .staged_exact_baseline and grant.arm == .packed_exact and config.context_storage == .packed_exact and config.compiled_packed_prefill_bridge == null) {
+                const packed_session = if (owned_packed) |*session| session else return error.UnqualifiedCompactionArtifact;
+                try packed_session.sealForSingletonDecode();
+                if (config.metal_checkpoint_packed_singleton_evidence_sink) |sink|
+                    sink.* = packed_session.singletonDecodeSealEvidence();
+            }
+        }
+        if (self.bounded_ple_prefill_decode_handoff_required) {
+            const cache = self.graph_cache orelse return error.RequiredCompiledRuntimePrepareDeclined;
+            if (!try graph_mod.execution.finishCompiledModelPrefillForDecode(self, cache))
+                return error.RequiredCompiledRuntimePrepareDeclined;
+            self.bounded_ple_prefill_decode_handoff_required = false;
+        }
+        if (self.checkpoint_resume) |request| cached_prompt_tokens = request.restored_tokens;
+        const finished_prefill_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        const packed_profile_after_prefill = if (packed_grant_profile) packedGrantProfileSnapshot(self) else null;
         if (serving_compaction) |request| {
             if (comptime !@import("build_options").enable_metal) return error.BackendUnavailable;
             if (comptime @import("builtin").is_test) if (config.context_fault_controller != null) {
@@ -9475,22 +18158,32 @@ pub const NativeGenerationPipeline = struct {
         );
 
         if (self.checkpoint_prepare) |request| {
+            if (request.qualification_phase_telemetry) |*owned| {
+                const now = platform.time.monotonicNs();
+                try owned.observer().emit(.source_prefill, .end, now);
+                try owned.observer().emit(.compiled_handoff, .begin, now);
+            }
+            try self.handoffPrivateCompiledPrefill(request, token_ids[0..seq_len], decode_state, config);
             try self.prepareNativeCheckpoint(request, token_ids[0..seq_len], prefill_last_logits orelse return error.MissingCompactionResumeLogits, decode_state, config);
-            if (comptime builtin.is_test) {
-                if (config.metal_native_checkpoint_qualification and
-                    config.metal_checkpoint_qualification_route != .none and
-                    self.cb.kind() == .metal)
-                {
-                    if (decode_state.total_tokens != seq_len) return error.InvalidKvCheckpoint;
-                    // Preparation ends immediately after a complete prefill:
-                    // every logical prompt token already owns a materialized
-                    // KV row, and no sampled decode token is pending.
-                    self.metal_qualification_completion = try metalQualificationCompletion(
-                        seq_len,
-                        decode_state.total_tokens,
-                        0,
-                    );
-                }
+            // This is preparation wall time through fitting, not end-to-end TTFT.
+            // Export, upload, install, and first-content delivery remain measured by
+            // the outer SDK request timer.
+            if (request.compiled_prefill_preparation_wall_started_at) |preparation_started_at|
+                request.compiled_prefill_preparation_wall_ns = mtpProfileElapsedNs(true, self.io, preparation_started_at);
+            try self.logNativeCheckpointRequestPrivatePublish(decode_state, config, request);
+            if (config.metal_native_checkpoint_qualification and
+                config.metal_checkpoint_qualification_route != .none and
+                self.cb.kind() == .metal)
+            {
+                if (decode_state.total_tokens != seq_len) return error.InvalidKvCheckpoint;
+                // Preparation ends immediately after a complete prefill:
+                // every logical prompt token already owns a materialized
+                // KV row, and no sampled decode token is pending.
+                self.metal_qualification_completion = try metalQualificationCompletion(
+                    seq_len,
+                    decode_state.total_tokens,
+                    0,
+                );
             }
             return .{
                 .text = try allocator.dupe(u8, ""),
@@ -9625,6 +18318,7 @@ pub const NativeGenerationPipeline = struct {
         var tokens_generated: usize = 0;
         var pending_unmaterialized_tokens: u8 = 0;
         var speculative_stats = SpeculativeDecodeStats{};
+        speculative_stats.prompt_lookup_requested = prompt_lookup_requested;
         speculative_stats.speculation_policy = speculation_policy;
         speculative_stats.speculation_calibration = config.speculation_calibration;
         speculative_stats.mtp_graph_replay_status = gemma4MtpGraphReplayStatusName();
@@ -10188,6 +18882,7 @@ pub const NativeGenerationPipeline = struct {
                             if (stream_enabled) on_token_fn else null,
                             if (stream_enabled) on_token_ctx else null,
                             if (stream_enabled) &streaming_text else null,
+                            false,
                         );
                         if (speculative_stats.mtp_profile.enabled) {
                             speculative_stats.mtp_profile.fallback_calls += 1;
@@ -10231,6 +18926,7 @@ pub const NativeGenerationPipeline = struct {
                             if (stream_enabled) on_token_fn else null,
                             if (stream_enabled) on_token_ctx else null,
                             if (stream_enabled) &streaming_text else null,
+                            false,
                         );
                         if (speculative_stats.mtp_profile.enabled) {
                             speculative_stats.mtp_profile.fallback_calls += 1;
@@ -10270,10 +18966,20 @@ pub const NativeGenerationPipeline = struct {
                 if (stream_enabled) on_token_fn else null,
                 if (stream_enabled) on_token_ctx else null,
                 if (stream_enabled) &streaming_text else null,
+                use_prompt_lookup,
             );
             tokens_generated = decode_result.tokens_generated;
             finish_reason = decode_result.finish_reason;
             pending_unmaterialized_tokens = decode_result.pending_unmaterialized_tokens;
+            if (use_prompt_lookup) {
+                speculative_stats.prompt_lookup_enabled = true;
+                speculative_stats.prompt_lookup = decode_result.prompt_lookup;
+                speculative_stats.rounds = @intCast(decode_result.prompt_lookup.target_verify_passes);
+                speculative_stats.drafted_tokens = @intCast(decode_result.prompt_lookup.proposed_tokens);
+                speculative_stats.matched_draft_tokens = @intCast(decode_result.prompt_lookup.accepted_proposal_tokens);
+                speculative_stats.accepted_tokens = @intCast(decode_result.prompt_lookup.accepted_proposal_tokens);
+                speculative_stats.speculation_policy_decision = .active;
+            }
             debugGenerationStage(
                 "standard decode returned tokens_generated={d} finish_reason={s} seq_len={d}",
                 .{ tokens_generated, finish_reason, seq_len },
@@ -10343,18 +19049,39 @@ pub const NativeGenerationPipeline = struct {
         const result_gen_token_ids = generationResultTokenSlice(
             raw_gen_token_ids,
             projected_gen_token_ids,
-            self.return_raw_token_ids,
+            self.return_raw_token_ids or config.return_raw_token_ids,
         );
         const result_gen_ids = try allocator.alloc(i32, result_gen_token_ids.len);
         errdefer allocator.free(result_gen_ids);
         for (result_gen_token_ids, 0..) |token_id, idx| result_gen_ids[idx] = @intCast(token_id);
 
-        const text_gen_ids = if (self.return_raw_token_ids) blk: {
+        const text_gen_ids = if (self.return_raw_token_ids or config.return_raw_token_ids) blk: {
             const ids = try allocator.alloc(i32, projected_gen_token_ids.len);
             for (projected_gen_token_ids, 0..) |token_id, idx| ids[idx] = @intCast(token_id);
             break :blk ids;
         } else result_gen_ids;
-        defer if (self.return_raw_token_ids) allocator.free(text_gen_ids);
+        defer if (self.return_raw_token_ids or config.return_raw_token_ids) allocator.free(text_gen_ids);
+
+        const result_eos_token_ids: ?[]i32 = if (config.return_raw_token_ids and config.fixed_length_mask_eos) blk: {
+            var eos_storage: [gpt_mod.max_extra_eos_token_ids + 1]i32 = undefined;
+            var eos_len: usize = 0;
+            if (self.gpt_config.eos_token_id >= 0) {
+                eos_storage[eos_len] = self.gpt_config.eos_token_id;
+                eos_len += 1;
+            }
+            for (self.gpt_config.extra_eos_token_ids[0..self.gpt_config.extra_eos_token_ids_len]) |eos| {
+                if (eos < 0 or std.mem.indexOfScalar(i32, eos_storage[0..eos_len], eos) != null) continue;
+                eos_storage[eos_len] = eos;
+                eos_len += 1;
+            }
+            break :blk try allocator.dupe(i32, eos_storage[0..eos_len]);
+        } else null;
+        errdefer if (result_eos_token_ids) |ids| allocator.free(ids);
+        const result_suppress_token_ids: ?[]i32 = if (config.return_raw_token_ids and config.fixed_length_mask_eos)
+            try allocator.dupe(i32, config.effectiveSuppressTokenIds(&self.gpt_config))
+        else
+            null;
+        errdefer if (result_suppress_token_ids) |ids| allocator.free(ids);
 
         // Channel-protocol debugging: report whether the final-channel marker
         // tokens resolved against this tokenizer. A null marker means the
@@ -10421,6 +19148,45 @@ pub const NativeGenerationPipeline = struct {
                     timing.decode,
                     timing.text_decode,
                     timing.total,
+                },
+            );
+        }
+        if (packed_grant_profile) {
+            const grant = config.native_checkpoint_operator_grant.?;
+            const before = packed_profile_before.?;
+            const after_prefill = packed_profile_after_prefill.?;
+            const after_decode = packedGrantProfileSnapshot(self);
+            if (owned_packed) |*packed_session| std.debug.print(
+                "packed_grant_profile {{\"schema\":\"antfly.packed-grant-profile.v1\",\"request\":{},\"route\":\"{s}\",\"qualification_arm\":\"{s}\",\"prefill_forward_attempts\":{},\"prefill_prepared_token_successes\":{},\"prefill_canonical_last_logits_calls\":{},\"prefill_decoder_calls\":{},\"prefill_block_ns\":{},\"prefill_attention_ns\":{},\"prefill_ffn_ns\":{},\"decode_forward_attempts\":{},\"decode_prepared_token_successes\":{},\"decode_canonical_last_logits_calls\":{},\"decode_decoder_calls\":{},\"decode_block_ns\":{},\"decode_attention_ns\":{},\"decode_ffn_ns\":{},\"frame_submits\":{},\"frame_wait_ns\":{},\"frame_gpu_ns\":{},\"compute_encoders\":{},\"blit_encoders\":{},\"host_download_bytes\":{},\"to_host_calls\":{},\"packed_framed_attention_dispatches\":{},\"packed_standalone_attention_dispatches\":{},\"packed_split_decode_dispatches\":{},\"packed_flash_prefill_dispatches\":{}}}\n",
+                .{
+                    grant.request_id,
+                    @tagName(grant.route),
+                    @tagName(grant.arm),
+                    after_prefill.debug.forward_attempts -| before.debug.forward_attempts,
+                    after_prefill.debug.prepared_token_successes -| before.debug.prepared_token_successes,
+                    after_prefill.debug.canonical_last_logits_calls -| before.debug.canonical_last_logits_calls,
+                    after_prefill.decoder.prefill_calls -| before.decoder.prefill_calls,
+                    after_prefill.decoder.prefill_block_nanos -| before.decoder.prefill_block_nanos,
+                    after_prefill.decoder.prefill_block_attention_nanos -| before.decoder.prefill_block_attention_nanos,
+                    after_prefill.decoder.prefill_block_ffn_nanos -| before.decoder.prefill_block_ffn_nanos,
+                    after_decode.debug.forward_attempts -| after_prefill.debug.forward_attempts,
+                    after_decode.debug.prepared_token_successes -| after_prefill.debug.prepared_token_successes,
+                    after_decode.debug.canonical_last_logits_calls -| after_prefill.debug.canonical_last_logits_calls,
+                    after_decode.decoder.greedy_calls -| after_prefill.decoder.greedy_calls,
+                    after_decode.decoder.greedy_block_nanos -| after_prefill.decoder.greedy_block_nanos,
+                    after_decode.decoder.greedy_block_attention_nanos -| after_prefill.decoder.greedy_block_attention_nanos,
+                    after_decode.decoder.greedy_block_ffn_nanos -| after_prefill.decoder.greedy_block_ffn_nanos,
+                    after_decode.frame_submits -| before.frame_submits,
+                    after_decode.frame_wait_ns -| before.frame_wait_ns,
+                    after_decode.frame_gpu_ns -| before.frame_gpu_ns,
+                    after_decode.compute_encoders -| before.compute_encoders,
+                    after_decode.blit_encoders -| before.blit_encoders,
+                    after_decode.host_download_bytes -| before.host_download_bytes,
+                    after_decode.to_host_calls -| before.to_host_calls,
+                    packed_session.framed_attention_dispatches,
+                    packed_session.attention.standalone_dispatches,
+                    packed_session.split_decode_dispatches,
+                    packed_session.flash_prefill_dispatches,
                 },
             );
         }
@@ -10491,31 +19257,32 @@ pub const NativeGenerationPipeline = struct {
                 profile.host_draft_steps,          profile.draft_target_embedding_cross_copies,
             });
         }
-        if (comptime builtin.is_test) {
-            if (config.metal_native_checkpoint_qualification and
-                config.metal_checkpoint_qualification_route != .none and
-                self.cb.kind() == .metal)
-            {
-                if (pending_unmaterialized_tokens > 1 or pending_unmaterialized_tokens > decode_state.total_tokens)
-                    return error.InvalidKvCheckpoint;
-                if (decode_state.total_tokens != seq_len) return error.InvalidKvCheckpoint;
-                self.metal_qualification_completion = try metalQualificationCompletion(
-                    decode_state.total_tokens,
-                    decode_state.total_tokens - pending_unmaterialized_tokens,
-                    pending_unmaterialized_tokens,
-                );
-            }
+        if (config.metal_native_checkpoint_qualification and
+            config.metal_checkpoint_qualification_route != .none and
+            self.cb.kind() == .metal)
+        {
+            if (pending_unmaterialized_tokens > 1 or pending_unmaterialized_tokens > decode_state.total_tokens)
+                return error.InvalidKvCheckpoint;
+            if (decode_state.total_tokens != seq_len) return error.InvalidKvCheckpoint;
+            self.metal_qualification_completion = try metalQualificationCompletion(
+                decode_state.total_tokens,
+                decode_state.total_tokens - pending_unmaterialized_tokens,
+                pending_unmaterialized_tokens,
+            );
         }
         return .{
             .text = text,
             .reasoning_text = reasoning_text,
             .token_ids = result_gen_ids,
+            .applied_suppress_token_ids = result_suppress_token_ids,
+            .eos_token_ids = result_eos_token_ids,
+            .fixed_length_mask_eos = config.fixed_length_mask_eos,
             .prompt_tokens = prompt_token_count,
             .tokens_used = tokens_generated,
             .finish_reason = finish_reason,
             .cached_prompt_tokens = cached_prompt_tokens,
             .timing_ms = timing_ms,
-            .speculative = if (use_speculative or draft_requested) speculative_stats else null,
+            .speculative = if (use_speculative or draft_requested or prompt_lookup_requested) speculative_stats else null,
             .teacher_forced_evidence = if (comptime builtin.is_test) quality_generation_evidence else {},
             .allocator = allocator,
         };
@@ -10632,6 +19399,40 @@ pub const NativeGenerationPipeline = struct {
     /// re-runs the whole prompt through the generic per-op forward (a second
     /// prompt-length forward that scales with prompt size). Returns null on
     /// any miss so the caller falls back to the plain logits prefill.
+    pub fn makeE2bF16MirrorAdmission(budget: *const runtime.tier.memory.RunBudget, estimate: runtime.tier.memory.Estimate, prefill_rows: usize, config: gpt_mod.Config) ?ops.DecoderRuntimeE2bF16MirrorAdmission {
+        const cohort_and_layers = f16MirrorCohortForConfig(config) orelse return null;
+        const backend_limit = std.math.cast(u64, budget.limits.backend_limit_bytes) orelse return null;
+        const combined_limit = std.math.cast(u64, budget.limits.combined_limit_bytes) orelse return null;
+        const host_total = std.math.cast(u64, budget.hostTotalBytes()) orelse return null;
+        const cap = e2bF16MirrorBackendCap(backend_limit, combined_limit, host_total) orelse return null;
+        const kv_bytes = std.math.cast(u64, @max(budget.backend_kv_bytes, estimate.kv_bytes)) orelse return null;
+        const scratch_bytes = std.math.cast(u64, @max(budget.backend_scratch_bytes, estimate.scratch_bytes)) orelse return null;
+        const value: ops.DecoderRuntimeE2bF16MirrorAdmission = .{
+            .cohort = cohort_and_layers[0],
+            .model_layer_count = config.num_hidden_layers,
+            // Current supported Gemma generation has no weight-adapter
+            // surface: neither native CLI Options nor HTTP GenerateRequest owns
+            // one. Jina retrieval LoRA is a distinct non-Gemma embedding route.
+            // Keep the admission field default-true so a future generative
+            // adapter must thread authoritative state here or fail closed.
+            .backend_cap_bytes = cap,
+            .additional_unprepared_weight_bytes = 0,
+            .adapters_active = false,
+            .declared_backend_kv_bytes = kv_bytes,
+            .declared_backend_scratch_bytes = scratch_bytes,
+            .e4_transient_down_scratch_bytes = std.math.cast(u64, estimate.metal_e4_transient_down_scratch_bytes) orelse return null,
+            .max_context_tokens = estimate.retained_tokens,
+            .max_prefill_rows = prefill_rows,
+            .layer_count = cohort_and_layers[1],
+        };
+        return if (value.requestFactsValid()) value else null;
+    }
+    fn finalizeE2bF16Mirrors(self: *NativeGenerationPipeline) !void {
+        // This generic pipeline does not own the whole-model embedding/PLE
+        // completion proof. It must not claim complete physical residency.
+        _ = try self.cb.decoderRuntimeFinalizeE2bF16Mirrors(null);
+    }
+
     fn tryMetalPreparedTailPrefillGreedy(
         self: *NativeGenerationPipeline,
         input_ids: []const i64,
@@ -10649,7 +19450,11 @@ pub const NativeGenerationPipeline = struct {
             seq_len,
             self.gpt_config.num_hidden_layers,
         ) catch return null;
-        if (!prepared.prepared) return null;
+        if (!prepared.prepared) {
+            _ = try self.cb.decoderRuntimeFinalizeE2bF16Mirrors(null);
+            return null;
+        }
+        try self.finalizeE2bF16Mirrors();
 
         const tail = (try decoder_gated_runtime.forwardPrefillLastPreparedTail(
             &self.cb,
@@ -10777,12 +19582,13 @@ pub const NativeGenerationPipeline = struct {
                 self.cb.kind(),
                 config,
                 allow_resident_greedy_token,
-                self.gpt_config.suppressTokenIds().len > 0,
+                config.effectiveSuppressTokenIds(&self.gpt_config).len > 0,
                 enableCudaPrefillGreedyToken(),
             );
         // Keep the prepared greedy route MTP-only. Target-only Metal takes the
         // final-row logits path below without touching prepared-tail state.
         const use_metal_prefill_greedy_token = self.cb.kind() == .metal and
+            !config.fixed_length_mask_eos and
             gemma4MtpMetalPrefillHiddenCaptureEnabled() and
             capture_last_hidden and
             allow_resident_greedy_token and
@@ -10843,6 +19649,12 @@ pub const NativeGenerationPipeline = struct {
             }
         }
 
+        if (self.recent_prefill_query_capture) |capture| {
+            try capture.validate();
+            if (config.kv_cache_mode == .select_v1 or self.compiled_partition_backend != .metal or
+                self.compiled_attachment_target != .whole_model or self.graph_cache == null)
+                return error.RecentPrefillQueryCaptureUnavailable;
+        }
         if (config.kv_cache_mode != .select_v1 and self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null) {
             if (prefilled_tokens != 0) return error.UnsupportedShape;
             const whole_model_kv_policy = generationKvCapacityPolicyForRoute(
@@ -10882,23 +19694,31 @@ pub const NativeGenerationPipeline = struct {
                 const chunk_end = @min(prompt_ids.len, processed + prefill_chunk_size);
                 const chunk = prompt_ids[processed..chunk_end];
                 const total_chunk_end = prefilled_tokens + chunk_end;
-                const decode_context = decode_runtime.preparePrefill(total_chunk_end, chunk.len) catch |err| {
+                var decode_context = decode_runtime.preparePrefill(total_chunk_end, chunk.len) catch |err| {
                     debugGenerationStage(
                         "executePrefill whole-model KV advance failed chunk_start={d} chunk_end={d} err={s}",
                         .{ processed, chunk_end, @errorName(err) },
                     );
                     return err;
                 };
+                decode_context.recent_prefill_query_capture = self.recent_prefill_query_capture;
                 const is_last_chunk = chunk_end == prompt_ids.len;
                 const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
                 defer phase_timer.finish();
-                var output = (graph_mod.execution.graphForwardCompiledModelOutput(
+                const effective_suppress_token_ids = config.effectiveSuppressTokenIds(&self.gpt_config);
+                const request_suppress_token_ids = if (config.fixed_length_mask_eos and
+                    self.cb.kind() == .metal and self.compiled_partition_backend == .metal)
+                    effective_suppress_token_ids
+                else
+                    &.{};
+                var output = (graph_mod.execution.graphForwardCompiledModelOutputSuppress(
                     self,
                     self.graph_cache.?,
                     chunk,
                     1,
                     total_chunk_end,
                     &decode_context,
+                    if (is_last_chunk) request_suppress_token_ids else &.{},
                 ) catch |err| {
                     debugGenerationStage(
                         "executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}",
@@ -10914,10 +19734,19 @@ pub const NativeGenerationPipeline = struct {
                 };
                 defer output.deinit(allocator);
                 if (is_last_chunk and allow_resident_greedy_token and
+                    (if (config.fixed_length_mask_eos)
+                        request_suppress_token_ids.len > 0
+                    else
+                        requestSuppressionsAllowResidentGreedy(effective_suppress_token_ids)) and
                     isPureGreedyConfig(config) and config.grammar == null)
                 {
-                    const token = try output.greedyToken(allocator, self.gpt_config.vocab_size);
+                    const token = try output.greedyTokenSuppress(
+                        allocator,
+                        self.gpt_config.vocab_size,
+                        request_suppress_token_ids,
+                    );
                     if (token < 0) return error.InvalidModelOutput;
+                    if (config.prefill_execution_stats) |stats| try stats.observe(chunk.len);
                     if (self.scheduler) |scheduler| {
                         if (self.scheduler_lease) |lease| {
                             scheduler.notePrefillProgress(lease, total_chunk_end, seq_len);
@@ -10926,8 +19755,12 @@ pub const NativeGenerationPipeline = struct {
                     }
                     return .{ .greedy_token = @intCast(token) };
                 } else if (is_last_chunk) {
+                    // takeHostLogits transfers allocator-owned host storage out of
+                    // ModelOutput. It cannot alias compiled-runtime scratch state,
+                    // so reset/discard after exact-KV handoff cannot invalidate it.
                     prefill_last_logits = try output.takeHostLogits(allocator);
                 }
+                if (config.prefill_execution_stats) |stats| try stats.observe(chunk.len);
                 processed = chunk_end;
                 if (comptime @import("builtin").is_test) if (config.context_fault_controller) |fault|
                     try fault.checkpoint(.prefill, @intCast(processed), @intCast(prompt_ids.len));
@@ -11304,6 +20137,7 @@ pub const NativeGenerationPipeline = struct {
                 // The chunk's KV writes and query captures are committed at
                 // this point. Selection never runs inside an active forward.
                 if (config.kv_cache_mode == .select_v1) try decode_state.compactSelectedGlobalDonors(self.gpt_config, self.execution_control);
+                if (config.prefill_execution_stats) |stats| try stats.observe(chunk.len);
                 processed = chunk_end;
                 if (admitted_plan != null) plan_chunk_index += 1;
                 if (comptime @import("builtin").is_test) if (config.context_fault_controller) |fault|
@@ -11485,7 +20319,11 @@ pub const NativeGenerationPipeline = struct {
             seq_len,
             self.gpt_config.num_hidden_layers,
         ) catch return null;
-        if (!prepared.prepared) return null;
+        if (!prepared.prepared) {
+            _ = try self.cb.decoderRuntimeFinalizeE2bF16Mirrors(null);
+            return null;
+        }
+        try self.finalizeE2bF16Mirrors();
         var rows = (try decoder_gated_runtime.forwardFinalHiddenRowsFromEmbeddings(
             &self.cb,
             self.allocator,
@@ -11714,6 +20552,7 @@ pub const NativeGenerationPipeline = struct {
         /// Accepted output tokens which have not yet been consumed by a
         /// following model forward and therefore have no materialized KV row.
         pending_unmaterialized_tokens: u8 = 0,
+        prompt_lookup: prompt_lookup.Counters = .{},
     };
 
     const DeviceDecodeOutcome = struct {
@@ -11826,7 +20665,7 @@ pub const NativeGenerationPipeline = struct {
                     .{ cached_logits.len, has_grammar },
                 );
                 try self.debugFirstTokenTopLogits("first_token_top_logits_raw", cached_logits);
-                const suppress_token_ids = self.gpt_config.suppressTokenIds();
+                const suppress_token_ids = config.effectiveSuppressTokenIds(&self.gpt_config);
                 if (suppress_token_ids.len > 0 and firstTokenTopKTraceCount() > 0) {
                     const masked_logits = try self.allocator.dupe(f32, cached_logits);
                     defer self.allocator.free(masked_logits);
@@ -11948,12 +20787,17 @@ pub const NativeGenerationPipeline = struct {
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
         emitted_text: ?*StreamingTextState,
+        enable_prompt_lookup: bool,
     ) !DecodeResult {
         const allocator = self.allocator;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         var tokens_generated = initial_tokens_generated;
         var kv_boundary = AutoregressiveKvBoundary.init(initial_tokens_generated > 0);
         var finish_reason: []const u8 = "length";
+        var prompt_lookup_proposer = if (enable_prompt_lookup)
+            try prompt_lookup.Proposer.init(.{ .max_draft = 1 })
+        else
+            null;
         var device_token_tensor: ?ops.CT = null;
         defer if (device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
         debugGenerationStage(
@@ -11989,7 +20833,56 @@ pub const NativeGenerationPipeline = struct {
             var direct_attempted = false;
             defer if (direct_attempted) @import("antfly_readers").pipeline_metrics.observe(.decode, direct_ns);
             if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated), @intCast(max_tokens));
+            if (tokens_generated > 0) {
+                if (prompt_lookup_proposer) |*proposer| {
+                    const remaining = max_tokens - tokens_generated;
+                    var proposal_buffer: [16]i64 = undefined;
+                    const proposal = try proposer.propose(token_ids[0..seq_len.*], remaining, &proposal_buffer);
+                    if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated), @intCast(max_tokens));
+                    if (proposal.tokens.len > 0) {
+                        // Verification consumes the currently pending sample
+                        // through the host q_len=2 input. A retained device
+                        // handoff for that same sample would be stale afterward.
+                        if (device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
+                        device_token_tensor = null;
+                        const result = try self.verifyPromptLookupProposal(
+                            token_ids,
+                            seq_len,
+                            decode_state,
+                            config,
+                            proposal.tokens,
+                            remaining,
+                            penalty_state,
+                        );
+                        proposer.noteVerification(result.drafted, result.matched_drafts, result.drafted + 1);
+                        tokens_generated += result.accepted;
+                        if (result.pending_unmaterialized_tokens == 0)
+                            kv_boundary.noteForwardConsumedSample()
+                        else
+                            kv_boundary.noteAcceptedSample();
+                        if (on_token_fn != null and on_token_ctx != null and emitted_text != null) {
+                            const keep_streaming = try self.emitDecodedDelta(
+                                token_ids[prompt_token_count..seq_len.*],
+                                emitted_text.?,
+                                on_token_fn.?,
+                                on_token_ctx.?,
+                            );
+                            if (!keep_streaming) {
+                                finish_reason = "stop";
+                                break;
+                            }
+                        }
+                        if (result.hit_eos or result.hit_grammar_stop) {
+                            finish_reason = "stop";
+                            break;
+                        }
+                        if (result.accepted == 0) return error.InvalidSpeculativeState;
+                        continue;
+                    }
+                }
+            }
             if (tokens_generated > 0 and self.executor_sequence_control != null and
+                !config.fixed_length_mask_eos and
                 self.gpt_config.hasQwen35VisionArchitectureContract() and (self.cb.kind() == .metal or self.cb.kind() == .cuda) and
                 self.execution_lock != null and self.io != null and self.scheduler_lease != null and
                 self.scheduler != null and self.scheduler.?.hasExecutor() and self.scheduler.?.usesStepEvents() and
@@ -12012,7 +20905,9 @@ pub const NativeGenerationPipeline = struct {
                 "standardDecode iter={d} seq_len={d} device_token_handoff={}",
                 .{ tokens_generated, seq_len.*, device_token_tensor != null },
             );
-            if (tokens_generated > 0 and self.pipelinedGreedyEligible(config, token_table, json_grammar, gbnf_grammar, decode_state)) {
+            if (tokens_generated > 0 and prompt_lookup_proposer == null and
+                self.pipelinedGreedyEligible(config, token_table, json_grammar, gbnf_grammar, decode_state))
+            {
                 if (try self.runPipelinedGreedyTail(
                     token_ids,
                     seq_len,
@@ -12050,7 +20945,7 @@ pub const NativeGenerationPipeline = struct {
                 // and waits for work that will never be enqueued. The
                 // scheduler still admits only full-geometry-compatible work,
                 // and incompatible peers do not pay a coalescing delay.
-                const route_decode_through_scheduler = self.execution_lock != null and self.scheduler_lease != null and
+                const route_decode_through_scheduler = !config.fixed_length_mask_eos and self.execution_lock != null and self.scheduler_lease != null and
                     (self.cb.execution_owner != 0 or (if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false));
                 // A cooperative CUDA request uses the same canonical logits
                 // path while alone and shared. Admission/retirement of a peer
@@ -12059,7 +20954,7 @@ pub const NativeGenerationPipeline = struct {
                     isPureGreedyConfig(config) and token_table == null and json_grammar.* == null and gbnf_grammar == null and
                     !has_cached_prefill_logits)
                 {
-                    const scheduled = try self.runScheduledDecodeBatch(self.scheduler.?, self.scheduler_lease.?, self.io.?, decode_state, token_ids[seq_len.* - 1], seq_len.*, true);
+                    const scheduled = try self.runScheduledDecodeBatch(self.scheduler.?, self.scheduler_lease.?, self.io.?, decode_state, token_ids[seq_len.* - 1], seq_len.*, true, config.effectiveSuppressTokenIds(&self.gpt_config));
                     break :blk .{ .token = scheduled.token orelse return error.InvalidBatchDecodeState, .grammar_complete = false };
                 }
                 const allow_direct_device_decode = !route_decode_through_scheduler;
@@ -12128,10 +21023,10 @@ pub const NativeGenerationPipeline = struct {
                     if (self.scheduler) |scheduler| {
                         if (self.scheduler_lease) |lease| {
                             if (self.io) |io| {
-                                if (self.graph_cache == null and decode_runtime.kvView() != null and (tokens_generated > 0 or prefill_last_logits.* == null)) {
+                                if (!config.fixed_length_mask_eos and self.graph_cache == null and decode_runtime.kvView() != null and (tokens_generated > 0 or prefill_last_logits.* == null)) {
                                     used_decode_microbatch = true;
                                     owns_last_logits = true;
-                                    break :logits_blk (try self.runScheduledDecodeBatch(scheduler, lease, io, decode_state, token_ids[seq_len.* - 1], seq_len.*, false)).logits.?;
+                                    break :logits_blk (try self.runScheduledDecodeBatch(scheduler, lease, io, decode_state, token_ids[seq_len.* - 1], seq_len.*, false, config.effectiveSuppressTokenIds(&self.gpt_config))).logits.?;
                                 }
                                 try scheduler.awaitTurnControlled(lease, .decode, io, self.execution_control);
                                 direct_decode_turn_acquired = true;
@@ -12172,6 +21067,7 @@ pub const NativeGenerationPipeline = struct {
                         &decode_context,
                         config,
                         token_table != null or json_grammar.* != null or gbnf_grammar != null,
+                        decodeBudgetAllowsPipelineRearm(tokens_generated, max_tokens),
                     )) |token| {
                         break :blk .{ .token = token, .grammar_complete = false };
                     }
@@ -12270,6 +21166,7 @@ pub const NativeGenerationPipeline = struct {
             .tokens_generated = tokens_generated,
             .finish_reason = finish_reason,
             .pending_unmaterialized_tokens = kv_boundary.pending_unmaterialized_tokens,
+            .prompt_lookup = if (prompt_lookup_proposer) |proposer| proposer.counters else .{},
         };
     }
 
@@ -12281,6 +21178,7 @@ pub const NativeGenerationPipeline = struct {
         gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
         decode_state: *NativeDecodeState,
     ) bool {
+        if (config.fixed_length_mask_eos) return false;
         if (config.kv_cache_mode == .select_v1) return false;
         if (!pipelinedMetalDecodeEnabled()) return false;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
@@ -12809,6 +21707,10 @@ pub const NativeGenerationPipeline = struct {
             decoder_runtime_debug_stats.grammar_blocked += 1;
             return null;
         }
+        const request_suppress_token_ids = config.effectiveSuppressTokenIds(&self.gpt_config);
+        if (config.fixed_length_mask_eos and
+            (backend_kind != .metal or self.gpt_config.family != .gemma or !self.gpt_config.hasPle() or !gemma4MetalDirectGreedyEnabled()))
+            return null;
         if (!isPureGreedyConfig(config)) {
             // Sampled decoding must stay on the fused decoder frame; without
             // this it fell off onto the per-op eager path, making sampled chat
@@ -12875,22 +21777,61 @@ pub const NativeGenerationPipeline = struct {
 
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
         const decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
-        var attention_match_frame = try AttentionMatchForwardFrame.begin(self, 1, &decode_context);
+        // The direct decoder owns a generic runtime frame, not the installed
+        // attention-match transaction. A coalesced binding must decline before
+        // any append so canonical GPT logits can own that transaction.
+        // Fixed-length V5 retains its existing canonical-fallback behavior.
+        var skip_optional_frame = false;
+        if (comptime build_options.enable_metal) {
+            if (backend_kind == .metal and
+                self.gpt_config.family == .gemma and self.gpt_config.usesGemma4Channels())
+            {
+                if (decode_context.kv_storage) |storage| {
+                    const compute: *metal_compute.MetalCompute = @ptrCast(@alignCast(self.cb.ptr));
+                    if (compute.hasInstalledAttentionMatch(storage)) {
+                        if (compute.attentionMatchExecution().coalesced_stage) return null;
+                        skip_optional_frame = config.fixed_length_mask_eos;
+                    }
+                }
+            }
+        }
+        var attention_match_frame = if (skip_optional_frame)
+            null
+        else
+            try AttentionMatchForwardFrame.begin(self, 1, &decode_context);
         defer if (attention_match_frame) |*owned| owned.deinit();
         if (backend_kind == .metal and self.gpt_config.family == .gemma and self.gpt_config.hasPle() and gemma4MetalDirectGreedyEnabled()) {
-            if (try decoder_gated_runtime.forwardGreedyToken(
-                &self.cb,
-                self.allocator,
-                self.gpt_config,
-                self.gpt_config.num_hidden_layers,
-                token_ids[seq_len - 1],
-                seq_len,
-                &decode_context,
-            )) |token_id| {
+            const prepared_token = if (config.fixed_length_mask_eos)
+                try decoder_gated_runtime.forwardGreedyTokenSuppress(
+                    &self.cb,
+                    self.allocator,
+                    self.gpt_config,
+                    self.gpt_config.num_hidden_layers,
+                    token_ids[seq_len - 1],
+                    seq_len,
+                    &decode_context,
+                    request_suppress_token_ids,
+                )
+            else
+                try decoder_gated_runtime.forwardGreedyToken(
+                    &self.cb,
+                    self.allocator,
+                    self.gpt_config,
+                    self.gpt_config.num_hidden_layers,
+                    token_ids[seq_len - 1],
+                    seq_len,
+                    &decode_context,
+                );
+            if (prepared_token) |token_id| {
                 if (token_id < 0) return error.InvalidModelOutput;
                 if (attention_match_frame) |*owned| try owned.finish();
+                decoder_runtime_debug_stats.prepared_token_successes +|= 1;
                 return .{ .token = @intCast(token_id) };
             }
+            // Every secondary device-greedy path below only sees model-global
+            // suppression. Fixed-length requests must return to canonical
+            // last-logits sampling if the prepared list-aware path declines.
+            if (!preparedGreedyDeclineAllowsUnsuppressedFallback(config.fixed_length_mask_eos)) return null;
         }
         if (input_token_tensor) |token_tensor| {
             if (enableCudaGreedyDeviceTokenHandoff()) {
@@ -13068,7 +22009,11 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) ![]f32 {
-        var frame = try AttentionMatchForwardFrame.begin(self, batch, decode_context);
+        decoder_runtime_debug_stats.canonical_last_logits_calls +|= 1;
+        var frame = if (self.gptOwnsCoalescedAttentionMatchFrame(batch, decode_context))
+            null
+        else
+            try AttentionMatchForwardFrame.begin(self, batch, decode_context);
         defer if (frame) |*owned| owned.deinit();
         const result = try self.forwardLastLogitsImpl(input_ids, batch, seq_len, decode_context);
         errdefer self.allocator.free(result);
@@ -13123,6 +22068,10 @@ pub const NativeGenerationPipeline = struct {
         return try self.allocator.dupe(f32, logits[last_pos_offset..][0..@intCast(self.gpt_config.vocab_size)]);
     }
 
+    fn decodeBudgetAllowsPipelineRearm(generated: usize, max_tokens: usize) bool {
+        return generated < max_tokens and max_tokens - generated > 1;
+    }
+
     fn forwardGreedyCompiledModelToken(
         self: *NativeGenerationPipeline,
         input_ids: []const i64,
@@ -13131,15 +22080,25 @@ pub const NativeGenerationPipeline = struct {
         decode_context: *const gpt_arch.DecodeContext,
         config: GenerationConfig,
         has_grammar: bool,
+        allow_pipeline_rearm: bool,
     ) !?usize {
         if (config.kv_cache_mode == .select_v1) return null;
+        const effective_suppress_token_ids = config.effectiveSuppressTokenIds(&self.gpt_config);
+        const request_suppress_token_ids = if (config.fixed_length_mask_eos) blk: {
+            if (self.cb.kind() != .metal or self.compiled_partition_backend != .metal) return null;
+            if (effective_suppress_token_ids.len == 0) return null;
+            break :blk effective_suppress_token_ids;
+        } else blk: {
+            if (!requestSuppressionsAllowResidentGreedy(effective_suppress_token_ids)) return null;
+            break :blk &.{};
+        };
         if (!isPureGreedyConfig(config)) return null;
         if (has_grammar or config.grammar != null) return null;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         const cache = self.graph_cache orelse return null;
         if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return null;
 
-        const token_id = (try graph_mod.execution.graphForwardCompiledModelGreedyToken(
+        const token_id = (try graph_mod.execution.graphForwardCompiledModelGreedyTokenSuppress(
             self,
             cache,
             input_ids,
@@ -13147,6 +22106,8 @@ pub const NativeGenerationPipeline = struct {
             seq_len,
             decode_context,
             self.gpt_config.vocab_size,
+            request_suppress_token_ids,
+            allow_pipeline_rearm,
         )) orelse return null;
         if (token_id < 0) return error.InvalidModelOutput;
         return @intCast(token_id);
@@ -13172,7 +22133,7 @@ pub const NativeGenerationPipeline = struct {
         if (!compiledSampleRequestEligible(
             config,
             has_grammar,
-            self.gpt_config.suppressTokenIds().len != 0,
+            config.effectiveSuppressTokenIds(&self.gpt_config).len != 0,
         )) return null;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         const cache = self.graph_cache orelse return null;
@@ -13209,12 +22170,49 @@ pub const NativeGenerationPipeline = struct {
         self: *NativeGenerationPipeline,
         kv_tokens_hint: usize,
     ) !bool {
+        self.compiled_runtime_prepare_after_reset = false;
+        self.compiled_runtime_prepare_token_hint = 0;
+        self.bounded_ple_prefill_decode_handoff_required = false;
         const cache = self.graph_cache orelse return false;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return false;
-        // ponytail: Metal prefill prepares lazily; eager prepare is only a warmup and can be skipped.
-        if (self.compiled_partition_backend == .metal) return false;
+        // Ordinary Metal graph execution prepares lazily. Request-scoped
+        // bounded PLE and mirror admission are different: prepare() owns their
+        // typed policy handoff and must run before the first prefill chunk.
+        if (self.compiled_partition_backend == .metal) {
+            const bounded_ple_required = (try boundedPleQ6RequestScratchBytes(
+                .metal,
+                self.gpt_config,
+                platform.env.getenvBool("TERMITE_METAL_ENABLE_BOUNDED_PLE_Q6_ROWS"),
+                platform.env.getenvBool("TERMITE_METAL_DISABLE_BOUNDED_PLE_Q6_ROWS"),
+            )) != 0;
+            const required = compiledMetalRuntimePrepareRequired(
+                bounded_ple_required,
+                false,
+                self.e2b_f16_mirror_admission != null,
+                gemmaF16MirrorPrepareRequested(self.gpt_config, self.e2b_f16_mirror_admission != null),
+            );
+            self.compiled_runtime_prepare_after_reset = required;
+            self.compiled_runtime_prepare_token_hint = kv_tokens_hint;
+            self.bounded_ple_prefill_decode_handoff_required = required and
+                self.e2b_f16_mirror_admission != null and
+                try boundedPleF16MirrorPhaseRequested(.metal, self.gpt_config);
+            if (!required) return false;
+            if (!try graph_mod.execution.prepareCompiledModelRuntime(self, cache, kv_tokens_hint))
+                return error.RequiredCompiledRuntimePrepareDeclined;
+            return true;
+        }
         return graph_mod.execution.prepareCompiledModelRuntime(self, cache, kv_tokens_hint);
+    }
+
+    fn compiledMetalRuntimePrepareRequired(
+        bounded_ple_enabled: bool,
+        bounded_ple_disabled: bool,
+        has_e2b_mirror_admission: bool,
+        matching_mirror_requested: bool,
+    ) bool {
+        return (bounded_ple_enabled and !bounded_ple_disabled) or
+            (has_e2b_mirror_admission and matching_mirror_requested);
     }
 
     fn forwardAllLogits(
@@ -13224,7 +22222,10 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) ![]f32 {
-        var frame = try AttentionMatchForwardFrame.begin(self, batch, decode_context);
+        var frame = if (self.gptOwnsCoalescedAttentionMatchFrame(batch, decode_context))
+            null
+        else
+            try AttentionMatchForwardFrame.begin(self, batch, decode_context);
         defer if (frame) |*owned| owned.deinit();
         const result = try self.forwardAllLogitsImpl(input_ids, batch, seq_len, decode_context);
         errdefer self.allocator.free(result);
@@ -13689,7 +22690,11 @@ pub const NativeGenerationPipeline = struct {
                     attempt.decode_context.kv_sequence_len,
                     pipeline.gpt_config.num_hidden_layers,
                 );
-                if (!prepared.prepared) return false;
+                if (!prepared.prepared) {
+                    _ = try pipeline.cb.decoderRuntimeFinalizeE2bF16Mirrors(null);
+                    return false;
+                }
+                try pipeline.finalizeE2bF16Mirrors();
 
                 const direct = (try decoder_gated_runtime.forwardFinalHiddenRows(
                     &pipeline.cb,
@@ -14289,6 +23294,77 @@ pub const NativeGenerationPipeline = struct {
         return std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer}) catch null;
     }
 
+    fn verifyPromptLookupProposal(
+        self: *NativeGenerationPipeline,
+        token_ids: []i64,
+        seq_len: *usize,
+        decode_state: *NativeDecodeState,
+        config: GenerationConfig,
+        proposal: []const i64,
+        remaining_generation_tokens: usize,
+        penalty_state: *SamplingPenaltyState,
+    ) !SpeculativeRoundResult {
+        if (proposal.len == 0 or proposal.len > 16) return error.InvalidSpeculativeK;
+        const allocator = self.allocator;
+        const round_start = seq_len.*;
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        var round_penalties = try penalty_state.clone(allocator);
+        defer round_penalties.deinit(allocator);
+        @memcpy(token_ids[seq_len.*..][0..proposal.len], proposal);
+
+        try setWorkloadProfileRegime(&self.cb, .speculative_verify);
+        defer setWorkloadProfileRegime(&self.cb, .decode) catch {};
+        const verify_len = proposal.len + 1;
+        const verify_seq = seq_len.* + proposal.len;
+        const target_query_len: usize = if (decode_runtime.kvView() != null) verify_len else verify_seq;
+        try reserveSpeculativeTargetVerification(&decode_runtime, self.cb.kind(), self.gpt_config, target_query_len, proposal.len);
+        const target_ctx = decode_runtime.makeDecodeContext(verify_seq, target_query_len);
+        const verify_start = if (target_query_len == verify_seq) 0 else verify_seq - target_query_len;
+        const target_logits = self.forwardAllLogits(token_ids[verify_start..verify_seq], 1, verify_seq, &target_ctx) catch |err| {
+            decode_runtime.truncateGeneratedTokens(proposal.len) catch {};
+            return err;
+        };
+        defer allocator.free(target_logits);
+        var no_json_grammar: ?grammar_mod.JsonGrammar = null;
+        const verified = self.acceptVerifiedDraftTokens(
+            token_ids,
+            seq_len.*,
+            proposal,
+            target_logits,
+            target_query_len,
+            config,
+            &round_penalties,
+            null,
+            &no_json_grammar,
+            null,
+            shouldAcceptSpeculativeBonus(true, proposal.len, remaining_generation_tokens),
+            null,
+        ) catch |err| {
+            decode_runtime.truncateGeneratedTokens(proposal.len) catch {};
+            return err;
+        };
+        const rollback = proposal.len - verified.matched_drafts;
+        if (rollback > 0) try decode_runtime.truncateGeneratedTokens(rollback);
+        // The q_len=2 verify materialized every matched proposal. A correction
+        // or bonus is accepted from logits but was not an input row, so append
+        // its logical KV slot and let the ordinary next decode consume it.
+        // This avoids an extra q_len=1 forward on every successful lookup.
+        const pending_unmaterialized_tokens = promptLookupPendingAfterVerification(verified);
+        if (pending_unmaterialized_tokens != 0) _ = try decode_runtime.appendGeneratedToken();
+        seq_len.* += verified.accepted;
+        try penalty_state.noteTokens(allocator, token_ids[round_start..seq_len.*]);
+        return .{
+            .drafted = proposal.len,
+            .matched_drafts = verified.matched_drafts,
+            .accepted = verified.accepted,
+            .correction_added = verified.correction_added,
+            .had_bonus = verified.had_bonus,
+            .hit_eos = verified.hit_eos,
+            .hit_grammar_stop = verified.hit_grammar_stop,
+            .pending_unmaterialized_tokens = pending_unmaterialized_tokens,
+        };
+    }
+
     /// Speculative decoding: use `draft_pipeline` to propose `k` candidate
     /// tokens, then verify them against the target model in one forward pass.
     ///
@@ -14803,7 +23879,7 @@ pub const NativeGenerationPipeline = struct {
                 const verify_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
                 const target_lm_rows = if (cached_first_target_choice != null) draft_count else verify_len;
                 const logit_base_row = target_query_len - target_lm_rows;
-                const suppress_token_ids = self.gpt_config.suppressTokenIds();
+                const suppress_token_ids = config.effectiveSuppressTokenIds(&self.gpt_config);
                 const target_hidden_result = if (logit_base_row == 0)
                     self.forwardMtpTargetHiddenDevicePreparedArgmax(
                         token_ids[verify_start..verify_seq],
@@ -15398,6 +24474,7 @@ pub const NativeGenerationPipeline = struct {
         had_bonus: bool,
         hit_eos: bool,
         hit_grammar_stop: bool,
+        pending_unmaterialized_tokens: u8 = 0,
         mtp_quality: MtpQualityStats = .{},
     };
 
@@ -15411,6 +24488,10 @@ pub const NativeGenerationPipeline = struct {
         bonus_skipped: bool = false,
         mtp_quality: MtpQualityStats = .{},
     };
+
+    fn promptLookupPendingAfterVerification(verified: SpeculativeVerificationResult) u8 {
+        return @intFromBool(verified.correction_added or verified.had_bonus);
+    }
 
     fn shouldUseGemma4MtpGreedyDeviceVerifier(
         self: *const NativeGenerationPipeline,
@@ -15498,7 +24579,7 @@ pub const NativeGenerationPipeline = struct {
         if (target_query_len < verify_len or target_result.rows < target_query_len) return error.InvalidTensorShape;
         const logit_base_row = target_query_len - verify_len;
         const vocab_size: usize = @intCast(self.gpt_config.vocab_size);
-        const suppress_token_ids = self.gpt_config.suppressTokenIds();
+        const suppress_token_ids = config.effectiveSuppressTokenIds(&self.gpt_config);
         const batched_choices: ?[]u32 = if (suppress_token_ids.len == 0)
             try self.cb.argmaxRows(target_result.logits, logit_base_row, verify_len, vocab_size, self.allocator)
         else
@@ -15728,7 +24809,7 @@ pub const NativeGenerationPipeline = struct {
     ) !SampleOutcome {
         const has_grammar = json_grammar.* != null or gbnf_grammar != null;
         if (config.token_observer != null and !has_grammar) return error.TokenEvidenceRequiresGrammar;
-        const suppress_token_ids = self.gpt_config.suppressTokenIds();
+        const suppress_token_ids = config.effectiveSuppressTokenIds(&self.gpt_config);
         const needs_mutable_logits = has_grammar or suppress_token_ids.len > 0;
         const working_logits = if (needs_mutable_logits)
             try self.allocator.dupe(f32, logits)
@@ -16457,6 +25538,7 @@ pub const NativeGenerationPipeline = struct {
         token_id: i64,
         seq_len: usize,
         wants_greedy: bool,
+        suppress_token_ids: []const i32,
     ) !ScheduledDecodeResult {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         const decode_ctx = decode_runtime.makeDecodeContext(seq_len, 1);
@@ -16496,7 +25578,7 @@ pub const NativeGenerationPipeline = struct {
         if (work.greedy_token) |token| return .{ .token = token };
         const logits = work.logits orelse return error.InvalidBatchDecodeState;
         if (wants_greedy) {
-            applySuppressTokenMask(logits, self.gpt_config.suppressTokenIds());
+            applySuppressTokenMask(logits, suppress_token_ids);
             return .{ .token = @intCast(activations.argmax(logits)) };
         }
         work.logits = null;
@@ -16660,7 +25742,11 @@ pub const NativeGenerationPipeline = struct {
                     attempt.decode_context.kv_sequence_len,
                     pipeline.gpt_config.num_hidden_layers,
                 );
-                if (!prepared.prepared) return false;
+                if (!prepared.prepared) {
+                    _ = try pipeline.cb.decoderRuntimeFinalizeE2bF16Mirrors(null);
+                    return false;
+                }
+                try pipeline.finalizeE2bF16Mirrors();
 
                 const tail = (try decoder_gated_runtime.forwardPrefillLastPreparedTail(
                     &pipeline.cb,
@@ -18222,6 +27308,30 @@ pub const NativeGenerationPipeline = struct {
     }
 };
 
+test "compiled Metal request prepare handoff honors bounded PLE and mirror admission" {
+    const required = NativeGenerationPipeline.compiledMetalRuntimePrepareRequired;
+    try std.testing.expect(!required(false, false, false, false));
+    try std.testing.expect(!required(false, false, true, false));
+    try std.testing.expect(required(true, false, false, false));
+    try std.testing.expect(!required(true, true, true, false));
+    try std.testing.expect(required(false, false, true, true));
+}
+
+test "resident wide cache authority forwards exact bounded owner before bridge" {
+    var tracker = runtime.kv.host_allocation_tracker.HostAllocationTracker.initSwitchablePrepare(0);
+    const identity = try tracker.activateBoundedPrepare(runtime.kv.host_allocation_tracker.bounded_prepare_e4_physical_bytes);
+    const authority = (try residentWideCacheAuthority(.bounded_page_e4_resident_1152m_v1, &tracker, identity)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(identity, authority.owner_identity);
+    const admitted = try authority.flatAdmission(4096, 8192, .{});
+    try std.testing.expectEqual(identity, admitted.owner_identity);
+    try std.testing.expect(admitted.fits);
+    try std.testing.expect(admitted.required_physical_bytes >= admitted.probability_logical_bytes + admitted.output_logical_bytes);
+    try std.testing.expectError(error.InvalidBoundedPrepareOwner, residentWideCacheAuthority(.bounded_page_e4_resident_1152m_v1, null, identity));
+    try std.testing.expectError(error.InvalidBoundedPrepareOwner, residentWideCacheAuthority(.bounded_page_e4_resident_1152m_v1, &tracker, identity + 1));
+    try std.testing.expect((try residentWideCacheAuthority(.none, &tracker, 0)) == null);
+    try std.testing.expectError(error.InvalidBoundedPrepareOwner, residentWideCacheAuthority(.none, &tracker, identity));
+}
+
 /// Drive a request's step loop to completion. Each iteration consults the
 /// driver for a per-step KV-aware budget, asks the scheduler to claim a step,
 /// dispatches the claim through the driver's executor, and yields when no
@@ -18699,6 +27809,19 @@ test "first token callback cancellation prevents speculative entry" {
     try std.testing.expect(!shouldEnterSpeculativeDecodeLoop(true, false, true));
 }
 
+test "prompt lookup admission is explicit and fails closed for unsupported requests" {
+    try std.testing.expect(!promptLookupRequestEligible(false, false, false, false, true, true, true, true, true));
+    try std.testing.expect(promptLookupRequestEligible(true, false, false, false, true, true, true, true, true));
+    try std.testing.expect(!promptLookupRequestEligible(true, true, false, false, true, true, true, true, true));
+    try std.testing.expect(!promptLookupRequestEligible(true, false, true, false, true, true, true, true, true));
+    try std.testing.expect(!promptLookupRequestEligible(true, false, false, true, true, true, true, true, true));
+    try std.testing.expect(!promptLookupRequestEligible(true, false, false, false, false, true, true, true, true));
+    try std.testing.expect(!promptLookupRequestEligible(true, false, false, false, true, false, true, true, true));
+    try std.testing.expect(!promptLookupRequestEligible(true, false, false, false, true, true, false, true, true));
+    try std.testing.expect(!promptLookupRequestEligible(true, false, false, false, true, true, true, false, true));
+    try std.testing.expect(!promptLookupRequestEligible(true, false, false, false, true, true, true, true, false));
+}
+
 test "shouldAddBosToken skips duplicate literal bos prefix" {
     try std.testing.expect(!shouldAddBosToken("<bos><start_of_turn>user\nHello", true, "<bos>"));
 }
@@ -18862,6 +27985,30 @@ test "native generation prefill ceiling only specializes Gemma4 Metal target" {
         @as(usize, 2048),
         nativeGenerationPrefillChunkCeiling(.metal, assistant, 2048),
     );
+}
+
+test "E4 Metal prefill 2048 diagnostic is exact default off and disable wins" {
+    const e4 = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .intermediate_size = 10240,
+        .num_kv_shared_layers = 18,
+        .sliding_window = 512,
+        .ple_hidden_size = 2560,
+    };
+    try std.testing.expectEqual(@as(usize, 512), nativeGenerationPrefillChunkCeilingPolicy(.metal, e4, 2048, false, false));
+    try std.testing.expectEqual(@as(usize, 2048), nativeGenerationPrefillChunkCeilingPolicy(.metal, e4, 2048, true, false));
+    try std.testing.expectEqual(@as(usize, 1024), nativeGenerationPrefillChunkCeilingPolicy(.metal, e4, 1024, true, false));
+    try std.testing.expectEqual(@as(usize, 512), nativeGenerationPrefillChunkCeilingPolicy(.metal, e4, 2048, true, true));
+    var wrong = e4;
+    wrong.num_hidden_layers -= 1;
+    try std.testing.expectEqual(@as(usize, 512), nativeGenerationPrefillChunkCeilingPolicy(.metal, wrong, 2048, true, false));
+    try std.testing.expectEqual(@as(usize, 2048), nativeGenerationPrefillChunkCeilingPolicy(.cuda, e4, 2048, true, false));
 }
 
 test "encodePromptForGeneration does not duplicate literal bos prefix" {
@@ -20800,6 +29947,50 @@ test "attention match request CUDA metadata pool preserves storage through appen
     }
 }
 
+test "Metal request manager is metadata only while paired storage preserves host fallback" {
+    const allocator = std.testing.allocator;
+    const numerical_config = runtime.kv.pool.KvPoolConfig{
+        .backend = .metal,
+        .dtype = .f16,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    };
+    const manager_config = requestKvManagerPoolConfig(numerical_config);
+    try std.testing.expect(!manager_config.store_cpu_bytes);
+    try std.testing.expect(numerical_config.store_cpu_bytes);
+
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(manager_config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, numerical_config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+
+    try state.notePrefill(4);
+    const sequence = state.sequence_id.?;
+    const keys = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const values = [_]f32{ 8, 7, 6, 5, 4, 3, 2, 1 };
+    try storage.writeFullLayerKv(sequence, 0, 4, &keys, &values);
+
+    const gathered = try storage.gatherLayerKv(allocator, sequence, 0, 4);
+    defer allocator.free(gathered.k);
+    defer allocator.free(gathered.v);
+    try std.testing.expectEqualSlices(f32, &keys, gathered.k);
+    try std.testing.expectEqualSlices(f32, &values, gathered.v);
+
+    const metadata = manager.getPoolMut(pool_id).?.hostPool().?;
+    try std.testing.expect(metadata.blocks.items.len != 0);
+    for (metadata.blocks.items) |block| {
+        try std.testing.expectEqual(@as(usize, 0), block.k_data.len);
+        try std.testing.expectEqual(@as(usize, 0), block.v_data.len);
+    }
+    try std.testing.expectError(error.KvBytesUnavailable, metadata.readToken(0, 0, 0));
+}
+
 test "native decode state rejects KV compaction when device storage is attached" {
     const allocator = std.testing.allocator;
     const pool_config = runtime.kv.pool.KvPoolConfig{
@@ -21132,7 +30323,7 @@ test "cuda prefill greedy token path is pure greedy only" {
     try std.testing.expect(shouldUseCudaPrefillGreedyToken(.cuda, greedy, true, false, true));
     try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.native, greedy, true, false, true));
     try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, greedy, false, false, true));
-    try std.testing.expect(shouldUseCudaPrefillGreedyToken(.cuda, greedy, true, true, true));
+    try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, greedy, true, true, true));
     try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, greedy, true, false, false));
 
     var sampled = greedy;
@@ -21146,6 +30337,14 @@ test "cuda prefill greedy token path is pure greedy only" {
     var grammar = greedy;
     grammar.grammar = "json";
     try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, grammar, true, false, true));
+}
+
+test "request suppressions decline resident prefill and compiled greedy" {
+    try std.testing.expect(requestSuppressionsAllowResidentGreedy(&.{}));
+    try std.testing.expect(!requestSuppressionsAllowResidentGreedy(&.{1}));
+    try std.testing.expect(!requestSuppressionsAllowResidentGreedy(&.{ 1, 50, 106 }));
+    try std.testing.expect(preparedGreedyDeclineAllowsUnsuppressedFallback(false));
+    try std.testing.expect(!preparedGreedyDeclineAllowsUnsuppressedFallback(true));
 }
 
 test "direct prepared prefill serializes multimodal CUDA and Metal execution" {
@@ -21390,6 +30589,16 @@ test "generation KV capacity policy is route and device-format aware" {
             .prompt_cache_enabled = true,
         }, .f16),
     );
+    try std.testing.expectEqual(
+        runtime.tier.memory.GenerationKvCapacityPolicy.full_history,
+        generationKvCapacityPolicyForRoute(.metal_whole_model, config, .{
+            .native_checkpoint_prepare_full_history = true,
+        }, .f16),
+    );
+    try std.testing.expectEqual(
+        runtime.tier.memory.GenerationKvCapacityPolicy.split_swa_ring,
+        generationKvCapacityPolicyForRoute(.metal_whole_model, config, .{}, .f16),
+    );
 }
 
 test "native generation suppress token mask removes configured logits" {
@@ -21401,6 +30610,93 @@ test "native generation suppress token mask removes configured logits" {
     try std.testing.expect(std.math.isInf(logits[3]) and logits[3] < 0);
     try std.testing.expect(NativeGenerationPipeline.isSuppressedToken(1, &.{ 1, 3, 99, -1 }));
     try std.testing.expect(!NativeGenerationPipeline.isSuppressedToken(2, &.{ 1, 3, 99, -1 }));
+}
+
+test "fixed length eos mask unions deduplicates and stays request local" {
+    var model = gpt_mod.Config{ .vocab_size = 32, .eos_token_id = 7, .extra_eos_token_ids_len = 2, .suppress_token_ids_len = 2 };
+    model.suppress_token_ids[0] = 3;
+    model.suppress_token_ids[1] = 7;
+    model.extra_eos_token_ids[0] = 9;
+    model.extra_eos_token_ids[1] = 7;
+    var masked_storage: [max_request_suppress_token_ids]i32 = undefined;
+    const masked = try buildRequestSuppressTokenIds(model, .{ .ignore_eos = true, .fixed_length_mask_eos = true }, &masked_storage);
+    try std.testing.expectEqualSlices(i32, &.{ 3, 7, 9 }, masked);
+
+    var ordinary_storage: [max_request_suppress_token_ids]i32 = undefined;
+    const ordinary = try buildRequestSuppressTokenIds(model, .{}, &ordinary_storage);
+    try std.testing.expectEqualSlices(i32, &.{ 3, 7 }, ordinary);
+    try std.testing.expectEqualSlices(i32, &.{ 3, 7 }, model.suppressTokenIds());
+
+    // Reusing the same stack address for a different request must rebuild the
+    // union rather than observing the preceding request's contents.
+    model.eos_token_id = 11;
+    model.extra_eos_token_ids_len = 1;
+    model.extra_eos_token_ids[0] = 13;
+    const second = try buildRequestSuppressTokenIds(model, .{ .ignore_eos = true, .fixed_length_mask_eos = true }, &masked_storage);
+    try std.testing.expectEqualSlices(i32, &.{ 3, 7, 11, 13 }, second);
+    model.eos_token_id = 12;
+    model.extra_eos_token_ids[0] = 14;
+    const same_address_and_len = try buildRequestSuppressTokenIds(model, .{ .ignore_eos = true, .fixed_length_mask_eos = true }, &masked_storage);
+    try std.testing.expectEqualSlices(i32, &.{ 3, 7, 12, 14 }, same_address_and_len);
+    const after = try buildRequestSuppressTokenIds(model, .{}, &masked_storage);
+    try std.testing.expectEqualSlices(i32, &.{ 3, 7 }, after);
+}
+
+const SuppressLifetimeProbe = struct {
+    noinline fn ordinary(model: gpt_mod.Config, out: *[max_request_suppress_token_ids]i32) ![]const i32 {
+        return buildRequestSuppressTokenIds(model, .{}, out);
+    }
+
+    noinline fn clobber(seed: u8) u64 {
+        var bytes: [4096]u8 = undefined;
+        for (&bytes, 0..) |*byte, index| byte.* = seed +% @as(u8, @truncate(index));
+        var sum: u64 = 0;
+        for (bytes) |byte| sum +%= byte;
+        return sum;
+    }
+};
+
+test "ordinary suppression copy survives callee stack reuse" {
+    var model = gpt_mod.Config{ .vocab_size = 32, .suppress_token_ids_len = 3 };
+    model.suppress_token_ids[0] = 9;
+    model.suppress_token_ids[1] = 2;
+    model.suppress_token_ids[2] = 9;
+    var storage: [max_request_suppress_token_ids]i32 = undefined;
+    const ordinary = try SuppressLifetimeProbe.ordinary(model, &storage);
+    try std.testing.expect(SuppressLifetimeProbe.clobber(17) != 0);
+    // Preserve ordinary ordering and duplicates exactly; no request policy is
+    // allowed to normalize model-global behavior when the flag is absent.
+    try std.testing.expectEqualSlices(i32, &.{ 9, 2, 9 }, ordinary);
+}
+
+test "fixed length eos mask rejects non greedy and invalid eos" {
+    var model = gpt_mod.Config{ .vocab_size = 16, .eos_token_id = 4 };
+    var storage: [max_request_suppress_token_ids]i32 = undefined;
+    try std.testing.expectError(error.UnsupportedFixedLengthEosMask, buildRequestSuppressTokenIds(model, .{ .fixed_length_mask_eos = true }, &storage));
+    try std.testing.expectError(error.UnsupportedFixedLengthEosMask, buildRequestSuppressTokenIds(model, .{ .ignore_eos = true, .fixed_length_mask_eos = true, .temperature = 0.5 }, &storage));
+    model.eos_token_id = 16;
+    try std.testing.expectError(error.InvalidFixedLengthEosToken, buildRequestSuppressTokenIds(model, .{ .ignore_eos = true, .fixed_length_mask_eos = true }, &storage));
+
+    var all = gpt_mod.Config{ .vocab_size = 3, .eos_token_id = 2, .suppress_token_ids_len = 2 };
+    all.suppress_token_ids[0] = 0;
+    all.suppress_token_ids[1] = 1;
+    try std.testing.expectError(error.AllTokensSuppressed, buildRequestSuppressTokenIds(all, .{ .ignore_eos = true, .fixed_length_mask_eos = true }, &storage));
+}
+
+test "request suppression policy owns a stable sorted union" {
+    var model = gpt_mod.Config{ .vocab_size = 128, .eos_token_id = 50, .extra_eos_token_ids_len = 2, .suppress_token_ids_len = 2 };
+    model.suppress_token_ids[0] = 11;
+    model.suppress_token_ids[1] = 7;
+    model.extra_eos_token_ids[0] = 106;
+    model.extra_eos_token_ids[1] = 1;
+    var policy = try RequestSuppressPolicy.init(model, .{
+        .fixed_length_mask_eos = true,
+        .ignore_eos = true,
+        .max_tokens = 300,
+    });
+    try std.testing.expectEqualSlices(i32, &.{ 1, 7, 11, 50, 106 }, policy.ids());
+    model.suppress_token_ids[0] = 99;
+    try std.testing.expectEqualSlices(i32, &.{ 1, 7, 11, 50, 106 }, policy.ids());
 }
 
 test "native decode state deinit releases paged sequence" {
@@ -22318,6 +31614,139 @@ test "speculative verification can skip target bonus token" {
     try std.testing.expectEqual(false, result.had_bonus);
     try std.testing.expectEqual(true, result.bonus_skipped);
     try std.testing.expectEqual(@as(i64, 0), token_ids[2]);
+}
+
+test "prompt lookup target authority handles full partial and zero matches" {
+    const allocator = std.testing.allocator;
+    var pipeline = NativeGenerationPipeline{
+        .allocator = allocator,
+        .cb = undefined,
+        .gpt_config = .{ .vocab_size = 16 },
+        .tokenizer = undefined,
+    };
+
+    var full_tokens = [_]i64{ 2, 0, 0, 0 };
+    var full_penalties = SamplingPenaltyState{};
+    defer full_penalties.deinit(allocator);
+    const full = try pipeline.acceptVerifiedDraftTokenChoicesGreedy(
+        full_tokens[0..],
+        1,
+        &.{ 4, 5 },
+        &.{ 4, 5, 6 },
+        &full_penalties,
+        true,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 2), full.matched_drafts);
+    try std.testing.expectEqual(@as(usize, 3), full.accepted);
+    try std.testing.expect(full.had_bonus);
+    try std.testing.expectEqual(@as(u8, 1), NativeGenerationPipeline.promptLookupPendingAfterVerification(full));
+
+    var partial_tokens = [_]i64{ 2, 0, 0, 0 };
+    var partial_penalties = SamplingPenaltyState{};
+    defer partial_penalties.deinit(allocator);
+    const partial = try pipeline.acceptVerifiedDraftTokenChoicesGreedy(
+        partial_tokens[0..],
+        1,
+        &.{ 4, 5 },
+        &.{ 4, 8, 6 },
+        &partial_penalties,
+        true,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), partial.matched_drafts);
+    try std.testing.expectEqual(@as(usize, 2), partial.accepted);
+    try std.testing.expect(partial.correction_added);
+    try std.testing.expectEqual(@as(i64, 8), partial_tokens[2]);
+    try std.testing.expectEqual(@as(u8, 1), NativeGenerationPipeline.promptLookupPendingAfterVerification(partial));
+
+    var zero_tokens = [_]i64{ 2, 0, 0, 0 };
+    var zero_penalties = SamplingPenaltyState{};
+    defer zero_penalties.deinit(allocator);
+    const zero = try pipeline.acceptVerifiedDraftTokenChoicesGreedy(
+        zero_tokens[0..],
+        1,
+        &.{ 4, 5 },
+        &.{ 9, 8, 6 },
+        &zero_penalties,
+        true,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 0), zero.matched_drafts);
+    try std.testing.expectEqual(@as(usize, 1), zero.accepted);
+    try std.testing.expect(zero.correction_added);
+    try std.testing.expectEqual(@as(i64, 9), zero_tokens[1]);
+    try std.testing.expectEqual(@as(u8, 1), NativeGenerationPipeline.promptLookupPendingAfterVerification(zero));
+
+    var proposer = try prompt_lookup.Proposer.init(.{ .min_ngram = 2, .max_draft = 2 });
+    proposer.noteVerification(2, partial.matched_drafts, 3);
+    proposer.noteVerification(2, zero.matched_drafts, 3);
+    try std.testing.expectEqual(@as(u64, 1), proposer.counters.accepted_proposal_tokens);
+    try std.testing.expectEqual(@as(u64, 3), proposer.counters.rollback_tokens);
+    try std.testing.expectEqual(@as(u64, 2), proposer.counters.target_verify_passes);
+}
+
+test "prompt lookup budget EOS ignore and callback cancellation preserve target policy" {
+    const allocator = std.testing.allocator;
+    var pipeline = NativeGenerationPipeline{
+        .allocator = allocator,
+        .cb = undefined,
+        .gpt_config = .{ .vocab_size = 8, .eos_token_id = 7 },
+        .tokenizer = undefined,
+    };
+
+    try std.testing.expect(!shouldAcceptSpeculativeBonus(true, 1, 1));
+    var budget_tokens = [_]i64{ 2, 0, 0 };
+    var budget_penalties = SamplingPenaltyState{};
+    defer budget_penalties.deinit(allocator);
+    const budget = try pipeline.acceptVerifiedDraftTokenChoicesGreedy(
+        budget_tokens[0..],
+        1,
+        &.{4},
+        &.{ 4, 5 },
+        &budget_penalties,
+        false,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), budget.accepted);
+    try std.testing.expect(budget.bonus_skipped);
+    try std.testing.expectEqual(@as(u8, 0), NativeGenerationPipeline.promptLookupPendingAfterVerification(budget));
+
+    var eos_tokens = [_]i64{ 2, 0, 0 };
+    var eos_penalties = SamplingPenaltyState{};
+    defer eos_penalties.deinit(allocator);
+    const eos = try pipeline.acceptVerifiedDraftTokenChoicesGreedy(
+        eos_tokens[0..],
+        1,
+        &.{4},
+        &.{ 7, 5 },
+        &eos_penalties,
+        true,
+        .{},
+    );
+    try std.testing.expect(eos.hit_eos);
+    try std.testing.expectEqual(@as(usize, 0), eos.accepted);
+    try std.testing.expectEqual(@as(u8, 0), NativeGenerationPipeline.promptLookupPendingAfterVerification(eos));
+
+    var ignored_tokens = [_]i64{ 2, 0, 0 };
+    var ignored_penalties = SamplingPenaltyState{};
+    defer ignored_penalties.deinit(allocator);
+    const ignored = try pipeline.acceptVerifiedDraftTokenChoicesGreedy(
+        ignored_tokens[0..],
+        1,
+        &.{4},
+        &.{ 7, 5 },
+        &ignored_penalties,
+        true,
+        .{ .ignore_eos = true },
+    );
+    try std.testing.expect(!ignored.hit_eos);
+    try std.testing.expectEqual(@as(usize, 1), ignored.accepted);
+    try std.testing.expect(ignored.correction_added);
+    try std.testing.expectEqual(@as(i64, 7), ignored_tokens[1]);
+    try std.testing.expectEqual(@as(u8, 1), NativeGenerationPipeline.promptLookupPendingAfterVerification(ignored));
+
+    try std.testing.expect(!shouldEnterSpeculativeDecodeLoop(false, false, false));
 }
 
 test "speculative greedy verification excludes EOS from accepted tokens" {
@@ -23609,7 +33038,7 @@ test "context study preparation preserves loaded renderer and full token prefix"
     defer prepared.deinit();
     var question = try prepareCompactionQuestion(a, &template, tok.tokenizer(), &messages, .{}, policy, &prepared);
     defer question.deinit();
-    inline for (.{ studies.Kind.fit, studies.Kind.gate }) |kind| {
+    inline for (.{ studies.Kind.fit, studies.Kind.gate, studies.Kind.fit_training_v1 }) |kind| {
         var study = try prepareCompactionStudy(a, &template, tok.tokenizer(), &messages, .{}, &prepared, kind, studies.authority(kind), 4096, false);
         defer study.deinit();
         try std.testing.expectEqual(question.prompt_tokens, study.prompt_tokens);
@@ -23619,6 +33048,7 @@ test "context study preparation preserves loaded renderer and full token prefix"
         defer a.free(expected);
         try std.testing.expectEqual(expected.len, study.ids.len);
         for (study.ids, expected) |id, byte| try std.testing.expectEqual(@as(i64, byte), id);
+        if (kind == .fit_training_v1) try std.testing.expect(study.ids.len >= 64);
         try std.testing.expectError(error.ContextReplayBudgetExceeded, prepareCompactionStudy(a, &template, tok.tokenizer(), &messages, .{}, &prepared, kind, studies.authority(kind), question.prompt_tokens + 1, false));
     }
     var changed = studies.authority(.fit);
@@ -24615,6 +34045,37 @@ test "LightOnOCR3 CUDA prepared prefill greedy eligibility preserves sampled con
     try std.testing.expect(!shouldUsePreparedQwenPrefillGreedyToken(.cuda, softcap, .{}, true, false, true));
 }
 
+test "supplied checkpoint quality never enters the fit factory" {
+    const fit: NativeGenerationPipeline.MetalQualityCandidateSource = .{ .fit = null };
+    const supplied: NativeGenerationPipeline.MetalQualityCandidateSource = .{ .supplied = undefined };
+    var calls: usize = 0;
+    const Factory = struct {
+        fn call(counter: *usize) !NativeCheckpointPrepare.HostPlan {
+            counter.* += 1;
+            return .{ .fit_bytes = 1, .reservation_bytes = 2, .source_bytes = 3, .head_workspace_bytes = 4, .workers = 1 };
+        }
+    };
+    try std.testing.expect((try fit.runFitFactory(&calls, Factory.call)) != null);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expect((try supplied.runFitFactory(&calls, Factory.call)) == null);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "native quality retained snapshot wire is charged only when present" {
+    const plan: @import("../runtime/kv/metal_checkpoint_cycles.zig").PhasePlan = .{ .owners = 10, .host = 20, .wire = 3 };
+    try std.testing.expectEqual(@as(usize, 33), try NativeGenerationPipeline.admitNativeQualityPhase(plan, 0));
+    try std.testing.expectEqual(@as(usize, 40), try NativeGenerationPipeline.admitNativeQualityPhase(plan, 7));
+}
+
+test "context prepared quality retained input bytes close the aggregate cap" {
+    const cycles = @import("../runtime/kv/metal_checkpoint_cycles.zig");
+    const retained: usize = 4096;
+    const exact: cycles.PhasePlan = .{ .owners = 0, .host = cycles.max_aggregate_bytes - retained };
+    try std.testing.expectEqual(cycles.max_aggregate_bytes, try NativeGenerationPipeline.admitNativeQualityPhase(exact, retained));
+    const over: cycles.PhasePlan = .{ .owners = 0, .host = cycles.max_aggregate_bytes - retained + 1 };
+    try std.testing.expectError(error.CompactionWorkspaceLimit, NativeGenerationPipeline.admitNativeQualityPhase(over, retained));
+}
+
 test "LightOnOCR3 packed prefix publication separates device choices host logits and intermediate chunks" {
     const P = NativeGenerationPipeline;
     const a = std.testing.allocator;
@@ -24685,10 +34146,10 @@ test "LightOnOCR3 CUDA final prefix logits layout skips intermediate rows and pr
     try std.testing.expectEqual(@as(f32, 0.3), sampled.logits.?[0]);
 }
 
-test "LightOnOCR3 CUDA reader epoch logical pools retain positions across growth and reset without host mirrors" {
+test "LightOnOCR3 GPU reader epoch separates metadata manager from numerical storage policy" {
     const allocator = std.testing.allocator;
     for ([_]runtime.kv.pool.BackendKind{ .cuda, .metal }) |backend| {
-        const config = requestKvManagerPoolConfig(kvPoolConfig(backend, .f16, .{
+        const configs = requestKvPoolConfigs(kvPoolConfig(backend, .f16, .{
             .family = .gemma,
             .num_hidden_layers = 2,
             .num_attention_heads = 2,
@@ -24697,8 +34158,8 @@ test "LightOnOCR3 CUDA reader epoch logical pools retain positions across growth
         }, false));
         var manager = runtime.kv.manager.KvManager.init(allocator);
         defer manager.deinit();
-        const pool = try manager.addPool(config);
-        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, config);
+        const pool = try manager.addPool(configs.manager);
+        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, configs.storage);
         defer storage.deinit();
         for (0..2) |_| {
             var state = NativeDecodeState.initPaged(allocator, &manager, pool, null);
@@ -24710,19 +34171,95 @@ test "LightOnOCR3 CUDA reader epoch logical pools retain positions across growth
             try std.testing.expectEqual(@as(?usize, 57), manager.tokenCount(sequence));
             try std.testing.expectEqual(@as(?usize, 57), storage.tokenCount(sequence));
             try std.testing.expectEqual(@as(usize, 57), state.kvView().?.token_count);
-            for ([_]*runtime.kv.pool.KvPool{ manager.pools.items[pool].hostPool().?, storage.storage.hostPool().? }) |owner| {
-                try std.testing.expect(owner.blocks.items.len >= 4);
-                for (owner.blocks.items) |page| {
-                    if (backend == .cuda) {
-                        try std.testing.expectEqual(@as(usize, 0), page.k_data.len);
-                        try std.testing.expectEqual(@as(usize, 0), page.v_data.len);
-                    } else {
-                        try std.testing.expect(page.k_data.len > 0 and page.v_data.len > 0);
-                    }
+            const metadata = manager.pools.items[pool].hostPool().?;
+            const numerical = storage.storage.hostPool().?;
+            try std.testing.expect(metadata.blocks.items.len >= 4 and numerical.blocks.items.len >= 4);
+            for (metadata.blocks.items) |page| {
+                try std.testing.expectEqual(@as(usize, 0), page.k_data.len);
+                try std.testing.expectEqual(@as(usize, 0), page.v_data.len);
+            }
+            for (numerical.blocks.items) |page| {
+                if (backend == .cuda) {
+                    try std.testing.expectEqual(@as(usize, 0), page.k_data.len);
+                    try std.testing.expectEqual(@as(usize, 0), page.v_data.len);
+                } else {
+                    try std.testing.expect(page.k_data.len > 0 and page.v_data.len > 0);
                 }
+            }
+            if (backend == .metal) {
+                var keys: [16]f32 = undefined;
+                var values: [16]f32 = undefined;
+                for (&keys, &values, 0..) |*key, *value, i| {
+                    key.* = @floatFromInt(i + 1);
+                    value.* = @floatFromInt(keys.len - i);
+                }
+                try storage.writeFullLayerKv(sequence, 0, 2, &keys, &values);
+                const gathered = try storage.gatherLayerKv(allocator, sequence, 0, 2);
+                defer allocator.free(gathered.k);
+                defer allocator.free(gathered.v);
+                try std.testing.expectEqualSlices(f32, &keys, gathered.k);
+                try std.testing.expectEqualSlices(f32, &values, gathered.v);
             }
         }
     }
+}
+
+test "compiled whole-model outer KV keeps bookkeeping without host payload and ordinary fallback remains numerical" {
+    const allocator = std.testing.allocator;
+    const base = kvPoolConfig(.metal, .f16, .{
+        .family = .gemma,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 2,
+    }, false);
+    const compiled = try requestKvPoolConfigsForAuthority(base, .compiled_whole_model);
+    try std.testing.expect(!compiled.manager.store_cpu_bytes);
+    try std.testing.expect(!compiled.storage.store_cpu_bytes);
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool = try manager.addPool(compiled.manager);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, compiled.storage);
+    defer storage.deinit();
+    try storage.setNumericalAuthorityBeforeUse(.compiled_whole_model);
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool, null);
+    defer state.deinit();
+    state.kv_storage = &storage;
+    state.kv_numerical_authority = .compiled_whole_model;
+    try state.notePrefill(2);
+    try std.testing.expectEqual(@as(?usize, 2), manager.tokenCount(state.sequence_id.?));
+    try std.testing.expectEqual(@as(?usize, 2), storage.tokenCount(state.sequence_id.?));
+    try std.testing.expectError(error.CompiledWholeModelKvFallbackForbidden, storage.writeLayerKvSuffix(state.sequence_id.?, 0, 2, 2, &.{ 1, 2, 3, 4 }, &.{ 5, 6, 7, 8 }));
+
+    const ordinary = try requestKvPoolConfigsForAuthority(base, .outer_storage);
+    try std.testing.expect(ordinary.storage.store_cpu_bytes);
+    var ordinary_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, ordinary.storage);
+    defer ordinary_storage.deinit();
+    const ordinary_sequence = try ordinary_storage.attachSequence(ordinary_storage.poolId());
+    try ordinary_storage.appendTokens(ordinary_sequence, 1);
+    try ordinary_storage.writeLayerKvSuffix(ordinary_sequence, 0, 1, 1, &.{ 9, 10 }, &.{ 11, 12 });
+    const gathered = try ordinary_storage.gatherLayerKv(allocator, ordinary_sequence, 0, 1);
+    defer allocator.free(gathered.k);
+    defer allocator.free(gathered.v);
+    try std.testing.expectEqualSlices(f32, &.{ 9, 10 }, gathered.k);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 12 }, gathered.v);
+
+    var cuda = base;
+    cuda.backend = .cuda;
+    try std.testing.expectError(error.InvalidKvNumericalAuthority, requestKvPoolConfigsForAuthority(cuda, .compiled_whole_model));
+    var fp8 = base;
+    fp8.dtype = .fp8;
+    try std.testing.expectError(error.InvalidKvNumericalAuthority, requestKvPoolConfigsForAuthority(fp8, .compiled_whole_model));
+
+    var cuda_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, requestKvManagerPoolConfig(cuda));
+    defer cuda_storage.deinit();
+    try std.testing.expectError(error.InvalidKvNumericalAuthority, cuda_storage.setNumericalAuthorityBeforeUse(.compiled_whole_model));
+    var native = base;
+    native.backend = .native;
+    native.store_cpu_bytes = false;
+    var native_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, native);
+    defer native_storage.deinit();
+    try std.testing.expectError(error.InvalidKvNumericalAuthority, native_storage.setNumericalAuthorityBeforeUse(.compiled_whole_model));
 }
 
 test "LightOnOCR3 CUDA burst readback releases the execution lane and reacquires for cancelled cleanup" {
@@ -24967,4 +34504,333 @@ test "image decode admission planning credit follows the fallback image executor
     for ([_]gpt_mod.ModelFamily{ .gemma, .qwen3_vl }) |family| {
         try std.testing.expectEqual(@as(usize, 0), fallbackImagePreparationBytes(.{ .family = family }, null, media));
     }
+}
+
+test "context attention_match Dense512 query options use one authenticated explicit repeat authority" {
+    var repeat = [_]i64{ 11, 12, 13, 14 };
+    var offsets = [_]u32{ 0, 2 };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(&repeat), &digest, .{});
+    var stats: NativeGenerationPipeline.AttentionMatchQueryStats = .{};
+    const options = NativeGenerationPipeline.dense512QueryOptions(&repeat, digest, &offsets, &stats);
+
+    try NativeGenerationPipeline.validateAttentionMatchRepeatAuthority(options);
+    try std.testing.expect(!options.representative_repeat);
+    try std.testing.expect(options.explicit_repeat_tokens != null);
+    try std.testing.expect(options.explicit_sample_offsets != null);
+    try std.testing.expectEqualSlices(i64, &repeat, options.explicit_repeat_tokens.?);
+    try std.testing.expectEqualSlices(u32, &offsets, options.explicit_sample_offsets.?);
+    try std.testing.expectEqualSlices(u8, &digest, &options.explicit_repeat_sha256.?);
+
+    var mixed = options;
+    mixed.representative_repeat = true;
+    try std.testing.expectError(
+        error.UnsupportedCompactionQueryRoute,
+        NativeGenerationPipeline.validateAttentionMatchRepeatAuthority(mixed),
+    );
+    var missing_repeat = options;
+    missing_repeat.explicit_repeat_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedCompactionQueryRoute,
+        NativeGenerationPipeline.validateAttentionMatchRepeatAuthority(missing_repeat),
+    );
+}
+
+test "compiled owner fresh snapshot boundary rejects every post-KV evidence field" {
+    var state: NativeDecodeState = undefined;
+    state.total_tokens = 0;
+    state.context_session = null;
+    state.last_context_owner_committed = null;
+    state.last_context_session_released = false;
+    state.last_context_session_allocation_start = .{};
+    state.last_context_session_allocation_end = .{};
+    try std.testing.expect(NativeGenerationPipeline.isFreshCompiledOwnerSnapshotBoundary(&state, "prefill_started"));
+    try std.testing.expect(!NativeGenerationPipeline.isFreshCompiledOwnerSnapshotBoundary(&state, "checkpoint_source"));
+    state.total_tokens = 1;
+    try std.testing.expect(!NativeGenerationPipeline.isFreshCompiledOwnerSnapshotBoundary(&state, "prefill_started"));
+    state.total_tokens = 0;
+    state.last_context_session_released = true;
+    try std.testing.expect(!NativeGenerationPipeline.isFreshCompiledOwnerSnapshotBoundary(&state, "prefill_started"));
+    state.last_context_session_released = false;
+    state.last_context_session_allocation_start.available = true;
+    try std.testing.expect(!NativeGenerationPipeline.isFreshCompiledOwnerSnapshotBoundary(&state, "prefill_started"));
+}
+
+const CompiledOwnerSnapshotProbe = struct {
+    allocator: std.mem.Allocator,
+    allocation: []u8,
+    binding_state: graph_mod.model_runtime.ModelRuntime.ContextOwnerBindingState,
+    deinit_count: *usize,
+    state_queries: *usize,
+    drain_count: ?*usize = null,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        binding_state: graph_mod.model_runtime.ModelRuntime.ContextOwnerBindingState,
+        deinit_count: *usize,
+        state_queries: *usize,
+    ) !CompiledOwnerSnapshotProbe {
+        return .{
+            .allocator = allocator,
+            .allocation = try allocator.alloc(u8, 257),
+            .binding_state = binding_state,
+            .deinit_count = deinit_count,
+            .state_queries = state_queries,
+        };
+    }
+
+    fn prefill(_: *anyopaque, _: std.mem.Allocator, _: graph_mod.model_runtime.PrefillRequest) !graph_mod.model_runtime.ModelOutput {
+        return error.TestUnexpectedPrefill;
+    }
+
+    fn deinit(raw: *anyopaque) void {
+        const self: *CompiledOwnerSnapshotProbe = @ptrCast(@alignCast(raw));
+        self.allocator.free(self.allocation);
+        self.deinit_count.* += 1;
+    }
+
+    fn bindingState(raw: *anyopaque, _: graph_mod.model_runtime.ContextOwnerBinding) graph_mod.model_runtime.ModelRuntime.ContextOwnerBindingState {
+        const self: *CompiledOwnerSnapshotProbe = @ptrCast(@alignCast(raw));
+        self.state_queries.* += 1;
+        return self.binding_state;
+    }
+
+    fn drain(raw: *anyopaque, _: graph_mod.model_runtime.ContextOwnerBinding) !void {
+        const self: *CompiledOwnerSnapshotProbe = @ptrCast(@alignCast(raw));
+        const count = self.drain_count orelse return error.TestUnexpectedDrain;
+        count.* += 1;
+    }
+
+    const vtable = graph_mod.model_runtime.ModelRuntime.VTable{
+        .prefill = prefill,
+        .deinit = deinit,
+        .drain_context_owner_snapshot = drain,
+        .context_owner_binding_state = bindingState,
+    };
+
+    fn runtime(self: *CompiledOwnerSnapshotProbe) graph_mod.model_runtime.ModelRuntime {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+fn freshCompiledOwnerSnapshotState() NativeDecodeState {
+    var state: NativeDecodeState = undefined;
+    state.total_tokens = 0;
+    state.context_session = null;
+    state.last_context_owner_committed = null;
+    state.last_context_session_released = false;
+    state.last_context_session_allocation_start = .{};
+    state.last_context_session_allocation_end = .{};
+    return state;
+}
+
+test "compiled owner fresh switch cancellation preserves cached mutable runtime" {
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var owner = try runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null);
+    defer _ = owner.release();
+    const witness = try owner.beginContextScope(17);
+    try owner.requireCompiledStorage(witness);
+    const binding: graph_mod.model_runtime.ContextOwnerBinding = .{ .owner = &owner, .witness = witness };
+    var cache = graph_mod.cache.GraphCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var deinits: usize = 0;
+    var queries: usize = 0;
+    var probe = try CompiledOwnerSnapshotProbe.init(std.testing.allocator, .unbound, &deinits, &queries);
+    cache.putSessionCompiledModelRuntime(.metal, .whole_model, probe.runtime());
+    var state = freshCompiledOwnerSnapshotState();
+    const control = InferenceExecutionControl{ .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, NativeGenerationPipeline.prepareCompiledOwnerSnapshot(binding, &cache, control, &state, "prefill_started"));
+    try std.testing.expect(cache.getSessionCompiledModelRuntime(.metal, .whole_model) != null);
+    try std.testing.expectEqual(@as(usize, 0), deinits);
+    try std.testing.expectEqual(@as(usize, 0), queries);
+}
+
+test "compiled owner fresh switch retires mutable runtime and preserves immutable executor" {
+    var owner = try runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null);
+    defer _ = owner.release();
+    const witness = try owner.beginContextScope(23);
+    try owner.requireCompiledStorage(witness);
+    const binding: graph_mod.model_runtime.ContextOwnerBinding = .{ .owner = &owner, .witness = witness };
+    var cache = graph_mod.cache.GraphCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const key: graph_mod.cache.CacheKey = .{ .config_hash = 91, .batch = 1, .seq_len = 8, .attention_mode = .paged_prefill };
+    var graph = TestGraph.init(std.testing.allocator);
+    try cache.put(key, graph);
+    // Ownership transferred to the cache.
+    graph = undefined;
+    var executor_deinits: usize = 0;
+    const ExecutorProbe = struct {
+        fn deinit(raw: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(raw));
+            count.* += 1;
+        }
+    };
+    const entry = cache.getEntry(key).?;
+    entry.compiled_model_backend = .metal;
+    entry.compiled_model_attachment_target = .whole_model;
+    entry.compiled_model_status = .ready;
+    entry.compiled_model_executor = .{ .ptr = &executor_deinits, .deinit = ExecutorProbe.deinit };
+
+    var runtime_deinits: usize = 0;
+    var queries: usize = 0;
+    var probe = try CompiledOwnerSnapshotProbe.init(std.testing.allocator, .unbound, &runtime_deinits, &queries);
+    cache.putSessionCompiledModelRuntime(.metal, .whole_model, probe.runtime());
+    var state = freshCompiledOwnerSnapshotState();
+    try NativeGenerationPipeline.prepareCompiledOwnerSnapshot(binding, &cache, null, &state, "prefill_started");
+    try std.testing.expect(cache.getSessionCompiledModelRuntime(.metal, .whole_model) == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime_deinits);
+    try std.testing.expectEqual(@as(usize, 1), queries);
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+    try std.testing.expect(cache.getEntry(key).?.compiled_model_executor != null);
+    try std.testing.expectEqual(@as(usize, 0), executor_deinits);
+}
+
+test "compiled owner fresh switch rejects wrong stale and post-KV authority without mutation" {
+    var owner = try runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null);
+    defer _ = owner.release();
+    const witness = try owner.beginContextScope(31);
+    try owner.requireCompiledStorage(witness);
+    const binding: graph_mod.model_runtime.ContextOwnerBinding = .{ .owner = &owner, .witness = witness };
+    var cache = graph_mod.cache.GraphCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var deinits: usize = 0;
+    var queries: usize = 0;
+    var probe = try CompiledOwnerSnapshotProbe.init(std.testing.allocator, .other, &deinits, &queries);
+    cache.putSessionCompiledModelRuntime(.metal, .whole_model, probe.runtime());
+    var state = freshCompiledOwnerSnapshotState();
+    try std.testing.expectError(error.ContextFrameOwnershipMismatch, NativeGenerationPipeline.prepareCompiledOwnerSnapshot(binding, &cache, null, &state, "prefill_started"));
+    try std.testing.expect(cache.getSessionCompiledModelRuntime(.metal, .whole_model) != null);
+    try std.testing.expectEqual(@as(usize, 0), deinits);
+    try std.testing.expectEqual(@as(usize, 1), queries);
+
+    var stale = binding;
+    stale.witness.load_generation += 1;
+    try std.testing.expectError(error.StaleContextOwnerScope, NativeGenerationPipeline.prepareCompiledOwnerSnapshot(stale, &cache, null, &state, "prefill_started"));
+    try std.testing.expectEqual(@as(usize, 0), deinits);
+    try std.testing.expectEqual(@as(usize, 1), queries);
+
+    state.total_tokens = 1;
+    try std.testing.expectError(error.ContextPhysicalAccountingUnavailable, NativeGenerationPipeline.prepareCompiledOwnerSnapshot(binding, &cache, null, &state, "prefill_started"));
+    try std.testing.expectEqual(@as(usize, 0), deinits);
+    try std.testing.expectEqual(@as(usize, 1), queries);
+}
+
+test "compiled checkpoint source snapshot drains bound runtime before eager query suspension" {
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var owner = try runtime.kv.host_allocation_tracker.RequestAllocationOwner.init(null);
+    defer _ = owner.release();
+    const witness = try owner.beginContextScope(41);
+    try owner.requireCompiledStorage(witness);
+    try owner.bindCompiledStorage(witness, owner.tracker);
+    defer owner.detachCompiledStorage(witness, owner.tracker) catch unreachable;
+    const binding: graph_mod.model_runtime.ContextOwnerBinding = .{ .owner = &owner, .witness = witness };
+
+    var cache = graph_mod.cache.GraphCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var runtime_deinits: usize = 0;
+    var state_queries: usize = 0;
+    var drains: usize = 0;
+    var probe = try CompiledOwnerSnapshotProbe.init(std.testing.allocator, .exact, &runtime_deinits, &state_queries);
+    probe.drain_count = &drains;
+    cache.putSessionCompiledModelRuntime(.metal, .whole_model, probe.runtime());
+
+    var graph_cache: ?*graph_mod.cache.GraphCache = &cache;
+    var backend: ?ops.BackendKind = .metal;
+    var target: graph_mod.compiled_backend.AttachmentTarget = .whole_model;
+    var state = freshCompiledOwnerSnapshotState();
+    state.total_tokens = 8128;
+
+    // Cancellation is checked before binding validation, runtime state queries,
+    // or drain mutation.
+    const cancelled = InferenceExecutionControl{ .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, NativeGenerationPipeline.prepareCompiledOwnerSnapshot(binding, graph_cache, cancelled, &state, "checkpoint_source"));
+    try std.testing.expectEqual(@as(usize, 0), drains);
+    try std.testing.expectEqual(@as(usize, 0), state_queries);
+    try std.testing.expectEqual(@as(usize, 0), runtime_deinits);
+
+    // The production source snapshot sees the live route and drains it once.
+    try NativeGenerationPipeline.prepareCompiledOwnerSnapshot(binding, graph_cache, null, &state, "checkpoint_source");
+    try std.testing.expectEqual(@as(usize, 1), drains);
+    try std.testing.expectEqual(@as(usize, 1), state_queries);
+
+    const Probe = struct {
+        fn failDuringQuery(
+            graph: *?*graph_mod.cache.GraphCache,
+            selected_backend: *?ops.BackendKind,
+            attachment: *graph_mod.compiled_backend.AttachmentTarget,
+            expected: graph_mod.model_runtime.ContextOwnerBinding,
+            source: *const NativeDecodeState,
+        ) !void {
+            var suspension = NativeGenerationPipeline.EagerQueryCompiledRouteSuspension.begin(
+                graph,
+                selected_backend,
+                attachment,
+                true,
+            );
+            defer suspension.deinit();
+            try std.testing.expect(graph.* == null);
+            try std.testing.expect(selected_backend.* == null);
+            try std.testing.expectEqual(graph_mod.compiled_backend.AttachmentTarget.whole_model, attachment.*);
+            // This is the Root1842a negative control: hiding the route before
+            // checkpoint_source would fail closed for a bound-live owner.
+            try std.testing.expectError(error.MissingCompiledModelRuntime, NativeGenerationPipeline.prepareCompiledOwnerSnapshot(expected, graph.*, null, source, "checkpoint_source"));
+            return error.TestExpectedFailure;
+        }
+    };
+
+    try std.testing.expectError(error.TestExpectedFailure, Probe.failDuringQuery(&graph_cache, &backend, &target, binding, &state));
+    try std.testing.expect(graph_cache == &cache);
+    try std.testing.expectEqual(ops.BackendKind.metal, backend.?);
+    try std.testing.expectEqual(graph_mod.compiled_backend.AttachmentTarget.whole_model, target);
+    try std.testing.expectEqual(@as(usize, 1), drains);
+    try std.testing.expectEqual(@as(usize, 1), state_queries);
+
+    // Error unwind restored the real route, so the next source snapshot drains
+    // the same runtime again rather than retiring or replacing it.
+    try NativeGenerationPipeline.prepareCompiledOwnerSnapshot(binding, graph_cache, null, &state, "checkpoint_source");
+    try std.testing.expectEqual(@as(usize, 2), drains);
+    try std.testing.expectEqual(@as(usize, 2), state_queries);
+    try std.testing.expectEqual(@as(usize, 0), runtime_deinits);
+
+    // The normal successful query scope restores the same route explicitly.
+    var successful = NativeGenerationPipeline.EagerQueryCompiledRouteSuspension.begin(&graph_cache, &backend, &target, true);
+    try std.testing.expect(graph_cache == null);
+    successful.deinit();
+    try std.testing.expect(graph_cache == &cache);
+    try std.testing.expectEqual(ops.BackendKind.metal, backend.?);
+    try std.testing.expectEqual(@as(usize, 0), runtime_deinits);
+}
+
+test "context packed qualification phase snapshots current before session and inner after teardown" {
+    var tracker = runtime.kv.host_allocation_tracker.HostAllocationTracker.init(null, 0);
+    const allocation = try tracker.allocator().alloc(u8, 4096);
+    const inner = tracker.snapshot();
+    tracker.allocator().free(allocation);
+    const after_release = tracker.snapshot();
+
+    var state = NativeDecodeState.initContiguous(std.testing.allocator);
+    defer state.deinit();
+    const prefill = try NativeGenerationPipeline.metalQualificationOwnerSnapshot(&state, "prefill_started", true, &tracker);
+    try std.testing.expectEqual(after_release, prefill);
+    state.last_context_owner_committed = inner;
+    const committed = try NativeGenerationPipeline.metalQualificationOwnerSnapshot(&state, "generation_committed", true, &tracker);
+    try std.testing.expectEqual(inner, committed);
+    const automatic_with_inner = try NativeGenerationPipeline.metalQualificationOwnerSnapshot(&state, "generation_committed", false, &tracker);
+    try std.testing.expectEqual(inner, automatic_with_inner);
+    state.last_context_owner_committed = null;
+    try std.testing.expectError(
+        error.ContextPhysicalAccountingUnavailable,
+        NativeGenerationPipeline.metalQualificationOwnerSnapshot(&state, "generation_committed", true, &tracker),
+    );
+    const nonpacked = try NativeGenerationPipeline.metalQualificationOwnerSnapshot(&state, "generation_committed", false, &tracker);
+    try std.testing.expectEqual(after_release, nonpacked);
 }

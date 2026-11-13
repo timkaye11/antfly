@@ -33,13 +33,158 @@ const Receipt = struct {
 
 const CompilerProfile = struct { strip_debug_info: bool, have_error_return_tracing: bool };
 
-pub const Binding = struct { binary_sha256: [32]u8 };
+const Pin = struct { path: []const u8, sha256: []const u8 };
+const FullCliBinary = struct { path: []const u8, sha256: []const u8, bytes: u64 };
+const StagedFullCliReceipt = struct {
+    schema: []const u8,
+    build_kind: []const u8,
+    diagnostic_worker: bool,
+    source_freeze: Pin,
+    source_state_before: std.json.Value,
+    source_state_after: std.json.Value,
+    source_stable: bool,
+    full_context_release_proof: Pin,
+    resource: struct { path: []const u8, sha256: []const u8, peak_group_rss_mib: f64 },
+    binary: FullCliBinary,
+    builder: Pin,
+    command: []const []const u8,
+    fresh_standalone_install_required: bool,
+    release_eligible: bool,
+    qualification_eligible: bool,
+    serving_qualified: bool,
+    registry_enrolled: bool,
+};
+
+pub const Binding = struct { binary_sha256: [32]u8, source_freeze_sha256: ?[32]u8 = null };
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Binding {
     return parseWithCompilerProfile(allocator, bytes, .{
         .strip_debug_info = builtin.strip_debug_info,
         .have_error_return_tracing = builtin.have_error_return_tracing,
     });
+}
+
+/// Parse the parent-audited standalone full CLI receipt used exclusively by a
+/// staged operator candidate. This is deliberately separate from `parse`:
+/// enrolled producers and trusted consumers still require the release-eligible
+/// context-release receipt contract.
+pub fn parseStagedFullCli(allocator: std.mem.Allocator, bytes: []const u8) !Binding {
+    return parseStagedFullCliWithCompiler(allocator, bytes, .{
+        .strip_debug_info = builtin.strip_debug_info,
+        .have_error_return_tracing = builtin.have_error_return_tracing,
+    });
+}
+
+/// Parse the V4 full-context proof only when it is nested under an already
+/// authenticated staged-full-CLI receipt. Ordinary release binding remains
+/// deliberately limited to its existing V1-V3 contract.
+pub fn parseStagedFullContextProof(allocator: std.mem.Allocator, bytes: []const u8) !Binding {
+    return parseStagedFullContextProofWithCompiler(allocator, bytes, .{
+        .strip_debug_info = builtin.strip_debug_info,
+        .have_error_return_tracing = builtin.have_error_return_tracing,
+    });
+}
+
+fn parseStagedFullContextProofWithCompiler(allocator: std.mem.Allocator, bytes: []const u8, compiler: CompilerProfile) !Binding {
+    var parsed = std.json.parseFromSlice(Receipt, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidContextReleaseBuildReceipt;
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (!std.mem.eql(u8, value.schema, "antfly.context-release-build.v4") or
+        !std.mem.eql(u8, value.evidence_scope, "full_context_release_build") or
+        !value.release_eligible or value.serving_qualified or !value.source_verified_after_build or
+        value.binary.bytes == 0 or !validRelative(value.binary.path))
+        return error.InvalidContextReleaseBuildReceipt;
+    const profile = value.compiler_profile orelse return error.InvalidContextReleaseBuildReceipt;
+    if (profile != .object or profile.object.count() != 2)
+        return error.InvalidContextReleaseBuildReceipt;
+    const strip = profile.object.get("strip_debug_info") orelse return error.InvalidContextReleaseBuildReceipt;
+    const tracing = profile.object.get("have_error_return_tracing") orelse return error.InvalidContextReleaseBuildReceipt;
+    if (strip != .bool or tracing != .bool or !strip.bool or tracing.bool or
+        compiler.strip_debug_info != strip.bool or compiler.have_error_return_tracing != tracing.bool)
+        return error.InvalidContextReleaseBuildReceipt;
+    return .{ .binary_sha256 = digest32(value.binary.sha256) catch return error.InvalidContextReleaseBuildReceipt };
+}
+
+fn parseStagedFullCliWithCompiler(allocator: std.mem.Allocator, bytes: []const u8, compiler: CompilerProfile) !Binding {
+    var parsed = std.json.parseFromSlice(StagedFullCliReceipt, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidStagedFullCliBuildReceipt;
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (!std.mem.eql(u8, value.schema, "antfly.full-inference-cli-build.v1") or
+        !std.mem.eql(u8, value.build_kind, "full_inference_cli") or value.diagnostic_worker or
+        !value.source_stable or !jsonEqual(value.source_state_before, value.source_state_after) or
+        !value.fresh_standalone_install_required or value.release_eligible or value.qualification_eligible or
+        value.serving_qualified or value.registry_enrolled or value.binary.bytes == 0 or
+        !std.fs.path.isAbsolute(value.binary.path) or !validPin(value.source_freeze) or
+        !validPin(value.full_context_release_proof) or !validPin(value.builder) or
+        value.resource.peak_group_rss_mib <= 0 or !validAbsolutePin(value.resource.path, value.resource.sha256) or
+        !compiler.strip_debug_info or compiler.have_error_return_tracing or !validFullCliCommand(value.command))
+        return error.InvalidStagedFullCliBuildReceipt;
+    return .{
+        .binary_sha256 = digest32(value.binary.sha256) catch return error.InvalidStagedFullCliBuildReceipt,
+        .source_freeze_sha256 = digest32(value.source_freeze.sha256) catch return error.InvalidStagedFullCliBuildReceipt,
+    };
+}
+
+fn validPin(pin: Pin) bool {
+    return validAbsolutePin(pin.path, pin.sha256);
+}
+
+fn validAbsolutePin(path: []const u8, digest: []const u8) bool {
+    if (!std.fs.path.isAbsolute(path)) return false;
+    _ = digest32(digest) catch return false;
+    return true;
+}
+
+fn validFullCliCommand(command: []const []const u8) bool {
+    // The release builder emits either the original exact argv or the same
+    // argv with one compiler-driver `--verbose` immediately before
+    // `--verbose-link`. Only authority-owned executable, helper, Zig, cache
+    // and prefix paths vary.
+    if (command.len != 17 and command.len != 18) return false;
+    const suffix: usize = if (command.len == 18) 13 else 12;
+    if (command.len == 18 and !std.mem.eql(u8, command[12], "--verbose")) return false;
+    return std.fs.path.isAbsolute(command[0]) and std.fs.path.isAbsolute(command[1]) and
+        std.mem.eql(u8, command[2], "--zig") and std.fs.path.isAbsolute(command[3]) and
+        std.mem.eql(u8, command[4], "build") and std.mem.eql(u8, command[5], "install") and
+        std.mem.eql(u8, command[6], "-j1") and std.mem.eql(u8, command[7], "-Dmetal=true") and
+        std.mem.eql(u8, command[8], "-Dcuda=false") and std.mem.eql(u8, command[9], "-Doptimize=ReleaseFast") and
+        std.mem.eql(u8, command[10], "-Dstrip=true") and
+        std.mem.eql(u8, command[11], "-Dinference-compile-memory-mb=16384") and
+        std.mem.eql(u8, command[suffix], "--verbose-link") and std.mem.eql(u8, command[suffix + 1], "--cache-dir") and
+        std.fs.path.isAbsolute(command[suffix + 2]) and std.mem.eql(u8, command[suffix + 3], "--prefix") and
+        std.fs.path.isAbsolute(command[suffix + 4]);
+}
+
+fn jsonEqual(a: std.json.Value, b: std.json.Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .null => true,
+        .bool => |v| v == b.bool,
+        .integer => |v| v == b.integer,
+        .float => |v| v == b.float,
+        .number_string => |v| std.mem.eql(u8, v, b.number_string),
+        .string => |v| std.mem.eql(u8, v, b.string),
+        .array => |v| blk: {
+            if (v.items.len != b.array.items.len) break :blk false;
+            for (v.items, b.array.items) |x, y| if (!jsonEqual(x, y)) break :blk false;
+            break :blk true;
+        },
+        .object => |v| blk: {
+            if (v.count() != b.object.count()) break :blk false;
+            var it = v.iterator();
+            while (it.next()) |entry| {
+                const other = b.object.get(entry.key_ptr.*) orelse break :blk false;
+                if (!jsonEqual(entry.value_ptr.*, other)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
 }
 
 fn parseWithCompilerProfile(allocator: std.mem.Allocator, bytes: []const u8, compiler: CompilerProfile) !Binding {
@@ -171,6 +316,33 @@ test "context full release runtime binding rejects unknown future schema" {
     }));
 }
 
+const staged_context_v4_good =
+    \\{"schema":"antfly.context-release-build.v4","evidence_scope":"full_context_release_build","release_eligible":true,"serving_qualified":false,"source_verified_after_build":true,"binary":{"path":"context-tests","sha256":"1111111111111111111111111111111111111111111111111111111111111111","bytes":7},"compiler_profile":{"strip_debug_info":true,"have_error_return_tracing":false}}
+;
+
+test "staged full CLI nested context proof accepts canonical V4 only" {
+    const compiler: CompilerProfile = .{ .strip_debug_info = true, .have_error_return_tracing = false };
+    const binding = try parseStagedFullContextProofWithCompiler(std.testing.allocator, staged_context_v4_good, compiler);
+    try std.testing.expectEqual(@as(u8, 0x11), binding.binary_sha256[0]);
+    try std.testing.expectError(error.InvalidContextReleaseBuildReceipt, parseWithCompilerProfile(std.testing.allocator, staged_context_v4_good, compiler));
+    const v5 = try std.mem.replaceOwned(u8, std.testing.allocator, staged_context_v4_good, "context-release-build.v4", "context-release-build.v5");
+    defer std.testing.allocator.free(v5);
+    try std.testing.expectError(error.InvalidContextReleaseBuildReceipt, parseStagedFullContextProofWithCompiler(std.testing.allocator, v5, compiler));
+    const absent_binary =
+        \\{"schema":"antfly.context-release-build.v4","evidence_scope":"full_context_release_build","release_eligible":true,"serving_qualified":false,"source_verified_after_build":true,"compiler_profile":{"strip_debug_info":true,"have_error_return_tracing":false}}
+    ;
+    try std.testing.expectError(error.InvalidContextReleaseBuildReceipt, parseStagedFullContextProofWithCompiler(std.testing.allocator, absent_binary, compiler));
+    inline for (.{
+        .{ "\"compiler_profile\":{\"strip_debug_info\":true,\"have_error_return_tracing\":false}", "\"compiler_profile\":null" },
+        .{ "\"release_eligible\":true", "\"release_eligible\":false" },
+        .{ "\"path\":\"context-tests\"", "\"path\":\"\"" },
+    }) |replacement| {
+        const invalid = try std.mem.replaceOwned(u8, std.testing.allocator, staged_context_v4_good, replacement[0], replacement[1]);
+        defer std.testing.allocator.free(invalid);
+        try std.testing.expectError(error.InvalidContextReleaseBuildReceipt, parseStagedFullContextProofWithCompiler(std.testing.allocator, invalid, compiler));
+    }
+}
+
 test "context full release runtime binding v2 and v3 reject absent malformed and noncanonical profile" {
     const invalid_profiles = [_][]const u8{
         "",
@@ -210,4 +382,111 @@ test "context full release runtime binding v1 preserves unknown profile fields" 
         \\{"schema":"antfly.context-release-build.v1","evidence_scope":"full_context_release_build","release_eligible":true,"serving_qualified":false,"source_verified_after_build":true,"binary":{"path":"context-tests","sha256":"1111111111111111111111111111111111111111111111111111111111111111","bytes":7},"compiler_profile":{"future_field":42}}
     ;
     _ = try parse(std.testing.allocator, receipt);
+}
+
+const staged_full_cli_good =
+    \\{"schema":"antfly.full-inference-cli-build.v1","build_kind":"full_inference_cli","diagnostic_worker":false,"source_freeze":{"path":"/authority/freeze.json","sha256":"1111111111111111111111111111111111111111111111111111111111111111"},"source_state_before":{"head":"abc","dirty":[]},"source_state_after":{"dirty":[],"head":"abc"},"source_stable":true,"full_context_release_proof":{"path":"/authority/context-release-receipt.json","sha256":"2222222222222222222222222222222222222222222222222222222222222222"},"resource":{"path":"/authority/resource.json","sha256":"3333333333333333333333333333333333333333333333333333333333333333","peak_group_rss_mib":512.0},"binary":{"path":"/authority/antfly-inference-full","sha256":"4444444444444444444444444444444444444444444444444444444444444444","bytes":99},"builder":{"path":"/authority/build.py","sha256":"5555555555555555555555555555555555555555555555555555555555555555"},"command":["/usr/bin/python3","/authority/bounded.py","--zig","/authority/zig","build","install","-j1","-Dmetal=true","-Dcuda=false","-Doptimize=ReleaseFast","-Dstrip=true","-Dinference-compile-memory-mb=16384","--verbose-link","--cache-dir","/authority/cache","--prefix","/authority/out"],"fresh_standalone_install_required":true,"release_eligible":false,"qualification_eligible":false,"serving_qualified":false,"registry_enrolled":false}
+;
+
+test "staged full CLI binding accepts only exact stripped standalone authority" {
+    const binding = try parseStagedFullCliWithCompiler(std.testing.allocator, staged_full_cli_good, .{
+        .strip_debug_info = true,
+        .have_error_return_tracing = false,
+    });
+    try std.testing.expectEqual(@as(u8, 0x44), binding.binary_sha256[0]);
+    try std.testing.expectError(error.InvalidContextReleaseBuildReceipt, parseWithCompilerProfile(std.testing.allocator, staged_full_cli_good, .{
+        .strip_debug_info = true,
+        .have_error_return_tracing = false,
+    }));
+    try std.testing.expectError(error.InvalidStagedFullCliBuildReceipt, parseStagedFullCliWithCompiler(std.testing.allocator, staged_full_cli_good, .{
+        .strip_debug_info = false,
+        .have_error_return_tracing = false,
+    }));
+}
+
+test "context staged full CLI binding accepts exact verbose compiler argv receipt" {
+    const verbose_receipt = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        staged_full_cli_good,
+        "\"--verbose-link\"",
+        "\"--verbose\",\"--verbose-link\"",
+    );
+    defer std.testing.allocator.free(verbose_receipt);
+    const binding = try parseStagedFullCliWithCompiler(std.testing.allocator, verbose_receipt, .{
+        .strip_debug_info = true,
+        .have_error_return_tracing = false,
+    });
+    try std.testing.expectEqual(@as(u8, 0x44), binding.binary_sha256[0]);
+}
+
+test "context full CLI command admits only exact 17 or verbose 18 argument shapes" {
+    const original = [_][]const u8{
+        "/usr/bin/python3", "/authority/bounded.py",  "--zig",            "/authority/zig",
+        "build",            "install",                "-j1",              "-Dmetal=true",
+        "-Dcuda=false",     "-Doptimize=ReleaseFast", "-Dstrip=true",     "-Dinference-compile-memory-mb=16384",
+        "--verbose-link",   "--cache-dir",            "/authority/cache", "--prefix",
+        "/authority/out",
+    };
+    const verbose = [_][]const u8{
+        "/usr/bin/python3", "/authority/bounded.py",  "--zig",        "/authority/zig",
+        "build",            "install",                "-j1",          "-Dmetal=true",
+        "-Dcuda=false",     "-Doptimize=ReleaseFast", "-Dstrip=true", "-Dinference-compile-memory-mb=16384",
+        "--verbose",        "--verbose-link",         "--cache-dir",  "/authority/cache",
+        "--prefix",         "/authority/out",
+    };
+    try std.testing.expect(validFullCliCommand(&original));
+    try std.testing.expect(validFullCliCommand(&verbose));
+
+    const unknown_extra = [_][]const u8{
+        "/usr/bin/python3", "/authority/bounded.py",  "--zig",        "/authority/zig",
+        "build",            "install",                "-j1",          "-Dmetal=true",
+        "-Dcuda=false",     "-Doptimize=ReleaseFast", "-Dstrip=true", "-Dinference-compile-memory-mb=16384",
+        "--unknown",        "--verbose-link",         "--cache-dir",  "/authority/cache",
+        "--prefix",         "/authority/out",
+    };
+    const duplicated = [_][]const u8{
+        "/usr/bin/python3", "/authority/bounded.py",  "--zig",        "/authority/zig",
+        "build",            "install",                "-j1",          "-Dmetal=true",
+        "-Dcuda=false",     "-Doptimize=ReleaseFast", "-Dstrip=true", "-Dinference-compile-memory-mb=16384",
+        "--verbose-link",   "--verbose-link",         "--cache-dir",  "/authority/cache",
+        "--prefix",         "/authority/out",
+    };
+    const reordered = [_][]const u8{
+        "/usr/bin/python3", "/authority/bounded.py",  "--zig",        "/authority/zig",
+        "build",            "install",                "-j1",          "-Dmetal=true",
+        "-Dcuda=false",     "-Doptimize=ReleaseFast", "-Dstrip=true", "-Dinference-compile-memory-mb=16384",
+        "--verbose-link",   "--verbose",              "--cache-dir",  "/authority/cache",
+        "--prefix",         "/authority/out",
+    };
+    const duplicated_verbose = [_][]const u8{
+        "/usr/bin/python3", "/authority/bounded.py",  "--zig",          "/authority/zig",
+        "build",            "install",                "-j1",            "-Dmetal=true",
+        "-Dcuda=false",     "-Doptimize=ReleaseFast", "-Dstrip=true",   "-Dinference-compile-memory-mb=16384",
+        "--verbose",        "--verbose",              "--verbose-link", "--cache-dir",
+        "/authority/cache", "--prefix",               "/authority/out",
+    };
+    try std.testing.expect(!validFullCliCommand(&unknown_extra));
+    try std.testing.expect(!validFullCliCommand(&duplicated));
+    try std.testing.expect(!validFullCliCommand(&reordered));
+    try std.testing.expect(!validFullCliCommand(&duplicated_verbose));
+}
+
+test "staged full CLI binding rejects authority mutations" {
+    const mutations = [_]struct { old: []const u8, new: []const u8 }{
+        .{ .old = "\"source_stable\":true", .new = "\"source_stable\":false" },
+        .{ .old = "\"head\":\"abc\",\"dirty\":[]", .new = "\"head\":\"def\",\"dirty\":[]" },
+        .{ .old = "\"fresh_standalone_install_required\":true", .new = "\"fresh_standalone_install_required\":false" },
+        .{ .old = "\"-Dstrip=true\"", .new = "\"-Dstrip=false\"" },
+        .{ .old = "\"bytes\":99", .new = "\"bytes\":0" },
+        .{ .old = "\"registry_enrolled\":false", .new = "\"registry_enrolled\":true" },
+    };
+    for (mutations) |mutation| {
+        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, staged_full_cli_good, mutation.old, mutation.new);
+        defer std.testing.allocator.free(changed);
+        try std.testing.expectError(error.InvalidStagedFullCliBuildReceipt, parseStagedFullCliWithCompiler(std.testing.allocator, changed, .{
+            .strip_debug_info = true,
+            .have_error_return_tracing = false,
+        }));
+    }
 }

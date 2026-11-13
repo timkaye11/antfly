@@ -165,12 +165,15 @@ pub const Copier = struct {
     /// reserves window + chunk - 1 rows and publishes descriptors only after
     /// this synchronous copy completes.
     pub fn appendRing(self: *Copier, start: u32, rows: u32, capacity: u32, width: u32, keys: Ref, values: Ref, dest_keys: Ref, dest_values: Ref) !void {
-        return self.appendRingImpl(null, start, rows, capacity, width, keys, values, dest_keys, dest_values);
+        return self.appendRingImpl(null, null, start, rows, capacity, width, keys, values, dest_keys, dest_values);
     }
     pub fn appendRingOnActiveRuntime(self: *Copier, owner_runtime: *mr.RawMetalDecodeRuntime, start: u32, rows: u32, capacity: u32, width: u32, keys: Ref, values: Ref, dest_keys: Ref, dest_values: Ref) !void {
-        return self.appendRingImpl(owner_runtime, start, rows, capacity, width, keys, values, dest_keys, dest_values);
+        return self.appendRingImpl(owner_runtime, null, start, rows, capacity, width, keys, values, dest_keys, dest_values);
     }
-    fn appendRingImpl(self: *Copier, owner_runtime: ?*mr.RawMetalDecodeRuntime, start: u32, rows: u32, capacity: u32, width: u32, keys: Ref, values: Ref, dest_keys: Ref, dest_values: Ref) !void {
+    pub fn appendRingBoundedOnActiveRuntime(self: *Copier, owner_runtime: *mr.RawMetalDecodeRuntime, submission_epoch: u64, start: u32, rows: u32, capacity: u32, width: u32, keys: Ref, values: Ref, dest_keys: Ref, dest_values: Ref) !void {
+        return self.appendRingImpl(owner_runtime, submission_epoch, start, rows, capacity, width, keys, values, dest_keys, dest_values);
+    }
+    fn appendRingImpl(self: *Copier, owner_runtime: ?*mr.RawMetalDecodeRuntime, submission_epoch: ?u64, start: u32, rows: u32, capacity: u32, width: u32, keys: Ref, values: Ref, dest_keys: Ref, dest_values: Ref) !void {
         const count = @as(u64, rows) * width;
         const dest_count = @as(u64, capacity) * width;
         if (rows == 0 or rows > capacity or width == 0 or count > std.math.maxInt(u32) or dest_count > std.math.maxInt(u32) or
@@ -180,7 +183,10 @@ pub const Copier = struct {
         for ([_]Ref{ keys, values }) |r| if (r.handle == dest_keys.handle or r.handle == dest_values.handle) return error.AliasedContextStaging;
         const params = shared.Params{ .op = 1, .n = @intCast(count), .dim = width, .position = start, .stride = capacity };
         if (owner_runtime) |runtime|
-            try self.encodeOnActiveRuntime(runtime, params, .{ keys, values, dest_keys, dest_values })
+            if (submission_epoch) |epoch|
+                try self.encodeKvWriteOnActiveRuntime(runtime, epoch, params, .{ keys, values, dest_keys, dest_values })
+            else
+                try self.encodeOnActiveRuntime(runtime, params, .{ keys, values, dest_keys, dest_values })
         else
             try self.encode(params, .{ keys, values, dest_keys, dest_values });
     }
@@ -230,6 +236,12 @@ pub const Copier = struct {
     fn encodeOnActiveRuntime(self: *Copier, owner_runtime: *mr.RawMetalDecodeRuntime, params: shared.Params, inputs: [4]Ref) !void {
         if (self.core.batch_active or self.core.batch_submitted) return error.ContextTransactionBusy;
         try self.core.runOnActiveRuntime(owner_runtime, params, &inputs, self.core.dummy.ref());
+    }
+    fn encodeKvWriteOnActiveRuntime(self: *Copier, owner_runtime: *mr.RawMetalDecodeRuntime, submission_epoch: u64, params: shared.Params, inputs: [4]Ref) !void {
+        if (self.core.batch_active or self.core.batch_submitted) return error.ContextTransactionBusy;
+        // context_storage op 1 and op 4 read bindings 0/1 and write packed K/V
+        // through bindings 2/3. Dummy bindings 4..7 remain read-only.
+        try self.core.runBoundedCoalescedOnActiveRuntime(owner_runtime, submission_epoch, params, &inputs, self.core.dummy.ref(), 0x0c);
     }
 };
 
@@ -522,12 +534,15 @@ pub const Generation = struct {
     /// Writes only unpublished tail capacity. A failed/cancelled append leaves
     /// descriptors unchanged and can be retried. Call with no outstanding readers.
     pub fn append(self: *Generation, copier: *Copier, publication: *const views.Publication, rows: u32, keys: Ref, values: Ref) !void {
-        return self.appendImpl(copier, publication, null, rows, keys, values);
+        return self.appendImpl(copier, publication, null, null, rows, keys, values);
     }
     pub fn appendOnActiveRuntime(self: *Generation, copier: *Copier, publication: *const views.Publication, owner_runtime: *mr.RawMetalDecodeRuntime, rows: u32, keys: Ref, values: Ref) !void {
-        return self.appendImpl(copier, publication, owner_runtime, rows, keys, values);
+        return self.appendImpl(copier, publication, owner_runtime, null, rows, keys, values);
     }
-    fn appendImpl(self: *Generation, copier: *Copier, publication: *const views.Publication, owner_runtime: ?*mr.RawMetalDecodeRuntime, rows: u32, keys: Ref, values: Ref) !void {
+    pub fn appendBoundedOnActiveRuntime(self: *Generation, copier: *Copier, publication: *const views.Publication, owner_runtime: *mr.RawMetalDecodeRuntime, submission_epoch: u64, rows: u32, keys: Ref, values: Ref) !void {
+        return self.appendImpl(copier, publication, owner_runtime, submission_epoch, rows, keys, values);
+    }
+    fn appendImpl(self: *Generation, copier: *Copier, publication: *const views.Publication, owner_runtime: ?*mr.RawMetalDecodeRuntime, submission_epoch: ?u64, rows: u32, keys: Ref, values: Ref) !void {
         if (self.hasReplayReaders()) return error.ContextReplayActive;
         if (publication.pending) return error.ContextTransactionBusy;
         if (publication.readers != 0) return error.ContextReadersActive;
@@ -551,7 +566,10 @@ pub const Generation = struct {
             const last = self.plan.spans[h.span_start + h.span_count - 1];
             const params = shared.Params{ .op = 4, .n = rows * v.head_dim, .dim = v.head_dim, .groups = v.kv_heads, .index = @intCast(head), .stride = h.kv_start + last.physical_start + last.row_count };
             if (owner_runtime) |runtime|
-                try copier.encodeOnActiveRuntime(runtime, params, .{ keys, values, self.keys.ref(), self.values.ref() })
+                if (submission_epoch) |epoch|
+                    try copier.encodeKvWriteOnActiveRuntime(runtime, epoch, params, .{ keys, values, self.keys.ref(), self.values.ref() })
+                else
+                    try copier.encodeOnActiveRuntime(runtime, params, .{ keys, values, self.keys.ref(), self.values.ref() })
             else
                 try copier.encode(params, .{ keys, values, self.keys.ref(), self.values.ref() });
         }

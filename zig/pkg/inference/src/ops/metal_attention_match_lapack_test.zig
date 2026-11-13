@@ -27,6 +27,70 @@ fn compareSelection(input: solver.MatrixInput, target: usize) !void {
     for (reference.values, accelerated.values) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-9);
 }
 
+fn compareRawSelection(input: solver.MatrixInput, rhs: []const f64, target: usize) !void {
+    var cfg: solver.Config = .{ .target_rows = target, .selection = .residual_omp, .mass_solver = .active_set };
+    var reference = try solver.fitMatricesMassTargetPolicyForTest(std.testing.allocator, input, cfg, rhs, .raw);
+    defer reference.deinit();
+    cfg.backend = .{ .workspace_fn = selectionWorkspace, .values_fn = lapack.values, .raw_select_fn = lapack.selectRawTarget };
+    var accelerated = try solver.fitMatricesMassTargetPolicyForTest(std.testing.allocator, input, cfg, rhs, .raw);
+    defer accelerated.deinit();
+    try std.testing.expectEqualSlices(usize, reference.source_indices, accelerated.source_indices);
+    for (reference.bias, accelerated.bias) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-9);
+    for (reference.values, accelerated.values) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-9);
+}
+
+test "attention_match Accelerate raw rho selector matches native asymmetric and dependent matrices" {
+    if (comptime !lapack.supported) return error.SkipZigTest;
+    const p = [_]f64{
+        0.45, 0.20, 0.35,
+        0.35, 0.60, 0.05,
+        0.40, 0.40, 0.20,
+        0.10, 0.10, 0.80,
+        0.60, 0.20, 0.20,
+    };
+    const y = [_]f64{ 1, 2, 3, 4, 5 };
+    try compareRawSelection(.{ .probabilities = &p, .targets = &y, .rows = 3, .dim = 1, .query_rows = 5 }, &.{ 0.2, 2, 0.7, 1.3, 0 }, 2);
+    const dependent = [_]f64{ 0.2, 0.2, 0.6, 0.4, 0.4, 0.2, 0.1, 0.1, 0.8 };
+    try compareRawSelection(.{ .probabilities = &dependent, .targets = &.{ 1, 2, 3 }, .rows = 3, .dim = 1, .query_rows = 3 }, &.{ 1, 0.5, 2 }, 2);
+}
+
+test "attention_match raw rho callback is explicitly gated and rejects malformed output" {
+    const Trap = struct {
+        var calls: usize = 0;
+        fn raw(_: ?*anyopaque, _: std.mem.Allocator, _: []const f64, _: []const f64, _: []const f64, _: usize, n: usize, _: []const usize, indices: []usize, weights: []f64, _: solver.Config) !usize {
+            calls += 1;
+            @memset(indices, n);
+            @memset(weights, 1);
+            return 0;
+        }
+    };
+    const input: solver.MatrixInput = .{ .probabilities = &.{ 0.8, 0.2, 0.1, 0.9 }, .targets = &.{ 1, 2 }, .rows = 2, .dim = 1, .query_rows = 2 };
+    const backend: solver.Backend = .{ .workspace_fn = selectionWorkspace, .raw_select_fn = Trap.raw };
+    Trap.calls = 0;
+    var normalized = try solver.fitMatrices(std.testing.allocator, input, .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set, .backend = backend });
+    normalized.deinit();
+    try std.testing.expectEqual(@as(usize, 0), Trap.calls);
+    try std.testing.expectError(error.InvalidSelectionResult, solver.fitMatricesMassTargetPolicyForTest(std.testing.allocator, input, .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set, .backend = backend }, &.{ 1, 1 }, .raw));
+    try std.testing.expectEqual(@as(usize, 1), Trap.calls);
+}
+
+test "attention_match Accelerate raw rho selector preserves cancellation and allocation failure" {
+    if (comptime !lapack.supported) return error.SkipZigTest;
+    const p = [_]f64{ 0.8, 0.2, 0.1, 0.9 };
+    const importance = [_]f64{ 0.65, 0.85 };
+    var indices: [1]usize = undefined;
+    var weights: [1]f64 = undefined;
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    const cancelled: solver.Config = .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set, .control = .{ .check_fn = Cancel.check } };
+    try std.testing.expectError(error.Cancelled, lapack.selectRawTarget(null, std.testing.allocator, &p, &importance, &.{ 1, 0.5 }, 2, 2, &.{}, &indices, &weights, cancelled));
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, lapack.selectRawTarget(null, failing.allocator(), &p, &importance, &.{ 1, 0.5 }, 2, 2, &.{}, &indices, &weights, .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set }));
+}
+
 test "attention_match Metal FP64 selection matches native asymmetric matrices and dependent columns" {
     if (comptime !lapack.supported) return error.SkipZigTest;
     const q = 33;
@@ -52,6 +116,40 @@ test "attention_match Metal FP64 selection matches native asymmetric matrices an
     const uniform: [16 * 8]f64 = @splat(0.125);
     const targets: [16]f64 = @splat(2.5);
     try compareSelection(.{ .probabilities = &uniform, .targets = &targets, .rows = 8, .dim = 1, .query_rows = 16 }, 4);
+}
+
+test "attention_match Metal FP64 selection preserves mandatory training argmax seeds" {
+    if (comptime !lapack.supported) return error.SkipZigTest;
+    const input: solver.MatrixInput = .{ .probabilities = &.{ 0.2, 0.8, 0, 0.2, 0, 0.8 }, .targets = &.{ 1, 2 }, .rows = 3, .dim = 1, .query_rows = 2 };
+    const base: solver.Config = .{ .target_rows = 2, .selection = .residual_omp, .mass_solver = .active_set, .mandatory_training_argmax = true };
+    var reference = try solver.fitMatrices(std.testing.allocator, input, base);
+    defer reference.deinit();
+    var accelerated_cfg = base;
+    accelerated_cfg.backend = .{ .workspace_fn = selectionWorkspace, .values_fn = lapack.values, .select_fn = lapack.select };
+    var accelerated = try solver.fitMatrices(std.testing.allocator, input, accelerated_cfg);
+    defer accelerated.deinit();
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, accelerated.source_indices);
+    try std.testing.expectEqualSlices(usize, reference.source_indices, accelerated.source_indices);
+    for (reference.bias, accelerated.bias) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-9);
+    for (reference.values, accelerated.values) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-9);
+    try std.testing.expect(reference.metrics.nnls_sweeps > 0 and accelerated.metrics.nnls_sweeps > 0);
+}
+
+test "attention_match Metal FP64 selection preserves mandatory training top2 seeds" {
+    if (comptime !lapack.supported) return error.SkipZigTest;
+    const input: solver.MatrixInput = .{ .probabilities = &.{ 0.6, 0.3, 0.1, 0, 0.6, 0, 0.1, 0.3 }, .targets = &.{ 1, 2 }, .rows = 4, .dim = 1, .query_rows = 2 };
+    const base: solver.Config = .{ .target_rows = 3, .selection = .residual_omp, .mass_solver = .active_set, .mandatory_training_argmax = true, .mandatory_training_top_k = 2 };
+    var reference = try solver.fitMatrices(std.testing.allocator, input, base);
+    defer reference.deinit();
+    var accelerated_cfg = base;
+    accelerated_cfg.backend = .{ .workspace_fn = selectionWorkspace, .values_fn = lapack.values, .select_fn = lapack.select };
+    var accelerated = try solver.fitMatrices(std.testing.allocator, input, accelerated_cfg);
+    defer accelerated.deinit();
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 3 }, accelerated.source_indices);
+    try std.testing.expectEqualSlices(usize, reference.source_indices, accelerated.source_indices);
+    for (reference.bias, accelerated.bias) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-9);
+    for (reference.values, accelerated.values) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-9);
+    try std.testing.expect(reference.metrics.nnls_sweeps > 0 and accelerated.metrics.nnls_sweeps > 0);
 }
 
 test "attention_match Metal FP64 selection preserves the native workspace including one query" {
@@ -83,10 +181,10 @@ test "attention_match Metal FP64 selection checks dimensions importance and canc
     var indices: [2]usize = undefined;
     var weights: [2]f64 = undefined;
     const config: solver.Config = .{ .target_rows = 2, .selection = .residual_omp, .mass_solver = .active_set };
-    try std.testing.expectError(error.InvalidAttentionShape, lapack.select(null, std.testing.failing_allocator, &p, &importance, 0, 4, &indices, &weights, config));
+    try std.testing.expectError(error.InvalidAttentionShape, lapack.select(null, std.testing.failing_allocator, &p, &importance, 0, 4, &.{}, &indices, &weights, config));
     var poisoned = importance;
     poisoned[0] = std.math.nan(f64);
-    try std.testing.expectError(error.NonFiniteAttention, lapack.select(null, std.testing.failing_allocator, &p, &poisoned, 3, 4, &indices, &weights, config));
+    try std.testing.expectError(error.NonFiniteAttention, lapack.select(null, std.testing.failing_allocator, &p, &poisoned, 3, 4, &.{}, &indices, &weights, config));
     const Check = struct {
         calls: usize = 0,
         fn check(raw: ?*anyopaque) !void {
@@ -98,7 +196,7 @@ test "attention_match Metal FP64 selection checks dimensions importance and canc
     var state: Check = .{};
     var cancellable = config;
     cancellable.control = .{ .context = &state, .check_fn = Check.check };
-    try std.testing.expectError(error.Cancelled, lapack.select(null, std.testing.allocator, &p, &importance, 3, 4, &indices, &weights, cancellable));
+    try std.testing.expectError(error.Cancelled, lapack.select(null, std.testing.allocator, &p, &importance, 3, 4, &.{}, &indices, &weights, cancellable));
     try std.testing.expectEqual(@as(usize, 3), state.calls);
 }
 
@@ -113,7 +211,7 @@ test "attention_match Metal FP64 selection releases every failed allocation" {
             };
             var indices: [2]usize = undefined;
             var weights: [2]f64 = undefined;
-            _ = try lapack.select(null, allocator, &p, &importance, 3, 4, &indices, &weights, .{ .target_rows = 2, .selection = .residual_omp, .mass_solver = .active_set });
+            _ = try lapack.select(null, allocator, &p, &importance, 3, 4, &.{}, &indices, &weights, .{ .target_rows = 2, .selection = .residual_omp, .mass_solver = .active_set });
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
@@ -260,7 +358,7 @@ test "attention_match Metal FP64 accelerator output cannot bypass the native dir
         fn workspace(_: ?*anyopaque, _: usize, _: usize, _: usize, _: usize) !usize {
             return 0;
         }
-        fn select(_: ?*anyopaque, _: std.mem.Allocator, _: []const f64, _: []const f64, _: usize, _: usize, indices: []usize, weights: []f64, _: solver.Config) !usize {
+        fn select(_: ?*anyopaque, _: std.mem.Allocator, _: []const f64, _: []const f64, _: usize, _: usize, _: []const usize, indices: []usize, weights: []f64, _: solver.Config) !usize {
             for (indices, 0..) |*index, i| index.* = i;
             @memset(weights, 0);
             return 0;

@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.server
 import json
 import pathlib
+import subprocess
 import sys
 import tempfile
+import threading
 import textwrap
 import unittest
 from unittest import mock
@@ -55,8 +58,14 @@ def sample(engine: str, total: float, ttft: float, digest: str = "stable") -> di
         "decode_tok_s": 299_000 / decode,
         "prompt_tokens": 2051,
         "completion_tokens": 300,
-        "completion_token_accounting_source": "final_sse_usage",
-        "prompt_token_accounting_source": "final_sse_usage",
+        "completion_token_accounting_source": (
+            "final_sse_usage"
+            if engine == "antfly"
+            else "ordered_single_id_stream_partials"
+        ),
+        "prompt_token_accounting_source": (
+            "final_sse_usage" if engine == "antfly" else "terminal_tokens_evaluated"
+        ),
         "finish_reason": "length",
         "content": content,
         "content_utf8_bytes": len(content.encode("utf-8")),
@@ -188,6 +197,34 @@ def frozen_baseline(
 
 
 class FixtureTests(unittest.TestCase):
+    def test_metal_artifact_fixture_uses_native_template_with_locked_tokens(self) -> None:
+        path = SCRIPTS / "fixtures/gemma4_metal_artifact_template_v2.json"
+        fixture = benchmark.load_fixture(path)
+        self.assertEqual(2047, fixture.expected_prompt_tokens)
+        self.assertEqual("model_selected_final", fixture.response_channel)
+        self.assertTrue(fixture.reference_prompt.endswith("<turn|>\n<|turn>model\n"))
+        serialized = benchmark.TOKENIZER_BOS_TEXT + fixture.reference_prompt
+        contract = benchmark.validate_llama_rendered_prompt(serialized, fixture)
+        self.assertTrue(contract["leading_bos_from_template"])
+        self.assertEqual(fixture.reference_prompt_sha256, contract["sha256"])
+        with self.assertRaises(RuntimeError):
+            benchmark.validate_llama_rendered_prompt(benchmark.TOKENIZER_BOS_TEXT + serialized, fixture)
+        with tempfile.TemporaryDirectory() as temporary:
+            namespace = benchmark.parse_args(["--model", "/model/model.gguf", "--backend", "metal",
+                                              "--profile", "metal-headline", "--collect-only"])
+            spec = benchmark.make_server_spec(namespace, "llama_cpp", 19001, pathlib.Path(temporary), fixture)
+            self.assertIn("--jinja", spec.command)
+            self.assertNotIn("--chat-template-file", spec.command)
+            self.assertEqual("1", spec.command[spec.command.index("--parallel") + 1])
+
+    def test_metal_artifact_fixture_rejects_a_different_channel_policy(self) -> None:
+        value = json.loads((SCRIPTS / "fixtures/gemma4_metal_artifact_template_v2.json").read_text())
+        value["response_channel"] = "public_final"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "fixture.json"
+            path.write_text(json.dumps(value))
+            with self.assertRaises(ValueError):
+                benchmark.load_fixture(path)
     def test_checked_in_fixture_renders_exact_reference_prompt(self) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
         self.assertEqual(8192, fixture.user_utf8_bytes)
@@ -247,6 +284,103 @@ class FixtureTests(unittest.TestCase):
 
 
 class SchedulingAndParsingTests(unittest.TestCase):
+    def test_fixed_length_generated_ids_require_exact_eos_free_300(self) -> None:
+        ids = list(range(100, 400))
+        proof = benchmark.validate_fixed_length_generated_ids(
+            ids, {1, 2, 9}, 300, eos_token_ids={1, 2}
+        )
+        self.assertEqual(300, proof["count"])
+        self.assertTrue(proof["eos_free"])
+        self.assertTrue(proof["fixed_length_mask_eos"])
+        for invalid in (ids[:-1], ids + [400], None):
+            with self.subTest(invalid=invalid is None and "missing" or len(invalid)):
+                with self.assertRaises(ValueError):
+                    benchmark.validate_fixed_length_generated_ids(
+                        invalid, {1, 2, 9}, 300, eos_token_ids={1, 2}
+                    )
+        with self.assertRaises(ValueError):
+            benchmark.validate_fixed_length_generated_ids(
+                ids[:-1] + [2], {1, 2, 9}, 300, eos_token_ids={1, 2}
+            )
+        with self.assertRaises(ValueError):
+            benchmark.validate_fixed_length_generated_ids(
+                ids, set(), 300, eos_token_ids={1, 2}
+            )
+        with self.assertRaisesRegex(ValueError, "suppressed IDs"):
+            benchmark.validate_fixed_length_generated_ids(
+                ids[:-1] + [9], {1, 2, 9}, 300, eos_token_ids={1, 2}
+            )
+
+    def test_fixed_length_request_keeps_ignore_and_mask_distinct(self) -> None:
+        fixture = benchmark.load_fixture(FIXTURE)
+        body = benchmark.request_body(
+            "antfly", "model", "metal", fixture, 300, "f16", stream=True
+        )
+        self.assertIs(True, body["ignore_eos"])
+        self.assertIs(True, body["fixed_length_mask_eos"])
+        self.assertEqual(300, body["max_tokens"])
+        self.assertEqual(0, body["top_p"])
+
+    def test_terminal_metadata_binds_full_suppression_union(self) -> None:
+        ids = list(range(100, 400))
+        event = {"generated_token_ids": ids, "applied_suppress_token_ids": [1, 2, 9],
+                 "eos_token_ids": [1, 2], "fixed_length_mask_eos": True}
+        proof = benchmark.fixed_length_terminal_metadata([event], 300)
+        self.assertEqual([1, 2, 9], proof["applied_suppress_token_ids"])
+        with self.assertRaises(ValueError):
+            benchmark.fixed_length_terminal_metadata([event, event], 300)
+        with self.assertRaises(ValueError):
+            benchmark.fixed_length_terminal_metadata([{**event,
+                "applied_suppress_token_ids": [1]}], 300)
+        unsorted = {**event, "applied_suppress_token_ids": [9, 1, 2]}
+        self.assertEqual(
+            [1, 2, 9],
+            benchmark.fixed_length_terminal_metadata([unsorted], 300)[
+                "applied_suppress_token_ids"
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "deduplicated"):
+            benchmark.fixed_length_terminal_metadata([{**event,
+                "applied_suppress_token_ids": [1, 2, 9, 9]}], 300)
+        with self.assertRaisesRegex(ValueError, "suppressed IDs"):
+            benchmark.fixed_length_terminal_metadata([{**event,
+                "generated_token_ids": ids[:-1] + [9]}], 300)
+
+    def test_llama_request_receives_exact_applied_suppression_union(self) -> None:
+        fixture = benchmark.load_fixture(FIXTURE)
+        body = benchmark.request_body("llama_cpp", "model", "metal", fixture,
+                                      300, "f16", stream=True,
+                                      applied_suppress_token_ids=[1, 2, 9])
+        self.assertIs(True, body["ignore_eos"])
+        self.assertIs(True, body["return_tokens"])
+        self.assertEqual([[1, False], [2, False], [9, False]], body["logit_bias"])
+
+    def test_llama_stream_aggregates_ordered_partial_ids_and_allows_repeated_values(self) -> None:
+        ids = [100 + (index % 7) for index in range(300)]
+        events = [{"content": "x", "tokens": [token], "stop": False} for token in ids]
+        events.append({"content": "", "tokens": [], "stop": True, "stop_type": "limit"})
+        proof = benchmark.llama_fixed_length_terminal_metadata(
+            events, 300, [1, 2], [1, 2, 9]
+        )
+        self.assertEqual(ids, proof["token_ids"])
+        self.assertEqual(
+            "ordered_single_id_stream_partials", proof["token_accounting_source"]
+        )
+        with self.assertRaises(ValueError):
+            benchmark.llama_fixed_length_terminal_metadata(
+                events[:-1] + [events[0], events[-1]], 300, [1, 2], [1, 2, 9]
+            )
+        with self.assertRaisesRegex(ValueError, "terminal event"):
+            benchmark.llama_fixed_length_terminal_metadata(
+                events + [events[-1]], 300, [1, 2], [1, 2, 9]
+            )
+        with self.assertRaisesRegex(ValueError, "must not repeat"):
+            benchmark.llama_fixed_length_terminal_metadata(
+                events[:-1]
+                + [{"tokens": [100], "stop": True, "stop_type": "limit"}],
+                300, [1, 2], [1, 2, 9]
+            )
+
     def test_pair_order_is_ab_ba(self) -> None:
         self.assertEqual(("antfly", "llama_cpp"), benchmark.paired_order(1))
         self.assertEqual(("llama_cpp", "antfly"), benchmark.paired_order(2))
@@ -935,6 +1069,72 @@ class SchedulingAndParsingTests(unittest.TestCase):
         )
         self.assertNotEqual(profile["sha256"], changed["sha256"])
 
+    def test_guard_nonce_environment_does_not_change_material_profile(self) -> None:
+        fixture = benchmark.load_fixture(FIXTURE)
+        namespace = argparse.Namespace(
+            backend="metal",
+            output_tokens=300,
+            antfly_env=[],
+            antfly_server_prefix="",
+            llama_server_prefix="",
+        )
+        common = {
+            "ANTFLY_INFERENCE_JSON_TOKEN_IDS": "1",
+            "TERMITE_METAL_ENABLE_GEMMA4_GQA8_TWOHEAD_REGISTER": "1",
+        }
+        first = {
+            **common,
+            "ANTFLY_BENCHMARK_GUARD_FD": "6",
+            "ANTFLY_BENCHMARK_GUARD_OWNER_PID": "93908",
+            "ANTFLY_BENCHMARK_GUARD_TOKEN": "first-nonce",
+        }
+        second = {
+            **common,
+            "ANTFLY_BENCHMARK_GUARD_FD": "9",
+            "ANTFLY_BENCHMARK_GUARD_OWNER_PID": "26033",
+            "ANTFLY_BENCHMARK_GUARD_TOKEN": "second-nonce",
+        }
+        first_before = dict(first)
+        second_before = dict(second)
+
+        first_profile = benchmark.resolve_antfly_execution_profile(
+            namespace, fixture, first
+        )
+        second_profile = benchmark.resolve_antfly_execution_profile(
+            namespace, fixture, second
+        )
+
+        self.assertEqual(
+            first_profile["material_environment_sha256"],
+            second_profile["material_environment_sha256"],
+        )
+        self.assertEqual(first_profile["sha256"], second_profile["sha256"])
+        for name in benchmark.NON_MATERIAL_BENCHMARK_GUARD_ENV:
+            self.assertFalse(benchmark.is_material_tuning_env(name))
+            self.assertNotIn(name, first_profile["effective_env"])
+            self.assertNotIn(name, second_profile["effective_env"])
+        self.assertEqual(first_before, first)
+        self.assertEqual(second_before, second)
+
+        tuned_profile = benchmark.resolve_antfly_execution_profile(
+            namespace,
+            fixture,
+            {**first, "TERMITE_METAL_ENABLE_GEMMA4_GQA8_TWOHEAD_REGISTER": "0"},
+        )
+        self.assertNotEqual(
+            first_profile["material_environment_sha256"],
+            tuned_profile["material_environment_sha256"],
+        )
+        self.assertNotEqual(first_profile["sha256"], tuned_profile["sha256"])
+
+    def test_guard_exclusion_is_exact_not_prefix_wide(self) -> None:
+        for name in (
+            "ANTFLY_BENCHMARK_GUARD_TOKEN_EXTRA",
+            "ANTFLY_BENCHMARK_GUARD_OWNER_PID_DEBUG",
+            "ANTFLY_BENCHMARK_GUARD_FD_LIMIT",
+        ):
+            self.assertTrue(benchmark.is_material_tuning_env(name))
+
     def test_headline_rejects_overridden_required_graph_profile(self) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
         resolve_args = argparse.Namespace(
@@ -1084,6 +1284,7 @@ class SchedulingAndParsingTests(unittest.TestCase):
                 model=model,
                 context_size=4096,
                 cache_dtype="f16",
+                backend="cuda",
             )
             spec = benchmark.make_server_spec(namespace, "llama_cpp", 19001, root)
             template = root / "gemma4-public-final-chat-template.jinja"
@@ -1118,6 +1319,65 @@ class StatisticsAndGateTests(unittest.TestCase):
             evidence["comparison"]["antfly_llama_median_total_ratio"], 0.95
         )
 
+    def test_metal_headline_uses_real_usage_without_cuda_route_requirements(self) -> None:
+        samples = rows()
+        for row in samples:
+            for key in list(row["antfly"]):
+                if key.startswith("cuda_"):
+                    del row["antfly"][key]
+        evidence = benchmark.evaluate(
+            args(profile="metal-headline", max_component_ratio=1.0,
+                 max_ttft_ci_upper=1.0, max_decode_ci_upper=1.0),
+            self.fixture, samples, None)
+        self.assertTrue(evidence["passed"])
+        self.assertFalse(any("gqa_prefill" in check["name"] for check in evidence["checks"]))
+        samples[0]["antfly"]["completion_token_accounting_source"] = "content_events"
+        evidence = benchmark.evaluate(args(profile="metal-headline"), self.fixture, samples, None)
+        self.assertFalse(evidence["passed"])
+
+    def test_metal_headline_reports_component_loss_without_overriding_total_win(self) -> None:
+        samples = rows()
+        for row in samples:
+            row["antfly"]["ttft_ms"] = row["llama_cpp"]["ttft_ms"] * 1.01
+            row["antfly"]["decode_ms"] = row["antfly"]["total_latency_ms"] - row["antfly"]["ttft_ms"]
+        evidence = benchmark.evaluate(
+            args(profile="metal-headline", max_median_ratio=1.0, max_component_ratio=1.0,
+                 max_ttft_ci_upper=1.0, max_decode_ci_upper=1.0),
+            self.fixture, samples, None)
+        self.assertTrue(evidence["passed"])
+        ttft = next(check for check in evidence["checks"] if check["name"] == "headline_ttft")
+        ttft_ci = next(check for check in evidence["checks"] if check["name"] == "headline_ttft_paired_ci")
+        self.assertFalse(ttft["passed"])
+        self.assertFalse(ttft["enforced"])
+        self.assertFalse(ttft_ci["passed"])
+        self.assertFalse(ttft_ci["enforced"])
+
+        for row in samples:
+            row["antfly"]["ttft_ms"] = row["llama_cpp"]["ttft_ms"]
+        evidence = benchmark.evaluate(
+            args(profile="metal-headline", max_median_ratio=1.0, max_component_ratio=1.0,
+                 max_ttft_ci_upper=1.0, max_decode_ci_upper=1.0),
+            self.fixture, samples, None)
+        self.assertFalse(next(check for check in evidence["checks"]
+                              if check["name"] == "headline_ttft_paired_ci")["passed"])
+        self.assertTrue(evidence["passed"])
+
+    def test_metal_headline_accepts_repeatable_total_lead_below_five_percent(self) -> None:
+        evidence = benchmark.evaluate(
+            args(profile="metal-headline", max_median_ratio=1.0),
+            self.fixture, rows(99.0, 100.0), None)
+        self.assertTrue(evidence["passed"])
+        total = next(check for check in evidence["checks"] if check["name"] == "headline_median_total_ratio")
+        self.assertTrue(total["enforced"])
+        self.assertTrue(total["passed"])
+
+        tied = benchmark.evaluate(
+            args(profile="metal-headline", max_median_ratio=1.0),
+            self.fixture, rows(100.0, 100.0), None)
+        self.assertFalse(tied["passed"])
+        tied_total = next(check for check in tied["checks"] if check["name"] == "headline_median_total_ratio")
+        self.assertFalse(tied_total["passed"])
+
     def test_headline_rejects_less_than_five_percent_win(self) -> None:
         evidence = benchmark.evaluate(args(), self.fixture, rows(96.0, 100.0), None)
         self.assertFalse(evidence["passed"])
@@ -1127,6 +1387,15 @@ class StatisticsAndGateTests(unittest.TestCase):
             if item["enforced"] and not item["passed"]
         }
         self.assertIn("headline_median_total_ratio", failed)
+
+    def test_profile_defaults_keep_cuda_margin_and_use_strict_metal_parity(self) -> None:
+        cuda = benchmark.parse_args(["--model", "/tmp/model.gguf", "--profile", "headline"])
+        metal = benchmark.parse_args(["--model", "/tmp/model.gguf", "--profile", "metal-headline"])
+        self.assertEqual(0.95, cuda.max_median_ratio)
+        self.assertEqual(1.0, metal.max_median_ratio)
+        contract = benchmark.performance_threshold_contract(metal)
+        self.assertEqual(1.0, contract["antfly_llama"]["median_total_latency_ratio_max_exclusive"])
+        self.assertFalse(contract["component_metrics_enforced"])
 
     def test_headline_ttft_paired_ci_rejects_tail_regressions_hidden_by_median(
         self,
@@ -1377,6 +1646,14 @@ class LockTests(unittest.TestCase):
                 hashlib.sha256(b"pairing-v2\n").hexdigest(),
                 second["files"]["pairing_support"]["sha256"],
             )
+            metal = gemma4 / "gemma4_metal_long_output.py"
+            metal.write_text("bundle-v1\n", encoding="utf-8")
+            third = benchmark.harness_provenance(script)
+            metal.write_text("bundle-v2\n", encoding="utf-8")
+            fourth = benchmark.harness_provenance(script)
+            self.assertNotEqual(third["sha256"], fourth["sha256"])
+            self.assertEqual(hashlib.sha256(b"bundle-v2\n").hexdigest(),
+                             fourth["files"]["metal_bundle_support"]["sha256"])
 
     def test_model_bundle_hash_covers_nonhidden_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1478,6 +1755,220 @@ class LockTests(unittest.TestCase):
             errors = benchmark.provenance_validation_errors(namespace, provenance)
             self.assertTrue(any("runtime-path manifest" in error for error in errors))
             self.assertTrue(any("symlinked" in error for error in errors))
+
+    def test_enforced_model_bundle_accepts_only_exact_metadata_generator_manifest(
+        self,
+    ) -> None:
+        accepted = {
+            "type": "generator",
+            "tasks": ["generate"],
+            "inputs": ["text", "image", "audio"],
+        }
+        rejected = (
+            '{"type":"generator","type":"generator","tasks":["generate"],'
+            '"inputs":["text","image","audio"]}',
+            json.dumps(accepted | {"model_path": "/external/model.gguf"}),
+            json.dumps(accepted | {"unknown": True}),
+            json.dumps(accepted | {"type": "reader"}),
+            json.dumps(accepted | {"tasks": ["generate", "embed"]}),
+            json.dumps(accepted | {"inputs": ["image", "text", "audio"]}),
+            json.dumps(accepted | {"inputs": ["text", "image", "audio", "audio"]}),
+            "not-json",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            model_dir = pathlib.Path(temporary) / "model"
+            model_dir.mkdir()
+            decoder = model_dir / "model.gguf"
+            decoder.write_bytes(b"decoder")
+            manifest = model_dir / "model_manifest.json"
+            manifest.write_text(json.dumps(accepted), encoding="utf-8")
+
+            self.assertTrue(benchmark.is_metadata_only_generator_manifest(manifest))
+            self.assertEqual([], benchmark.model_bundle_layout_errors(model_dir))
+            bundle = benchmark.antfly_model_bundle_provenance(
+                decoder, benchmark.path_provenance(decoder)
+            )
+            self.assertEqual([], bundle["layout_errors"])
+            manifest_row = next(
+                item for item in bundle["files"] if item["path"] == "model_manifest.json"
+            )
+            self.assertEqual(benchmark.sha256_file(manifest), manifest_row["sha256"])
+
+            for contents in rejected:
+                with self.subTest(contents=contents):
+                    manifest.write_text(contents, encoding="utf-8")
+                    self.assertFalse(
+                        benchmark.is_metadata_only_generator_manifest(manifest)
+                    )
+                    self.assertTrue(
+                        any(
+                            "runtime-path manifest" in error
+                            for error in benchmark.model_bundle_layout_errors(model_dir)
+                        )
+                    )
+
+            manifest.unlink()
+            (model_dir / "antfly_inference_bundle.json").write_text(
+                json.dumps(accepted), encoding="utf-8"
+            )
+            self.assertTrue(
+                any(
+                    "runtime-path manifest" in error
+                    for error in benchmark.model_bundle_layout_errors(model_dir)
+                )
+            )
+
+    def test_enforced_model_bundle_authenticates_native_completion_receipt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            model_dir = pathlib.Path(temporary) / "model"
+            model_dir.mkdir()
+            decoder = model_dir / "model.gguf"
+            projector = model_dir / "model-mmproj.gguf"
+            manifest = model_dir / "model_manifest.json"
+            decoder.write_bytes(b"decoder")
+            projector.write_bytes(b"projector")
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "type": "generator",
+                        "tasks": ["generate"],
+                        "inputs": ["text", "image", "audio"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source = {
+                "owner": "google",
+                "name": "gemma",
+                "variant": "gguf@revision",
+                "requested_revision": "revision",
+                "resolved_revision": "revision",
+                "selected_format": "gguf",
+            }
+
+            def artifact(path: pathlib.Path) -> dict[str, Any]:
+                return {
+                    "path": path.name,
+                    "size": path.stat().st_size,
+                    "sha256": benchmark.sha256_file(path),
+                }
+
+            receipt_path = model_dir / benchmark.NATIVE_COMPLETION_RECEIPT
+            receipt = {
+                "version": 2,
+                "source": source,
+                "artifacts": [artifact(decoder), artifact(projector), artifact(manifest)],
+            }
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            for row in receipt["artifacts"]:
+                cache = {
+                    "signature": list(range(32)),
+                    "digest": list(bytes.fromhex(row["sha256"])),
+                }
+                (model_dir / (row["path"] + benchmark.NATIVE_SHA256_CACHE_SUFFIX)).write_text(
+                    json.dumps(cache), encoding="utf-8"
+                )
+            bundle = benchmark.antfly_model_bundle_provenance(
+                decoder, benchmark.path_provenance(decoder)
+            )
+            self.assertEqual([], bundle["layout_errors"])
+            self.assertEqual(
+                3,
+                sum(item["path"].endswith(benchmark.NATIVE_SHA256_CACHE_SUFFIX) for item in bundle["files"]),
+            )
+            marker = next(
+                item
+                for item in bundle["files"]
+                if item["path"] == benchmark.NATIVE_COMPLETION_RECEIPT
+            )
+            self.assertEqual(benchmark.sha256_file(receipt_path), marker["sha256"])
+
+            invalid = []
+            wrong_hash = json.loads(json.dumps(receipt))
+            wrong_hash["artifacts"][0]["sha256"] = "0" * 64
+            invalid.append(wrong_hash)
+            wrong_size = json.loads(json.dumps(receipt))
+            wrong_size["artifacts"][0]["size"] += 1
+            invalid.append(wrong_size)
+            traversal = json.loads(json.dumps(receipt))
+            traversal["artifacts"][0]["path"] = "../model.gguf"
+            invalid.append(traversal)
+            duplicate_artifact = json.loads(json.dumps(receipt))
+            duplicate_artifact["artifacts"][1] = duplicate_artifact["artifacts"][0]
+            invalid.append(duplicate_artifact)
+            unknown = json.loads(json.dumps(receipt))
+            unknown["runtime_path"] = "/external/model.gguf"
+            invalid.append(unknown)
+            for value in invalid:
+                with self.subTest(value=value):
+                    receipt_path.write_text(json.dumps(value), encoding="utf-8")
+                    rejected = benchmark.antfly_model_bundle_provenance(
+                        decoder, benchmark.path_provenance(decoder)
+                    )
+                    self.assertTrue(rejected["layout_errors"])
+
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            first = receipt["artifacts"][0]
+            cache_path = model_dir / (first["path"] + benchmark.NATIVE_SHA256_CACHE_SUFFIX)
+            valid_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            duplicate_cache = (
+                '{"signature":'
+                + json.dumps(valid_cache["signature"])
+                + ',"digest":'
+                + json.dumps(valid_cache["digest"])
+                + ',"digest":'
+                + json.dumps(valid_cache["digest"])
+                + "}"
+            )
+            for bad_cache in (
+                {**valid_cache, "digest": [0] * 32},
+                {**valid_cache, "digest": [0] * 31},
+                {**valid_cache, "unknown": True},
+                duplicate_cache,
+                "not-json",
+            ):
+                with self.subTest(bad_cache=bad_cache):
+                    cache_path.write_text(
+                        bad_cache if isinstance(bad_cache, str) else json.dumps(bad_cache),
+                        encoding="utf-8",
+                    )
+                    rejected = benchmark.antfly_model_bundle_provenance(
+                        decoder, benchmark.path_provenance(decoder)
+                    )
+                    self.assertTrue(rejected["layout_errors"])
+            cache_path.write_text(json.dumps(valid_cache), encoding="utf-8")
+            unknown_cache = model_dir / ("unknown.gguf" + benchmark.NATIVE_SHA256_CACHE_SUFFIX)
+            unknown_cache.write_text(json.dumps(valid_cache), encoding="utf-8")
+            self.assertTrue(benchmark.antfly_model_bundle_provenance(decoder, benchmark.path_provenance(decoder))["layout_errors"])
+            unknown_cache.unlink()
+
+            receipt_path.write_text(
+                '{"version":2,"version":2,"source":{},"artifacts":[]}',
+                encoding="utf-8",
+            )
+            duplicate = benchmark.antfly_model_bundle_provenance(
+                decoder, benchmark.path_provenance(decoder)
+            )
+            self.assertTrue(duplicate["layout_errors"])
+
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            for hidden_name in (
+                ".antfly-download-plan.json",
+                ".antfly-download-in-progress",
+                ".other-hidden",
+            ):
+                hidden = model_dir / hidden_name
+                hidden.write_text("{}", encoding="utf-8")
+                with self.subTest(hidden=hidden_name):
+                    rejected = benchmark.antfly_model_bundle_provenance(
+                        decoder, benchmark.path_provenance(decoder)
+                    )
+                    self.assertTrue(
+                        any("hidden model-bundle path" in error for error in rejected["layout_errors"])
+                    )
+                hidden.unlink()
 
     def test_gpu_state_is_structured_and_scoped_to_cuda_visible_devices(self) -> None:
         raw = "\n".join(
@@ -1631,6 +2122,85 @@ class LockTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual("version: 1 (abc123)\nbuilt with GNU 12 for Linux", first)
 
+    def test_llama_build_revision_comes_from_embedded_metadata(self) -> None:
+        parsed = benchmark.parse_llama_build_revision(
+            "version: 0.8.0-dev (build 12077, commit 259d91709)\n"
+            "built with AppleClang 21 for Darwin arm64"
+        )
+        self.assertEqual({"revision": "259d91709", "build_number": 12077}, parsed)
+        self.assertIsNone(benchmark.parse_llama_build_revision("version: unknown"))
+
+    def test_vendored_llama_binary_never_inherits_enclosing_repo_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            tracked = root / "README"
+            tracked.write_text("host repository\n")
+            subprocess.run(["git", "-C", str(root), "add", "README"], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", str(root), "-c", "user.name=test",
+                    "-c", "user.email=test@example.invalid", "commit", "-qm", "host",
+                ],
+                check=True,
+            )
+            binary = root / ".qualification" / "llama-server"
+            binary.parent.mkdir()
+            binary.write_bytes(b"vendored comparator")
+            version = "version: 0.8.0-dev (build 12077, commit 259d91709)"
+            real_command_output = benchmark.command_output
+
+            def output(command: list[str], **kwargs: object) -> str | None:
+                if command == [str(binary.resolve()), "--version"]:
+                    return version
+                return real_command_output(command, **kwargs)
+
+            with mock.patch.object(benchmark, "command_output", side_effect=output):
+                provenance = benchmark.executable_provenance(binary)
+            self.assertFalse(provenance["git"]["available"])
+            self.assertEqual(
+                "enclosing_repository_does_not_track_executable",
+                provenance["git"]["reason"],
+            )
+            self.assertEqual("259d91709", provenance["revision"])
+            self.assertEqual("embedded_build_metadata", provenance["provenance_source"])
+
+    def test_tracked_external_llama_binary_uses_its_own_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            binary = root / "build" / "bin" / "llama-server"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"external comparator")
+            subprocess.run(
+                ["git", "-C", str(root), "add", str(binary.relative_to(root))],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(root), "-c", "user.name=test",
+                    "-c", "user.email=test@example.invalid", "commit", "-qm", "binary",
+                ],
+                check=True,
+            )
+            expected = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+            ).strip()
+            real_command_output = benchmark.command_output
+
+            def output(command: list[str], **kwargs: object) -> str | None:
+                if command == [str(binary.resolve()), "--version"]:
+                    return "llama-server version unavailable"
+                return real_command_output(command, **kwargs)
+
+            with mock.patch.object(benchmark, "command_output", side_effect=output):
+                provenance = benchmark.executable_provenance(binary)
+            self.assertTrue(provenance["git"]["available"])
+            self.assertEqual(expected, provenance["revision"])
+            self.assertEqual(
+                "tracked_executable_git_repository", provenance["provenance_source"]
+            )
+
     def test_dynamic_dependency_closure_hashes_material_shared_objects(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -1655,6 +2225,47 @@ class LockTests(unittest.TestCase):
                 [item["name"] for item in first["material_dependency_files"]],
             )
             self.assertNotEqual(first["sha256"], second["sha256"])
+
+    def test_metal_bundle_lock_detects_a_changed_dylib(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            binary, library = root / "llama-server", root / "libggml-metal.dylib"
+            binary.write_bytes(b"\xcf\xfa\xed\xfefake")
+            library.write_bytes(b"first-build")
+            with mock.patch.object(benchmark, "command_capture", return_value={"returncode": 0, "output": ""}):
+                first = benchmark.dynamic_dependency_provenance(binary)
+                library.write_bytes(b"changed-kernel")
+                second = benchmark.dynamic_dependency_provenance(binary)
+            self.assertTrue(first["is_macho"])
+            self.assertEqual("resolved_bundle", first["status"])
+            self.assertNotEqual(first["sha256"], second["sha256"])
+
+    def test_metal_identity_accepts_current_gpu_family_capability_key(self) -> None:
+        report = {"SPDisplaysDataType": [{"sppci_model": "Apple M4 Pro", "sppci_cores": "16",
+                    "spdisplays_mtlgpufamilysupport": "spdisplays_metal4"}]}
+        with mock.patch.object(benchmark, "command_capture", return_value={"output": json.dumps(report)}), \
+             mock.patch.object(benchmark, "command_output", return_value=str(24 * 1024**3)):
+            identity = benchmark.stable_metal_runtime_identity()
+        self.assertIsNone(identity["gpu_execution_state"]["error"])
+        self.assertEqual("Apple M4 Pro", identity["gpu_execution_state"]["selected_gpus"][0]["name"])
+        policy = benchmark.performance_threshold_contract(args(profile="metal-headline"))
+        self.assertEqual("antfly.gemma4_long_e2e.performance_thresholds.v3", policy["schema"])
+        self.assertIn("paired_ttft_log_ratio_95_ci_upper_max_exclusive", policy["antfly_llama"])
+
+    def test_metal_gate_rejects_missing_hardware_and_bundle_identity(self) -> None:
+        namespace = args(backend="metal", profile="metal-headline")
+        evidence = {
+            "runtime_identity": {"backend": "metal", "physical_memory_bytes": 24 * 1024**3,
+                "gpu_execution_state": {"selected_gpus": [{"name": "Apple M4 Pro"}], "error": None}},
+            "antfly_model_bundle": {"sha256": "model", "files": ["model.gguf"]},
+            "llama_cpp_binary": {"dynamic_dependencies": {
+                "is_macho": True, "status": "resolved_bundle", "sha256": "bundle"}},
+        }
+        with mock.patch.dict(benchmark.os.environ, {}, clear=True):
+            self.assertEqual([], benchmark.provenance_validation_errors(namespace, evidence))
+            evidence["runtime_identity"]["gpu_execution_state"]["selected_gpus"] = []
+            evidence["llama_cpp_binary"]["dynamic_dependencies"]["sha256"] = None
+            self.assertEqual(2, len(benchmark.provenance_validation_errors(namespace, evidence)))
 
     def test_ldd_parser_reports_unresolved_dependencies(self) -> None:
         resolved, unresolved = benchmark.parse_ldd_dependencies(
@@ -1910,6 +2521,42 @@ class LockTests(unittest.TestCase):
         self.assertEqual("f16", namespace.cache_dtype)
         self.assertEqual(1.03, namespace.max_baseline_regression)
 
+    def test_metal_headline_requires_matched_backend_and_total_parity_policy(self) -> None:
+        fixture = benchmark.load_fixture(FIXTURE)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            model = root / "benchmark-model" / "model.gguf"
+            model.parent.mkdir()
+            for path in (root / "antfly", root / "llama-server", root / "lock", model):
+                path.write_bytes(b"fixture")
+            namespace = benchmark.parse_args([
+                "--antfly-bin", str(root / "antfly"),
+                "--llama-server-bin", str(root / "llama-server"),
+                "--model", str(model), "--models-dir", str(root),
+                "--profile", "metal-headline", "--backend", "metal",
+                "--lockfile", str(root / "lock"), "--lockfile-sha256", "0" * 64,
+                "--require-lock", "--max-component-ratio", "1",
+                "--max-ttft-ci-upper", "1", "--max-decode-ci-upper", "1",
+            ])
+            benchmark.validate_args(namespace, fixture)
+            for field, value in (
+                ("backend", "cuda"), ("cache_dtype", "f32"),
+                ("max_median_ratio", 1.01), ("require_lock", False),
+                ("repeats", 9), ("antfly_env", ["ANTFLY_TEST=1"]),
+                ("antfly_server_prefix", "env ANTFLY_TEST=1"),
+            ):
+                old = getattr(namespace, field)
+                setattr(namespace, field, value)
+                try:
+                    with self.subTest(field=field), self.assertRaises(ValueError):
+                        benchmark.validate_args(namespace, fixture)
+                finally:
+                    setattr(namespace, field, old)
+            namespace.max_component_ratio = 1.01
+            namespace.max_ttft_ci_upper = 1.01
+            namespace.max_decode_ci_upper = 1.01
+            benchmark.validate_args(namespace, fixture)
+
     def test_headline_enforcement_rejects_opaque_prefix_for_either_server(self) -> None:
         fixture = benchmark.load_fixture(FIXTURE)
         with tempfile.TemporaryDirectory() as temporary:
@@ -2102,6 +2749,14 @@ class HarnessIntegrationTests(unittest.TestCase):
                         )
                         return
                     if self.path == "/tokenize":
+                        special_ids = {"<eos>": 1, "<turn|>": 2, "<|tool_response>": 1}
+                        if body.get("content") in special_ids:
+                            if body.get("add_special") is not False or body.get("parse_special") is not True:
+                                self.send_error(400, "special-token probe contract differs")
+                                return
+                            self.send_bytes("application/json", json.dumps(
+                                {"tokens": [special_ids[body["content"]]]}).encode())
+                            return
                         if (
                             body.get("content") != reference_prompt
                             or body.get("add_special") is not True
@@ -2111,7 +2766,7 @@ class HarnessIntegrationTests(unittest.TestCase):
                             return
                         self.send_bytes("application/json", json.dumps({"tokens": list(range(2051))}).encode())
                         return
-                    if self.path in ("/ai/v1/generate", "/v1/chat/completions"):
+                    if self.path in ("/ai/v1/generate", "/completion"):
                         expected_model = (
                             "benchmark-model"
                             if self.path == "/ai/v1/generate"
@@ -2120,22 +2775,38 @@ class HarnessIntegrationTests(unittest.TestCase):
                         if body.get("model") != expected_model:
                             self.send_error(400, "generation used the wrong model identifier")
                             return
-                        if body.get("messages") != [{"role": "user", "content": user_content}]:
-                            self.send_error(400, "generation did not receive measured messages")
-                            return
-                        if body.get("chat_template_kwargs") != {"enable_thinking": False}:
-                            self.send_error(400, "generation did not disable thinking")
-                            return
-                        if body.get("max_tokens") != 300 or body.get("ignore_eos") is not True:
+                        if self.path == "/ai/v1/generate":
+                            if body.get("messages") != [{"role": "user", "content": user_content}]:
+                                self.send_error(400, "generation did not receive measured messages")
+                                return
+                            if body.get("fixed_length_mask_eos") is not True:
+                                self.send_error(400, "Antfly fixed-length mask missing")
+                                return
+                            requested = body.get("max_tokens")
+                        else:
+                            if body.get("prompt") != reference_prompt or body.get("return_tokens") is not True:
+                                self.send_error(400, "llama completion did not receive exact prompt/token contract")
+                                return
+                            if body.get("logit_bias") != [[1, False], [2, False], [9, False]]:
+                                self.send_error(400, "llama suppression union differs")
+                                return
+                            requested = body.get("n_predict")
+                        if requested != 300 or body.get("ignore_eos") is not True:
                             self.send_error(400, "generation contract differs")
                             return
-                        cache_field = "cache_prompt" if self.path == "/v1/chat/completions" else "prompt_cache"
+                        cache_field = "cache_prompt" if self.path == "/completion" else "prompt_cache"
                         if body.get(cache_field) is not False:
                             self.send_error(400, "prompt cache was not disabled")
                             return
                         if body.get("stream") and body.get("stream_options") != {"include_usage": True}:
                             self.send_error(400, "stream usage was not requested")
                             return
+                    if not body.get("stream") and self.path == "/completion":
+                        response = {"content": visible_text, "tokens": list(range(100, 400)),
+                                    "tokens_predicted": 300, "tokens_evaluated": 2051,
+                                    "stop": True, "stop_type": "limit"}
+                        self.send_bytes("application/json", json.dumps(response).encode())
+                        return
                     if not body.get("stream"):
                         response = {
                             "choices": [{
@@ -2146,26 +2817,40 @@ class HarnessIntegrationTests(unittest.TestCase):
                         }
                         self.send_bytes("application/json", json.dumps(response).encode())
                         return
-                    chunks = []
-                    for offset in range(0, len(visible_text), 3):
-                        token_text = visible_text[offset:offset + 3]
-                        event = {"choices": [{"delta": {"content": token_text}, "finish_reason": None}]}
-                        chunks.append("data: " + json.dumps(event, separators=(",", ":")) + "\n\n")
-                    # Keep enough already-flushed SSE comment data after the
-                    # last token to prevent HTTPResponse's buffered reader from
-                    # waiting for the delayed final event before yielding it.
-                    chunks.append(":" + "padding" * 10000 + "\n\n")
-                    token_payload = "".join(chunks).encode()
-                    tail_chunks = []
-                    finish = {"choices": [{"delta": {}, "finish_reason": "length"}]}
-                    tail_chunks.append("data: " + json.dumps(finish, separators=(",", ":")) + "\n\n")
-                    if body.get("stream_options") == {"include_usage": True}:
-                        usage = {"choices": [], "usage": {
-                            "prompt_tokens": 2051, "completion_tokens": 300, "total_tokens": 2351,
-                        }}
+                    if self.path == "/completion":
+                        partials = []
+                        for index, token in enumerate(range(100, 400)):
+                            start = index * len(visible_text) // 300
+                            end = (index + 1) * len(visible_text) // 300
+                            partials.append({"content": visible_text[start:end],
+                                             "tokens": [token], "stop": False})
+                        terminal = {"content": "", "tokens": [],
+                                    "tokens_predicted": 300, "tokens_evaluated": 2051,
+                                    "stop": True, "stop_type": "limit"}
+                        token_payload = "".join(
+                            "data: " + json.dumps(event, separators=(",", ":")) + "\n\n"
+                            for event in partials
+                        ).encode()
+                        tail_payload = (("data: " + json.dumps(terminal, separators=(",", ":")) + "\n\n")
+                                        + "data: [DONE]\n\n").encode()
+                    else:
+                        chunks = []
+                        for offset in range(0, len(visible_text), 3):
+                            token_text = visible_text[offset:offset + 3]
+                            event = {"choices": [{"delta": {"content": token_text}, "finish_reason": None}]}
+                            chunks.append("data: " + json.dumps(event, separators=(",", ":")) + "\n\n")
+                        chunks.append(":" + "padding" * 10000 + "\n\n")
+                        token_payload = "".join(chunks).encode()
+                        finish = {"choices": [{"delta": {}, "finish_reason": "length"}]}
+                        tail_chunks = ["data: " + json.dumps(finish, separators=(",", ":")) + "\n\n"]
+                        usage = {"choices": [], "usage": {"prompt_tokens": 2051,
+                                 "completion_tokens": 300, "total_tokens": 2351},
+                                 "generated_token_ids": list(range(100, 400)),
+                                 "applied_suppress_token_ids": [1, 2, 9],
+                                 "eos_token_ids": [1, 2], "fixed_length_mask_eos": True}
                         tail_chunks.append("data: " + json.dumps(usage, separators=(",", ":")) + "\n\n")
-                    tail_chunks.append("data: [DONE]\n\n")
-                    tail_payload = "".join(tail_chunks).encode()
+                        tail_chunks.append("data: [DONE]\n\n")
+                        tail_payload = "".join(tail_chunks).encode()
                     self.send_response(200)
                     self.send_header("content-type", "text/event-stream")
                     self.send_header("transfer-encoding", "chunked")
@@ -2244,7 +2929,7 @@ class HarnessIntegrationTests(unittest.TestCase):
                 evidence["rows"][0]["antfly"]["completion_token_accounting_source"],
             )
             self.assertEqual(
-                "final_sse_usage",
+                "ordered_single_id_stream_partials",
                 evidence["rows"][0]["llama_cpp"]["completion_token_accounting_source"],
             )
             self.assertEqual(
@@ -2324,6 +3009,61 @@ class HarnessIntegrationTests(unittest.TestCase):
             self.assertIn("evidence.json", paths)
             self.assertIn("samples.jsonl", paths)
             self.assertNotIn("evidence_manifest.json", paths)
+
+    def test_generation_connection_is_freshly_primed_after_peer_close(self) -> None:
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("content-length", "0")))
+                rows = [
+                    {"choices": [{"delta": {"content": "x"}, "finish_reason": None}]},
+                    {"choices": [{"delta": {}, "finish_reason": "length"}],
+                     "usage": {"prompt_tokens": 1, "completion_tokens": 2}},
+                ]
+                body = b"".join(
+                    b"data: " + json.dumps(row).encode() + b"\n\n" for row in rows
+                )
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                self.close_connection = True
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        port = httpd.server_address[1]
+        managed = benchmark.ManagedServer(
+            benchmark.ServerSpec("fake", ("fake", "--port", str(port)), "/health", "/completion"),
+            pathlib.Path("unused.log"), {}, 1.0, 2.0,
+        )
+        try:
+            for _ in range(2):
+                prime = managed.prime_generation_connection()
+                sample, _events = managed.post_stream({"stream": True})
+                self.assertTrue(sample["connection_reused"])
+                self.assertEqual(0, prime["generation_retry_count"])
+                self.assertTrue(prime["socket_open_after_health"])
+        finally:
+            if managed.connection is not None:
+                managed.connection.close()
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":

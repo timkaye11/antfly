@@ -20,8 +20,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const Kind = enum { cancel_prefill, cancel_replay, cancel_fit, cancel_publish, oom, nonfinite, gpu_failure };
-pub const Stage = enum { prefill, replay, fit, publish, admission, gpu };
+pub const Kind = enum { cancel_prefill, cancel_replay, cancel_fit, cancel_publish, cancel_future_append, oom, nonfinite, gpu_failure, future_append_failure };
+pub const Stage = enum { prefill, replay, fit, publish, future_append, admission, gpu };
 
 pub const Observation = struct {
     injected: bool = false,
@@ -33,6 +33,7 @@ pub const Observation = struct {
 
 pub const Controller = struct {
     kind: Kind,
+    future_append_index: u32 = 0,
     mutex: std.atomic.Mutex = .unlocked,
     observation: Observation = .{},
 
@@ -42,10 +43,23 @@ pub const Controller = struct {
             .cancel_replay => .replay,
             .cancel_fit => .fit,
             .cancel_publish => .publish,
+            .cancel_future_append => .future_append,
             .oom => .admission,
             .nonfinite => .fit,
             .gpu_failure => .gpu,
+            .future_append_failure => .future_append,
         };
+    }
+
+    pub fn recordFutureAppendFailure(self: *Controller, completed_units: u32, total_units: u32) !void {
+        if (!builtin.is_test or self.kind != .future_append_failure or self.future_append_index == 0 or
+            self.future_append_index > total_units or completed_units != self.future_append_index)
+            return error.UnqualifiedFaultInjection;
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.observation.injected) return error.DuplicateFaultInjection;
+        self.observation = .{ .injected = true, .kind = self.kind, .stage = .future_append, .completed_units = completed_units, .total_units = total_units };
+        return error.ContextMetalDispatchFailed;
     }
 
     /// Record a real request-local tracked allocator failure. The allocation
@@ -106,10 +120,13 @@ pub const Controller = struct {
     pub fn checkpoint(self: *Controller, stage: Stage, completed_units: u32, total_units: u32) !void {
         if (!builtin.is_test) return error.UnqualifiedFaultInjection;
         if (total_units == 0 or completed_units > total_units) return error.InvalidFaultCheckpoint;
-        if (self.kind == .oom or self.kind == .nonfinite or self.kind == .gpu_failure) return;
+        if (self.kind == .oom or self.kind == .nonfinite or self.kind == .gpu_failure or self.kind == .future_append_failure) return;
         if (stage != expectedStage(self.kind)) return;
+        if (stage == .future_append and (self.future_append_index == 0 or self.future_append_index > total_units))
+            return error.InvalidFaultCheckpoint;
         const partial = switch (stage) {
             .prefill, .replay, .fit => completed_units > 0 and completed_units < total_units,
+            .future_append => completed_units == self.future_append_index,
             .publish => completed_units == total_units,
             .admission, .gpu => false,
         };
@@ -185,4 +202,25 @@ test "context GPU completion injection follows real completed work" {
     const observed = controller.snapshot();
     try std.testing.expectEqual(Stage.gpu, observed.stage.?);
     try std.testing.expectEqual(@as(u32, 1), observed.completed_units);
+}
+
+test "future append injections require a genuine completed prefix" {
+    var cancel = Controller{ .kind = .cancel_future_append, .future_append_index = 17 };
+    try cancel.checkpoint(.future_append, 16, 256);
+    try std.testing.expect(!cancel.snapshot().injected);
+    try std.testing.expectError(error.Cancelled, cancel.checkpoint(.future_append, 17, 256));
+    const cancelled = cancel.snapshot();
+    try std.testing.expectEqual(Stage.future_append, cancelled.stage.?);
+    try std.testing.expectEqual(@as(u32, 17), cancelled.completed_units);
+    var fault = Controller{ .kind = .future_append_failure, .future_append_index = 25 };
+    try std.testing.expectError(error.UnqualifiedFaultInjection, fault.recordFutureAppendFailure(24, 256));
+    try std.testing.expectError(error.ContextMetalDispatchFailed, fault.recordFutureAppendFailure(25, 256));
+    const failed = fault.snapshot();
+    try std.testing.expectEqual(Stage.future_append, failed.stage.?);
+    try std.testing.expectEqual(@as(u32, 25), failed.completed_units);
+
+    var zero = Controller{ .kind = .cancel_future_append };
+    try std.testing.expectError(error.InvalidFaultCheckpoint, zero.checkpoint(.future_append, 1, 256));
+    var too_large = Controller{ .kind = .cancel_future_append, .future_append_index = 257 };
+    try std.testing.expectError(error.InvalidFaultCheckpoint, too_large.checkpoint(.future_append, 1, 256));
 }

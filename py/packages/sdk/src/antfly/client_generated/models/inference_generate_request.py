@@ -57,6 +57,14 @@ class InferenceGenerateRequest:
             does not stop on the model's end-of-sequence token and continues until another stop
             condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
              Default: False.
+        fixed_length_mask_eos (bool | Unset): Qualification-only fixed-length greedy policy. When true, every primary
+            and additional
+            end-of-sequence token is suppressed from request-local token selection until `max_tokens`
+            is reached. Requires `ignore_eos=true`, deterministic greedy sampling, and no speculative
+            decoding. HTTP serving also requires the operator qualification opt-in
+            `ANTFLY_INFERENCE_JSON_TOKEN_IDS=1`. Omitted or false preserves the existing `ignore_eos`
+            behavior.
+             Default: False.
         tools (list[InferenceTool] | Unset): List of tools (functions) the model can call.
             Only supported by models with tool_call_format configured.
         min_p (float | Unset): Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to
@@ -140,6 +148,7 @@ class InferenceGenerateRequest:
     stream_options: InferenceGenerateStreamOptions | Unset = UNSET
     chat_template_kwargs: InferenceGenerateChatTemplateKwargs | Unset = UNSET
     ignore_eos: bool | Unset = False
+    fixed_length_mask_eos: bool | Unset = False
     tools: list[InferenceTool] | Unset = UNSET
     min_p: float | Unset = 0.0
     repetition_penalty: float | Unset = 1.0
@@ -195,6 +204,8 @@ class InferenceGenerateRequest:
             chat_template_kwargs = self.chat_template_kwargs.to_dict()
 
         ignore_eos = self.ignore_eos
+
+        fixed_length_mask_eos = self.fixed_length_mask_eos
 
         tools: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.tools, Unset):
@@ -299,6 +310,8 @@ class InferenceGenerateRequest:
             field_dict["chat_template_kwargs"] = chat_template_kwargs
         if ignore_eos is not UNSET:
             field_dict["ignore_eos"] = ignore_eos
+        if fixed_length_mask_eos is not UNSET:
+            field_dict["fixed_length_mask_eos"] = fixed_length_mask_eos
         if tools is not UNSET:
             field_dict["tools"] = tools
         if min_p is not UNSET:
@@ -397,6 +410,8 @@ class InferenceGenerateRequest:
             chat_template_kwargs = InferenceGenerateChatTemplateKwargs.from_dict(_chat_template_kwargs)
 
         ignore_eos = d.pop("ignore_eos", UNSET)
+
+        fixed_length_mask_eos = d.pop("fixed_length_mask_eos", UNSET)
 
         _tools = d.pop("tools", UNSET)
         tools: list[InferenceTool] | Unset = UNSET
@@ -529,6 +544,7 @@ class InferenceGenerateRequest:
             stream_options=stream_options,
             chat_template_kwargs=chat_template_kwargs,
             ignore_eos=ignore_eos,
+            fixed_length_mask_eos=fixed_length_mask_eos,
             tools=tools,
             min_p=min_p,
             repetition_penalty=repetition_penalty,

@@ -160,6 +160,45 @@ pub const State = struct {
     }
 };
 
+/// Validates one authenticated source head without requiring sibling payloads.
+/// Streaming preparation uses this before fitting or cloning a leased head.
+pub fn validateHeadForSource(head: Head, logical_length: u64, window: u32, limits: Limits, control: Control) !void {
+    try control.check();
+    const rows = head.positions.len;
+    try validateFp8(head, window);
+    if (logical_length == 0 or logical_length > limits.max_tokens or head.dim == 0 or head.dim > limits.max_head_dim or
+        head.compacted_until > logical_length or (window != 0 and head.compacted_until != 0) or rows == 0 or rows > logical_length or
+        head.coverage_ends.len != rows or head.bias.len != rows or head.keys.len != try mul(rows, head.dim) or head.values.len != head.keys.len)
+        return error.InvalidKvCheckpoint;
+    try validatePacked(head, window, control);
+    try finiteWithControl(head.keys, control);
+    try finiteWithControl(head.values, control);
+    try finiteWithControl(head.bias, control);
+    const local_rows = @min(window, logical_length);
+    if (window > 0 and rows != local_rows) return error.InvalidKvCheckpoint;
+    var next_exact = head.compacted_until;
+    var prefix_end: u64 = 0;
+    for (head.positions, head.coverage_ends, head.bias, 0..) |pos, end, bias, row| {
+        if (row % 1024 == 0) try control.check();
+        if (pos >= logical_length or end <= pos or end > logical_length or
+            (row > 0 and (pos <= head.positions[row - 1] or end < head.coverage_ends[row - 1])))
+            return error.InvalidKvCheckpoint;
+        if (window > 0 and (pos != logical_length - local_rows + row or end != pos + 1 or bias != 0))
+            return error.InvalidKvCheckpoint;
+        if (window == 0) {
+            if (pos < head.compacted_until) {
+                if (end > head.compacted_until) return error.InvalidKvCheckpoint;
+                prefix_end = end;
+            } else {
+                if (pos != next_exact or end != pos + 1 or bias != 0) return error.InvalidKvCheckpoint;
+                next_exact += 1;
+            }
+        }
+    }
+    if (window == 0 and (next_exact != logical_length or prefix_end != head.compacted_until))
+        return error.InvalidKvCheckpoint;
+}
+
 pub const Limits = struct {
     max_file_bytes: usize = 512 * 1024 * 1024,
     max_state_bytes: usize = 512 * 1024 * 1024,
@@ -317,6 +356,271 @@ pub fn encode(allocator: std.mem.Allocator, state: State, limits: Limits) ![]u8 
 }
 
 pub const ExportDigest = struct { integrity_sha256: [32]u8, file_sha256: [32]u8, bytes: usize };
+
+pub const StreamingDonor = struct { layer: u32, window: u32, head_count: usize };
+pub const StreamingMetadata = struct {
+    identity: Identity,
+    logical_length: u64,
+    tokens: []const u32,
+    logits: []const f32,
+    layer_donors: []const u32,
+    donors: []const StreamingDonor,
+};
+pub const StreamingHeadLease = struct {
+    context: ?*anyopaque,
+    close_fn: *const fn (?*anyopaque, *StreamingHeadLease) void,
+    donor: usize,
+    head_index: usize,
+    head: Head,
+    closed: bool = false,
+    pub fn deinit(self: *@This()) void {
+        if (self.closed) @panic("checkpoint streaming head closed twice");
+        self.close_fn(self.context, self);
+        self.closed = true;
+    }
+};
+pub const StreamingHeadProvider = struct {
+    context: ?*anyopaque,
+    open_fn: *const fn (?*anyopaque, usize, usize, Control) anyerror!StreamingHeadLease,
+    verify_empty_fn: *const fn (?*anyopaque) anyerror!void,
+    pub fn open(self: @This(), donor: usize, head_index: usize, control: Control) !StreamingHeadLease {
+        var lease = try self.open_fn(self.context, donor, head_index, control);
+        if (lease.closed or lease.donor != donor or lease.head_index != head_index) {
+            if (!lease.closed) lease.deinit();
+            return error.InvalidKvCheckpoint;
+        }
+        return lease;
+    }
+};
+
+fn validateStreamingMetadata(metadata: StreamingMetadata, limits: Limits, control: Control) !void {
+    if (metadata.logical_length == 0 or metadata.logical_length > limits.max_tokens or metadata.tokens.len != metadata.logical_length or metadata.logits.len == 0 or metadata.logits.len > limits.max_vocab or metadata.layer_donors.len == 0 or metadata.layer_donors.len > limits.max_layers or metadata.donors.len == 0 or metadata.donors.len > metadata.layer_donors.len) return error.InvalidKvCheckpoint;
+    for (metadata.tokens, 0..) |token, index| {
+        if (index % 4096 == 0) try control.check();
+        if (token >= metadata.logits.len) return error.InvalidKvCheckpoint;
+    }
+    try finiteWithControl(metadata.logits, control);
+    for (metadata.donors, 0..) |donor, index| if (donor.head_count == 0 or donor.head_count > limits.max_kv_heads or donor.layer >= metadata.layer_donors.len or metadata.layer_donors[donor.layer] != index or (index > 0 and metadata.donors[index - 1].layer >= donor.layer)) return error.InvalidKvCheckpoint;
+    for (metadata.layer_donors, 0..) |donor, layer| if (donor >= metadata.donors.len or metadata.donors[donor].layer > layer) return error.InvalidKvCheckpoint;
+}
+
+fn streamingEncodedSize(metadata: StreamingMetadata, provider: StreamingHeadProvider, limits: Limits, encoding: Encoding, control: Control) !usize {
+    var size = try add(header_bytes, 8 + 4 * 4);
+    size = try add(size, try mul(try add(try add(metadata.tokens.len, metadata.logits.len), metadata.layer_donors.len), 4));
+    for (metadata.donors, 0..) |donor, donor_index| {
+        size = try add(size, 12);
+        for (0..donor.head_count) |head_index| {
+            var lease = try provider.open(donor_index, head_index, control);
+            defer lease.deinit();
+            try validateHeadForSource(lease.head, metadata.logical_length, donor.window, limits, control);
+            const head = lease.head;
+            if (encoding != .rotated4 and head.compressed.spans.len != 0) return error.KvStoragePrecisionMismatch;
+            size = try add(size, 16);
+            size = try add(size, try mul(head.positions.len, 20));
+            if (encoding == .rotated4) {
+                size = try add(size, try add(16, head.compressed.bytes()));
+                size = try add(size, try mul(try mul(head.positions.len - head.compressed.rows(), head.dim), 4));
+            } else {
+                size = try add(size, 16);
+                const fp8 = if (encoding == .fp8) head.fp8 else codec.Fp8{};
+                const dense = try mul(head.keys.len, 4);
+                const saved = try mul(try mul(fp8.rows, head.dim), 2);
+                if (saved > dense) return error.InvalidKvCheckpoint;
+                size = try add(size, dense - saved);
+                for (head.keys, head.values, 0..) |key, value, i| {
+                    if (i % 4096 == 0) try control.check();
+                    const begin = @as(usize, fp8.first_row) * head.dim;
+                    const end = begin + @as(usize, fp8.rows) * head.dim;
+                    _ = try encodedValue(key, fp8.key_scale, i >= begin and i < end);
+                    _ = try encodedValue(value, fp8.value_scale, i >= begin and i < end);
+                }
+            }
+        }
+    }
+    try provider.verify_empty_fn(provider.context);
+    if (size > limits.max_file_bytes) return error.KvCheckpointLimit;
+    return size;
+}
+
+pub fn encodedSizeFromProvider(metadata: StreamingMetadata, provider: StreamingHeadProvider, limits: Limits, encoding: Encoding, control: Control) !usize {
+    if (encoding == .f32) return error.UnsupportedKvCheckpoint;
+    try validateStreamingMetadata(metadata, limits, control);
+    return streamingEncodedSize(metadata, provider, limits, encoding, control);
+}
+
+/// Providers are opened twice: once to size and once to write. Implementations
+/// must keep the source immutable across both passes. Revalidation below makes
+/// shape drift fail before that head's bytes are emitted; the final byte-count
+/// check rejects encoded-size drift before the integrity footer is published.
+fn writeStreamingPayload(w: anytype, metadata: StreamingMetadata, provider: StreamingHeadProvider, limits: Limits, encoding: Encoding, control: Control) !void {
+    try w.int(u64, metadata.logical_length);
+    try w.int(u32, @intCast(metadata.tokens.len));
+    try w.int(u32, @intCast(metadata.logits.len));
+    try w.int(u32, @intCast(metadata.layer_donors.len));
+    try w.int(u32, @intCast(metadata.donors.len));
+    try w.slice(u32, metadata.tokens);
+    try w.slice(f32, metadata.logits);
+    try w.slice(u32, metadata.layer_donors);
+    for (metadata.donors, 0..) |donor, donor_index| {
+        try w.int(u32, donor.layer);
+        try w.int(u32, donor.window);
+        try w.int(u32, @intCast(donor.head_count));
+        for (0..donor.head_count) |head_index| {
+            var lease = try provider.open(donor_index, head_index, control);
+            defer lease.deinit();
+            const head = lease.head;
+            try validateHeadForSource(head, metadata.logical_length, donor.window, limits, control);
+            try w.int(u32, head.dim);
+            try w.int(u32, @intCast(head.positions.len));
+            try w.int(u64, head.compacted_until);
+            const q = if (encoding == .fp8) head.fp8 else codec.Fp8{};
+            if (encoding == .rotated4) {
+                try w.int(u32, head.compressed.version);
+                try w.int(u32, @intCast(head.compressed.spans.len));
+                try w.int(u32, @intCast(head.compressed.rows()));
+                try w.int(u32, 0);
+                for (head.compressed.spans) |span| {
+                    try w.int(u32, span.first);
+                    try w.int(u32, span.rows);
+                    try w.int(u32, span.offset);
+                }
+            } else {
+                try w.int(u32, q.first_row);
+                try w.int(u32, q.rows);
+                try w.int(u32, @bitCast(q.key_scale));
+                try w.int(u32, @bitCast(q.value_scale));
+            }
+            try w.slice(u64, head.positions);
+            try w.slice(u64, head.coverage_ends);
+            if (encoding == .rotated4) {
+                try w.slice(u8, head.compressed.keys);
+                try w.slice(u8, head.compressed.values);
+                for ([_][]const f32{ head.keys, head.values }) |values| for (0..head.positions.len) |row| {
+                    if (head.compressed.index(row) == .compressed) continue;
+                    for (values[row * head.dim ..][0..head.dim]) |value| try w.int(u16, try encodedValue(value, 1, false));
+                };
+            } else {
+                try writeValues(w, head.keys, head.dim, q, q.key_scale);
+                try writeValues(w, head.values, head.dim, q, q.value_scale);
+            }
+            try w.slice(f32, head.bias);
+        }
+    }
+    try provider.verify_empty_fn(provider.context);
+}
+
+pub fn exportEncodedFromProvider(metadata: StreamingMetadata, provider: StreamingHeadProvider, limits: Limits, encoding: Encoding, sink: anytype, control: Control) !ExportDigest {
+    if (encoding == .f32) return error.UnsupportedKvCheckpoint;
+    try validateStreamingMetadata(metadata, limits, control);
+    const size = try streamingEncodedSize(metadata, provider, limits, encoding, control);
+    var header: [digest_offset]u8 = undefined;
+    var h: Encoder = .{ .bytes = &header };
+    try h.raw(magic);
+    try h.int(u32, encoding.wireVersion());
+    try h.int(u32, @intFromBool(encoding == .fp8));
+    try h.int(u64, size - header_bytes);
+    inline for (.{ "weights", "tokenizer", "template", "layout" }) |field| try h.raw(&@field(metadata.identity, field));
+    var w: StreamEncoder(@TypeOf(sink)) = .{ .sink = sink, .control = control, .streaming_hash = true };
+    try w.slice(u8, &header);
+    try writeStreamingPayload(&w, metadata, provider, limits, encoding, control);
+    try w.flush();
+    if (w.written_bytes != size - (header_bytes - digest_offset)) return error.InvalidKvCheckpoint;
+    try control.check();
+    const digest = w.hash.peek();
+    try sink.writeAll(&digest);
+    w.hash.update(&digest);
+    try control.check();
+    return .{ .integrity_sha256 = digest, .file_sha256 = w.hash.finalResult(), .bytes = size };
+}
+
+test "streaming head provider emits byte exact AFATT002 artifacts for every production codec" {
+    const Fake = struct {
+        state: State,
+        live: bool = false,
+        fn open(raw: ?*anyopaque, donor: usize, head_index: usize, _: Control) !StreamingHeadLease {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.live) return error.InvalidKvCheckpoint;
+            self.live = true;
+            return .{ .context = self, .close_fn = close, .donor = donor, .head_index = head_index, .head = self.state.donors[donor].heads[head_index] };
+        }
+        fn close(raw: ?*anyopaque, _: *StreamingHeadLease) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            std.debug.assert(self.live);
+            self.live = false;
+        }
+        fn empty(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.live) return error.IncompleteContextAllocationScope;
+        }
+    };
+    const donors = [_]StreamingDonor{.{ .layer = codec_test_state.donors[0].layer, .window = codec_test_state.donors[0].window, .head_count = codec_test_state.donors[0].heads.len }};
+    const Sink = struct {
+        bytes: []u8,
+        at: usize = 0,
+        fn writeAll(self: *@This(), value: []const u8) !void {
+            if (value.len > self.bytes.len - self.at) return error.InvalidKvCheckpoint;
+            @memcpy(self.bytes[self.at..][0..value.len], value);
+            self.at += value.len;
+        }
+    };
+    inline for (.{ Encoding.f16, Encoding.fp8, Encoding.rotated4 }) |encoding| {
+        const expected = try encodeWithEncoding(std.testing.allocator, codec_test_state, .{}, encoding, .{});
+        defer std.testing.allocator.free(expected);
+        const actual = try std.testing.allocator.alloc(u8, expected.len);
+        defer std.testing.allocator.free(actual);
+        var fake: Fake = .{ .state = codec_test_state };
+        var sink: Sink = .{ .bytes = actual };
+        const digest = try exportEncodedFromProvider(.{ .identity = codec_test_state.identity, .logical_length = codec_test_state.logical_length, .tokens = codec_test_state.tokens, .logits = codec_test_state.logits, .layer_donors = codec_test_state.layer_donors, .donors = &donors }, .{ .context = &fake, .open_fn = Fake.open, .verify_empty_fn = Fake.empty }, .{}, encoding, &sink, .{});
+        try std.testing.expectEqual(expected.len, digest.bytes);
+        try std.testing.expectEqual(expected.len, sink.at);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        try std.testing.expect(!fake.live);
+    }
+}
+
+test "streaming head provider rejects second pass shape drift before footer and closes lease" {
+    const Fake = struct {
+        state: State,
+        opens: usize = 0,
+        closes: usize = 0,
+        live: bool = false,
+        fn open(raw: ?*anyopaque, donor: usize, head_index: usize, _: Control) !StreamingHeadLease {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.live) return error.InvalidKvCheckpoint;
+            self.live = true;
+            self.opens += 1;
+            var head = self.state.donors[donor].heads[head_index];
+            if (self.opens > self.state.donors[donor].heads.len) head.dim += 1;
+            return .{ .context = self, .close_fn = close, .donor = donor, .head_index = head_index, .head = head };
+        }
+        fn close(raw: ?*anyopaque, _: *StreamingHeadLease) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            std.debug.assert(self.live);
+            self.live = false;
+            self.closes += 1;
+        }
+        fn empty(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.live) return error.IncompleteContextAllocationScope;
+        }
+    };
+    const Sink = struct {
+        bytes: usize = 0,
+        footer_writes: usize = 0,
+        fn writeAll(self: *@This(), value: []const u8) !void {
+            self.bytes = try std.math.add(usize, self.bytes, value.len);
+            if (value.len == 32) self.footer_writes += 1;
+        }
+    };
+    const donors = [_]StreamingDonor{.{ .layer = codec_test_state.donors[0].layer, .window = codec_test_state.donors[0].window, .head_count = codec_test_state.donors[0].heads.len }};
+    var fake: Fake = .{ .state = codec_test_state };
+    var sink: Sink = .{};
+    try std.testing.expectError(error.InvalidKvCheckpoint, exportEncodedFromProvider(.{ .identity = codec_test_state.identity, .logical_length = codec_test_state.logical_length, .tokens = codec_test_state.tokens, .logits = codec_test_state.logits, .layer_donors = codec_test_state.layer_donors, .donors = &donors }, .{ .context = &fake, .open_fn = Fake.open, .verify_empty_fn = Fake.empty }, .{}, .f16, &sink, .{}));
+    try std.testing.expectEqual(codec_test_state.donors[0].heads.len + 1, fake.opens);
+    try std.testing.expectEqual(fake.opens, fake.closes);
+    try std.testing.expect(!fake.live);
+    try std.testing.expectEqual(@as(usize, 0), sink.footer_writes);
+}
 
 fn validateFp8(head: Head, window: u32) !void {
     const q = head.fp8;
@@ -623,12 +927,14 @@ fn StreamEncoder(comptime Sink: type) type {
         streaming_hash: bool = false,
         buffer: [16 * 1024]u8 = undefined,
         used: usize = 0,
+        written_bytes: usize = 0,
         fn flush(self: *@This()) !void {
             try self.control.check();
             if (self.used == 0) return;
             if (self.streaming_hash) {
                 self.hash.update(self.buffer[0..self.used]);
                 try self.sink.writeAll(self.buffer[0..self.used]);
+                self.written_bytes = std.math.add(usize, self.written_bytes, self.used) catch return error.InvalidKvCheckpoint;
             } else if (self.hashing) self.hash.update(self.buffer[0..self.used]) else try self.sink.writeAll(self.buffer[0..self.used]);
             self.used = 0;
         }
@@ -748,6 +1054,16 @@ const Decoder = struct {
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, expected: Identity, limits: Limits) !Owned {
     return decodeWithControl(allocator, bytes, expected, limits, .{});
+}
+
+/// Authenticate the codec namespace in a complete checkpoint header without
+/// allocating or decoding its payload. Payload integrity remains the caller's
+/// responsibility through `decodeWithControl` or the streaming decoder.
+pub fn encodedWireEncoding(bytes: []const u8) !Encoding {
+    if (bytes.len < header_bytes or !std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidKvCheckpoint;
+    const wire_version = std.mem.readInt(u32, bytes[8..12], .little);
+    const flags = std.mem.readInt(u32, bytes[12..16], .little);
+    return wireEncoding(wire_version, flags);
 }
 
 pub fn decodeWithControl(allocator: std.mem.Allocator, bytes: []const u8, expected: Identity, limits: Limits, control: Control) !Owned {
@@ -1548,6 +1864,15 @@ test "checkpoint streaming import bounds large array reads and unwinds a partial
 const codec_test_values: [24]f32 = .{ -0.0, 0.000000059604644775390625, 65504, -65504, 1.0625, 2, 3, 4 } ++ @as([8]f32, @splat(1.125)) ++ @as([8]f32, @splat(1.0625));
 const codec_test_head: Head = .{ .dim = 8, .compacted_until = 2, .positions = &.{ 0, 1, 2 }, .coverage_ends = &.{ 1, 2, 3 }, .keys = &codec_test_values, .values = &codec_test_values, .bias = &.{ 0, 0.69, 0 }, .fp8 = .{ .first_row = 1, .rows = 1 } };
 const codec_test_state: State = .{ .identity = test_identity, .logical_length = 3, .tokens = &.{ 0, 0, 0 }, .logits = &.{0.1234567}, .layer_donors = &.{0}, .donors = &.{.{ .heads = &.{codec_test_head} }} };
+
+test "context checkpoint wire encoding authority distinguishes all prepared quality codecs" {
+    inline for (.{ Encoding.f16, Encoding.fp8, Encoding.rotated4 }) |encoding| {
+        const bytes = try encodeWithEncoding(std.testing.allocator, codec_test_state, .{}, encoding, .{});
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqual(encoding, try encodedWireEncoding(bytes));
+    }
+    try std.testing.expectError(error.InvalidKvCheckpoint, encodedWireEncoding("AFKV"));
+}
 
 fn codecAllocationFailures(a: std.mem.Allocator, encoding: Encoding) !void {
     const bytes = try encodeWithEncoding(a, codec_test_state, .{}, encoding, .{});

@@ -10,16 +10,20 @@ from ...models.inference_error import InferenceError
 from ...models.inference_generate_request import InferenceGenerateRequest
 from ...models.inference_transient_capacity_error import InferenceTransientCapacityError
 from ...models.prepare_native_kv_checkpoint_x_antfly_kv_encoding import PrepareNativeKvCheckpointXAntflyKVEncoding
-from ...types import File, Response, Unset
+from ...types import UNSET, File, Response, Unset
 
 
 def _get_kwargs(
     *,
     body: InferenceGenerateRequest,
+    accept: str | Unset = UNSET,
     x_antfly_kv_encoding: PrepareNativeKvCheckpointXAntflyKVEncoding
     | Unset = PrepareNativeKvCheckpointXAntflyKVEncoding.F16,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+    if not isinstance(accept, Unset):
+        headers["Accept"] = accept
+
     if not isinstance(x_antfly_kv_encoding, Unset):
         headers["X-Antfly-KV-Encoding"] = str(x_antfly_kv_encoding)
 
@@ -53,6 +57,11 @@ def _parse_response(
         response_401 = InferenceError.from_dict(response.json())
 
         return response_401
+
+    if response.status_code == 406:
+        response_406 = InferenceError.from_dict(response.json())
+
+        return response_406
 
     if response.status_code == 413:
         response_413 = InferenceError.from_dict(response.json())
@@ -90,6 +99,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceGenerateRequest,
+    accept: str | Unset = UNSET,
     x_antfly_kv_encoding: PrepareNativeKvCheckpointXAntflyKVEncoding
     | Unset = PrepareNativeKvCheckpointXAntflyKVEncoding.F16,
 ) -> Response[File | InferenceError | InferenceTransientCapacityError]:
@@ -104,7 +114,10 @@ def sync_detailed(
     to f16 and reject other cache precisions. Draft models, media, prompt caches, compiled/graph
     execution and other context/cache policies are unsupported.
 
-    The response is an AFATT001 envelope: JSON metadata followed by exactly
+    The response is an AFATT001 or AFATT002 envelope, selected from Accept:
+    AFATT002 uses application/vnd.antfly.attachments.v2 and carries opaque
+    prepared-producer authority; AFATT001 remains application/vnd.antfly.attachments.v1.
+    Both contain JSON metadata followed by exactly
     one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
     a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions,
     fitted global KV,
@@ -121,6 +134,7 @@ def sync_detailed(
     concurrent native checkpoint work and returns a retryable response when busy.
 
     Args:
+        accept (str | Unset):
         x_antfly_kv_encoding (PrepareNativeKvCheckpointXAntflyKVEncoding | Unset):  Default:
             PrepareNativeKvCheckpointXAntflyKVEncoding.F16.
         body (InferenceGenerateRequest):
@@ -135,6 +149,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         body=body,
+        accept=accept,
         x_antfly_kv_encoding=x_antfly_kv_encoding,
     )
 
@@ -149,6 +164,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceGenerateRequest,
+    accept: str | Unset = UNSET,
     x_antfly_kv_encoding: PrepareNativeKvCheckpointXAntflyKVEncoding
     | Unset = PrepareNativeKvCheckpointXAntflyKVEncoding.F16,
 ) -> File | InferenceError | InferenceTransientCapacityError | None:
@@ -163,7 +179,10 @@ def sync(
     to f16 and reject other cache precisions. Draft models, media, prompt caches, compiled/graph
     execution and other context/cache policies are unsupported.
 
-    The response is an AFATT001 envelope: JSON metadata followed by exactly
+    The response is an AFATT001 or AFATT002 envelope, selected from Accept:
+    AFATT002 uses application/vnd.antfly.attachments.v2 and carries opaque
+    prepared-producer authority; AFATT001 remains application/vnd.antfly.attachments.v1.
+    Both contain JSON metadata followed by exactly
     one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
     a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions,
     fitted global KV,
@@ -180,6 +199,7 @@ def sync(
     concurrent native checkpoint work and returns a retryable response when busy.
 
     Args:
+        accept (str | Unset):
         x_antfly_kv_encoding (PrepareNativeKvCheckpointXAntflyKVEncoding | Unset):  Default:
             PrepareNativeKvCheckpointXAntflyKVEncoding.F16.
         body (InferenceGenerateRequest):
@@ -195,6 +215,7 @@ def sync(
     return sync_detailed(
         client=client,
         body=body,
+        accept=accept,
         x_antfly_kv_encoding=x_antfly_kv_encoding,
     ).parsed
 
@@ -203,6 +224,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceGenerateRequest,
+    accept: str | Unset = UNSET,
     x_antfly_kv_encoding: PrepareNativeKvCheckpointXAntflyKVEncoding
     | Unset = PrepareNativeKvCheckpointXAntflyKVEncoding.F16,
 ) -> Response[File | InferenceError | InferenceTransientCapacityError]:
@@ -217,7 +239,10 @@ async def asyncio_detailed(
     to f16 and reject other cache precisions. Draft models, media, prompt caches, compiled/graph
     execution and other context/cache policies are unsupported.
 
-    The response is an AFATT001 envelope: JSON metadata followed by exactly
+    The response is an AFATT001 or AFATT002 envelope, selected from Accept:
+    AFATT002 uses application/vnd.antfly.attachments.v2 and carries opaque
+    prepared-producer authority; AFATT001 remains application/vnd.antfly.attachments.v1.
+    Both contain JSON metadata followed by exactly
     one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
     a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions,
     fitted global KV,
@@ -234,6 +259,7 @@ async def asyncio_detailed(
     concurrent native checkpoint work and returns a retryable response when busy.
 
     Args:
+        accept (str | Unset):
         x_antfly_kv_encoding (PrepareNativeKvCheckpointXAntflyKVEncoding | Unset):  Default:
             PrepareNativeKvCheckpointXAntflyKVEncoding.F16.
         body (InferenceGenerateRequest):
@@ -248,6 +274,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         body=body,
+        accept=accept,
         x_antfly_kv_encoding=x_antfly_kv_encoding,
     )
 
@@ -260,6 +287,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceGenerateRequest,
+    accept: str | Unset = UNSET,
     x_antfly_kv_encoding: PrepareNativeKvCheckpointXAntflyKVEncoding
     | Unset = PrepareNativeKvCheckpointXAntflyKVEncoding.F16,
 ) -> File | InferenceError | InferenceTransientCapacityError | None:
@@ -274,7 +302,10 @@ async def asyncio(
     to f16 and reject other cache precisions. Draft models, media, prompt caches, compiled/graph
     execution and other context/cache policies are unsupported.
 
-    The response is an AFATT001 envelope: JSON metadata followed by exactly
+    The response is an AFATT001 or AFATT002 envelope, selected from Accept:
+    AFATT002 uses application/vnd.antfly.attachments.v2 and carries opaque
+    prepared-producer authority; AFATT001 remains application/vnd.antfly.attachments.v1.
+    Both contain JSON metadata followed by exactly
     one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
     a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions,
     fitted global KV,
@@ -291,6 +322,7 @@ async def asyncio(
     concurrent native checkpoint work and returns a retryable response when busy.
 
     Args:
+        accept (str | Unset):
         x_antfly_kv_encoding (PrepareNativeKvCheckpointXAntflyKVEncoding | Unset):  Default:
             PrepareNativeKvCheckpointXAntflyKVEncoding.F16.
         body (InferenceGenerateRequest):
@@ -307,6 +339,7 @@ async def asyncio(
         await asyncio_detailed(
             client=client,
             body=body,
+            accept=accept,
             x_antfly_kv_encoding=x_antfly_kv_encoding,
         )
     ).parsed

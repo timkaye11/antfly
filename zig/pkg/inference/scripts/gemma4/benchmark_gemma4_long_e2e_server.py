@@ -38,6 +38,7 @@ import os
 import pathlib
 import platform
 import random
+import re
 import shlex
 import signal
 import socket
@@ -64,6 +65,7 @@ from paired_benchmark import (
 EVIDENCE_SCHEMA = "antfly.gemma4_long_e2e.v1"
 LOCK_SCHEMA = "antfly.gemma4_long_e2e.lock.v1"
 FIXTURE_SCHEMA = "antfly.prompt_fixture.v1"
+FIXTURE_SCHEMA_V2 = "antfly.prompt_fixture.v2"
 ENGINES = ("antfly", "llama_cpp")
 CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 REFERENCE_CHAT_PREFIX = "<|turn>user\n"
@@ -82,7 +84,8 @@ LLAMA_CHAT_TEMPLATE = (
     "{%- endif -%}"
 )
 PROFILE_DEFAULTS = {
-    "headline": {"cache_dtype": "f16", "max_baseline_regression": None},
+    "headline": {"cache_dtype": "f16", "max_baseline_regression": None, "max_median_ratio": 0.95},
+    "metal-headline": {"cache_dtype": "f16", "max_baseline_regression": None, "max_median_ratio": 1.0},
     "e2b-regression": {"cache_dtype": "f16", "max_baseline_regression": 1.03},
     "e4b-regression": {"cache_dtype": "f16", "max_baseline_regression": 1.03},
     "f32-control": {"cache_dtype": "f32", "max_baseline_regression": 1.05},
@@ -330,6 +333,13 @@ MATERIAL_TUNING_ENV_PREFIXES = (
     "JEMALLOC_",
     "TCMALLOC_",
 )
+NON_MATERIAL_BENCHMARK_GUARD_ENV = frozenset(
+    {
+        "ANTFLY_BENCHMARK_GUARD_FD",
+        "ANTFLY_BENCHMARK_GUARD_OWNER_PID",
+        "ANTFLY_BENCHMARK_GUARD_TOKEN",
+    }
+)
 ANTFLY_ENV_OVERRIDE_PREFIXES = (
     "ANTFLY_",
     "TERMITE_",
@@ -394,6 +404,8 @@ UNSAFE_MODEL_CONTROL_FILES = {
     "antfly_inference_variants.json",
     "model_manifest.json",
 }
+NATIVE_COMPLETION_RECEIPT = ".antfly-download-complete.json"
+NATIVE_SHA256_CACHE_SUFFIX = ".antfly-sha256-cache"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -449,7 +461,9 @@ def canonical_sha256(value: object) -> str:
 
 
 def is_material_tuning_env(name: str) -> bool:
-    return any(name.startswith(prefix) for prefix in MATERIAL_TUNING_ENV_PREFIXES)
+    return name not in NON_MATERIAL_BENCHMARK_GUARD_ENV and any(
+        name.startswith(prefix) for prefix in MATERIAL_TUNING_ENV_PREFIXES
+    )
 
 
 def is_antfly_env_override(name: str) -> bool:
@@ -719,7 +733,7 @@ def load_fixture(path: pathlib.Path) -> PromptFixture:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"could not read prompt fixture {path}: {exc}") from exc
-    if raw.get("schema") != FIXTURE_SCHEMA:
+    if raw.get("schema") not in {FIXTURE_SCHEMA, FIXTURE_SCHEMA_V2}:
         raise ValueError(f"unsupported prompt fixture schema: {raw.get('schema')!r}")
     segment = raw.get("segment")
     suffix = raw.get("suffix")
@@ -741,9 +755,11 @@ def load_fixture(path: pathlib.Path) -> PromptFixture:
     reference_suffix = raw.get("reference_chat_suffix")
     if not isinstance(prefix, str) or not isinstance(reference_suffix, str):
         raise ValueError("prompt fixture reference chat prefix/suffix must be strings")
+    model_selected = raw.get("schema") == FIXTURE_SCHEMA_V2
+    expected_suffix = "<turn|>\n<|turn>model\n" if model_selected else REFERENCE_PUBLIC_FINAL_SUFFIX
     if (
         prefix != REFERENCE_CHAT_PREFIX
-        or reference_suffix != REFERENCE_PUBLIC_FINAL_SUFFIX
+        or reference_suffix != expected_suffix
     ):
         raise ValueError(
             "prompt fixture must use the versioned public-final Gemma 4 chat contract"
@@ -752,7 +768,7 @@ def load_fixture(path: pathlib.Path) -> PromptFixture:
     response_channel = raw.get("response_channel")
     if (
         chat_template_kwargs != CHAT_TEMPLATE_KWARGS
-        or response_channel != "public_final"
+        or response_channel != ("model_selected_final" if model_selected else "public_final")
     ):
         raise ValueError(
             "prompt fixture chat-template policy must explicitly select the public final channel"
@@ -889,6 +905,12 @@ def is_event_stream_content_type(value: str | None) -> bool:
 
 
 def event_delta(event: dict[str, Any]) -> tuple[bool, str, str | None]:
+    if "content" in event and "choices" not in event:
+        content = str(event.get("content") or "")
+        finish = None
+        if event.get("stop") is True:
+            finish = "length" if event.get("stop_type") == "limit" else "stop"
+        return content != "", content, finish
     choices = event.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         return False, "", None
@@ -920,6 +942,25 @@ def stream_completion_accounting(
                 "stream usage completion_tokens must be a non-negative integer"
             )
         return value, "final_sse_usage"
+    llama_terminal = [event for event in events if event.get("stop") is True]
+    if len(llama_terminal) == 1 and llama_terminal[0].get("tokens") in (None, []):
+        generated_count = 0
+        for event in events:
+            if event is llama_terminal[0]:
+                continue
+            tokens = event.get("tokens")
+            if tokens in (None, []):
+                continue
+            if not isinstance(tokens, list) or len(tokens) != 1:
+                raise ValueError(
+                    "each llama generated-token partial must carry exactly one ID"
+                )
+            generated_count += 1
+        return generated_count, "ordered_single_id_stream_partials"
+    for event in reversed(events):
+        tokens = event.get("tokens")
+        if event.get("stop") is True and isinstance(tokens, list):
+            return len(tokens), "terminal_generated_token_ids"
     if content_event_count < 0:
         raise ValueError("content event count must be non-negative")
     return content_event_count, "content_events"
@@ -936,12 +977,134 @@ def stream_prompt_accounting(events: list[dict[str, Any]]) -> tuple[int | None, 
                 "stream usage prompt_tokens must be a non-negative integer"
             )
         return value, "final_sse_usage"
+    for event in reversed(events):
+        value = event.get("tokens_evaluated")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value, "terminal_tokens_evaluated"
     return None, "warmup_usage_fallback"
+
+
+def validate_fixed_length_generated_ids(
+    token_ids: Any,
+    applied_suppress_token_ids: set[int],
+    expected_count: int,
+    *,
+    eos_token_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    """Fail closed unless one fixed-length run retained every allowed token ID."""
+    if not isinstance(token_ids, list):
+        raise ValueError("fixed-length evidence is missing generated token IDs")
+    if len(token_ids) != expected_count:
+        raise ValueError(
+            f"fixed-length evidence has {len(token_ids)} IDs, expected {expected_count}"
+        )
+    if not applied_suppress_token_ids:
+        raise ValueError("fixed-length evidence is missing the suppression policy")
+    authoritative_eos = eos_token_ids or set()
+    if not authoritative_eos:
+        raise ValueError("fixed-length evidence is missing the authoritative EOS set")
+    if not authoritative_eos.issubset(applied_suppress_token_ids):
+        raise ValueError("the applied suppression policy does not contain every EOS ID")
+    normalized: list[int] = []
+    for token in token_ids:
+        if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+            raise ValueError("generated token IDs must be non-negative integers")
+        normalized.append(token)
+    selected_suppressed = sorted(set(normalized).intersection(applied_suppress_token_ids))
+    if selected_suppressed:
+        raise ValueError(
+            f"fixed-length generation selected suppressed IDs: {selected_suppressed}"
+        )
+    return {
+        **token_id_summary(normalized),
+        "token_ids": normalized,
+        "eos_token_ids": sorted(authoritative_eos),
+        "applied_suppress_token_ids": sorted(applied_suppress_token_ids),
+        "eos_free": True,
+        "fixed_length_mask_eos": True,
+    }
+
+
+def fixed_length_terminal_metadata(
+    events: list[dict[str, Any]], expected_count: int
+) -> dict[str, Any]:
+    rows = [event for event in events if "generated_token_ids" in event]
+    if len(rows) != 1:
+        raise ValueError("expected exactly one terminal generated-token metadata event")
+    row = rows[0]
+    if row.get("fixed_length_mask_eos") is not True:
+        raise ValueError("terminal metadata does not prove fixed-length EOS masking")
+    suppressions = row.get("applied_suppress_token_ids")
+    eos_ids = row.get("eos_token_ids")
+    if not isinstance(suppressions, list) or not isinstance(eos_ids, list):
+        raise ValueError("terminal metadata is missing suppression policy IDs")
+    if any(isinstance(x, bool) or not isinstance(x, int) or x < 0
+           for x in suppressions + eos_ids):
+        raise ValueError("suppression policy IDs must be non-negative integers")
+    if len(set(suppressions)) != len(suppressions):
+        raise ValueError("applied suppression IDs must be deduplicated")
+    if not set(eos_ids).issubset(suppressions):
+        raise ValueError("applied suppression policy does not contain every EOS ID")
+    proof = validate_fixed_length_generated_ids(
+        row["generated_token_ids"], set(suppressions), expected_count,
+        eos_token_ids=set(eos_ids),
+    )
+    return {**proof, "applied_suppress_token_ids": sorted(suppressions)}
+
+
+def llama_fixed_length_terminal_metadata(
+    events: list[dict[str, Any]], expected_count: int,
+    eos_token_ids: list[int], applied_suppress_token_ids: list[int],
+) -> dict[str, Any]:
+    terminal = [event for event in events if event.get("stop") is True]
+    if len(terminal) != 1:
+        raise ValueError("llama stream must contain exactly one terminal event")
+    terminal_tokens = terminal[0].get("tokens")
+    if terminal_tokens not in (None, []):
+        raise ValueError("llama terminal event must not repeat partial token IDs")
+    generated: list[int] = []
+    for event in events:
+        if event is terminal[0]:
+            continue
+        tokens = event.get("tokens")
+        if tokens in (None, []):
+            continue
+        if not isinstance(tokens, list) or len(tokens) != 1:
+            raise ValueError(
+                "each llama generated-token partial must carry exactly one ID"
+            )
+        generated.append(tokens[0])
+    proof = validate_fixed_length_generated_ids(
+        generated, set(applied_suppress_token_ids), expected_count,
+        eos_token_ids=set(eos_token_ids),
+    )
+    if terminal[0].get("stop_type") != "limit":
+        raise ValueError("llama fixed-length stream did not stop at its token limit")
+    return {
+        **proof,
+        "applied_suppress_token_ids": sorted(applied_suppress_token_ids),
+        "token_accounting_source": "ordered_single_id_stream_partials",
+    }
 
 
 def nonstream_summary(response: dict[str, Any]) -> dict[str, Any]:
     choices = response.get("choices")
     usage = response.get("usage")
+    if not isinstance(choices, list) and "content" in response:
+        content = str(response.get("content") or "")
+        content_bytes = content.encode("utf-8")
+        tokens = response.get("tokens")
+        completion_tokens = len(tokens) if isinstance(tokens, list) else int(
+            response.get("tokens_predicted") or 0
+        )
+        return {
+            "prompt_tokens": int(response.get("tokens_evaluated") or 0),
+            "completion_tokens": completion_tokens,
+            "finish_reason": "length" if response.get("stop_type") == "limit" else "stop",
+            "content": content,
+            "content_utf8_bytes": len(content_bytes),
+            "content_sha256": sha256_bytes(content_bytes),
+        }
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         raise ValueError("completion response is missing choices[0]")
     if not isinstance(usage, dict):
@@ -969,6 +1132,8 @@ def request_body(
     cache_dtype: str,
     *,
     stream: bool,
+    applied_suppress_token_ids: list[int] | None = None,
+    llama_prompt: str | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "model": str(model),
@@ -976,7 +1141,7 @@ def request_body(
         "chat_template_kwargs": dict(fixture.chat_template_kwargs),
         "max_tokens": output_tokens,
         "temperature": 0,
-        "top_p": 1,
+        "top_p": 0,
         "stream": stream,
     }
     if engine == "antfly":
@@ -985,13 +1150,22 @@ def request_body(
                 "backend": backend,
                 "cache_dtype": cache_dtype,
                 "ignore_eos": True,
+                "fixed_length_mask_eos": True,
                 "prompt_cache": False,
             }
         )
         if stream:
             body["stream_options"] = {"include_usage": True}
     elif engine == "llama_cpp":
-        body.update({"ignore_eos": True, "seed": 0, "cache_prompt": False})
+        if llama_prompt is not None:
+            body.pop("messages", None)
+            body.pop("chat_template_kwargs", None)
+            body["prompt"] = llama_prompt
+            body["n_predict"] = body.pop("max_tokens")
+        body.update({"ignore_eos": True, "seed": 0, "cache_prompt": False,
+                     "return_tokens": True})
+        if applied_suppress_token_ids is not None:
+            body["logit_bias"] = [[token, False] for token in applied_suppress_token_ids]
         if stream:
             body["stream_options"] = {"include_usage": True}
     else:
@@ -1063,6 +1237,7 @@ class ManagedServer:
         self.process: subprocess.Popen[bytes] | None = None
         self.log = None
         self.connection: http.client.HTTPConnection | None = None
+        self.last_generation_priming: dict[str, Any] | None = None
 
     def __enter__(self) -> "ManagedServer":
         self.log = self.log_path.open("wb")
@@ -1163,6 +1338,49 @@ class ManagedServer:
             )
         return value, {"total_latency_ms": elapsed_ms, "connection_reused": reused}
 
+    def prime_generation_connection(self) -> dict[str, Any]:
+        """Open a fresh socket and prove one health response on that socket.
+
+        This is called immediately before every timed or warmup generation.
+        Generation is never retried: if either priming or the following POST
+        fails, the sample fails visibly.
+        """
+        if self.connection is not None:
+            self.connection.close()
+        self.connection = http.client.HTTPConnection(
+            "127.0.0.1", self.port, timeout=self.request_timeout
+        )
+        started = time.monotonic_ns()
+        self.connection.request(
+            "GET",
+            self.spec.health_path,
+            headers={"accept": "application/json", "connection": "keep-alive"},
+        )
+        response = self.connection.getresponse()
+        raw = response.read()
+        elapsed_ms = (time.monotonic_ns() - started) / 1_000_000.0
+        headers = {key.lower(): value for key, value in response.getheaders()}
+        if not 200 <= response.status < 300:
+            raise RuntimeError(
+                f"{self.spec.engine} health HTTP {response.status}: "
+                f"{raw.decode(errors='replace')[:1000]}"
+            )
+        if self.connection.sock is None:
+            raise RuntimeError(
+                f"{self.spec.engine} health response did not preserve the fresh socket"
+            )
+        receipt = {
+            "policy": "fresh_connection_then_single_health_get_before_generation",
+            "health_path": self.spec.health_path,
+            "health_status": response.status,
+            "health_latency_ms": elapsed_ms,
+            "health_headers": headers,
+            "socket_open_after_health": True,
+            "generation_retry_count": 0,
+        }
+        self.last_generation_priming = receipt
+        return receipt
+
     def post_nonstream(
         self, body: dict[str, Any]
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1254,8 +1472,16 @@ class ManagedServer:
         stream_tail_ms = (response_finished_ns - decode_end_ns) / 1_000_000.0
         return {
             "total_latency_ms": total_ms,
+            "public_visible_ttft_ms": ttft_ms,
+            "public_visible_decode_span_ms": decode_ms,
             "ttft_ms": ttft_ms,
             "decode_ms": decode_ms,
+            "ttft_semantics": "first_nonempty_public_content_delta",
+            "decode_ms_semantics": (
+                "first_nonempty_public_content_delta_to_terminal_usage"
+                if accounting_source == "final_sse_usage"
+                else "first_nonempty_public_content_delta_to_last_nonempty_public_content_delta"
+            ),
             "stream_tail_ms": stream_tail_ms,
             "visible_content_ms": visible_content_ms,
             "inter_token_ms": decode_ms / (token_count - 1) if token_count > 1 else 0.0,
@@ -1274,11 +1500,13 @@ class ManagedServer:
             "content_event_sha256": canonical_sha256(token_fragments),
             "connection_reused": reused,
             "response_content_type": response_content_type,
+            "connection_priming": self.last_generation_priming,
         }, events
 
 
 def make_server_spec(
-    args: argparse.Namespace, engine: str, port: int, run_dir: pathlib.Path
+    args: argparse.Namespace, engine: str, port: int, run_dir: pathlib.Path,
+    fixture: PromptFixture | None = None,
 ) -> ServerSpec:
     if engine == "antfly":
         config_path = run_dir / "antfly-server.json"
@@ -1319,7 +1547,9 @@ def make_server_spec(
         return ServerSpec(engine, tuple(command), "/healthz", "/ai/v1/generate")
     if engine == "llama_cpp":
         template_path = run_dir / "gemma4-public-final-chat-template.jinja"
-        template_path.write_text(LLAMA_CHAT_TEMPLATE, encoding="utf-8")
+        artifact_template = fixture is not None and fixture.response_channel == "model_selected_final"
+        if not artifact_template:
+            template_path.write_text(LLAMA_CHAT_TEMPLATE, encoding="utf-8")
         command = [
             str(args.llama_server_bin.resolve()),
             "-m",
@@ -1341,12 +1571,14 @@ def make_server_spec(
             "-ctv",
             args.cache_dtype,
             "--jinja",
-            "--chat-template-file",
-            str(template_path.resolve()),
         ]
+        if not artifact_template:
+            command.extend(("--chat-template-file", str(template_path.resolve())))
+        if args.backend == "metal":
+            command.extend(("--parallel", "1"))
         if args.llama_server_prefix:
             command = shlex.split(args.llama_server_prefix) + command
-        return ServerSpec(engine, tuple(command), "/health", "/v1/chat/completions")
+        return ServerSpec(engine, tuple(command), "/health", "/completion")
     raise ValueError(f"unknown engine: {engine}")
 
 
@@ -1372,12 +1604,18 @@ def validate_llama_rendered_prompt(
         raise RuntimeError(
             "llama.cpp /apply-template response is missing a string prompt"
         )
-    encoded = rendered_prompt.encode("utf-8")
+    leading_bos = (fixture.response_channel == "model_selected_final" and
+                   rendered_prompt.startswith(TOKENIZER_BOS_TEXT))
+    normalized_prompt = rendered_prompt[len(TOKENIZER_BOS_TEXT):] if leading_bos else rendered_prompt
+    encoded = normalized_prompt.encode("utf-8")
     summary = {
         "source": "llama_cpp_apply_template",
         "utf8_bytes": len(encoded),
         "sha256": sha256_bytes(encoded),
     }
+    if leading_bos:
+        summary["leading_bos_from_template"] = True
+        summary["serialized_prompt_sha256"] = sha256_bytes(rendered_prompt.encode("utf-8"))
     if (
         summary["utf8_bytes"] != fixture.reference_prompt_utf8_bytes
         or summary["sha256"] != fixture.reference_prompt_sha256
@@ -1388,6 +1626,42 @@ def validate_llama_rendered_prompt(
             f"sha256={summary['sha256']} expected_sha256={fixture.reference_prompt_sha256}"
         )
     return summary
+
+
+# b12077 src/llama-vocab.cpp marks these model-specific Gemma 4 spellings EOG.
+LLAMA_GEMMA4_EOG_TOKEN_TEXTS = ("<eos>", "<turn|>", "<|tool_response>")
+
+
+def verify_llama_gemma4_eog_policy(
+    server: "ManagedServer", expected_eos_ids: list[int]
+) -> dict[str, Any]:
+    token_ids: dict[str, int] = {}
+    for token_text in LLAMA_GEMMA4_EOG_TOKEN_TEXTS:
+        response, _ = server.post_json(
+            {"content": token_text, "add_special": False, "parse_special": True},
+            path="/tokenize",
+        )
+        ids = response.get("tokens")
+        if (not isinstance(ids, list) or len(ids) != 1 or
+                isinstance(ids[0], bool) or not isinstance(ids[0], int) or ids[0] < 0):
+            raise RuntimeError(
+                f"llama.cpp did not resolve Gemma4 EOG token {token_text!r} uniquely"
+            )
+        token_ids[token_text] = ids[0]
+    actual = sorted(set(token_ids.values()))
+    expected = sorted(set(expected_eos_ids))
+    if actual != expected:
+        raise RuntimeError(
+            "llama.cpp Gemma4 EOG policy differs from Antfly primary/extra EOS: "
+            f"llama={actual} Antfly={expected}"
+        )
+    return {
+        "source": "llama_b12077_model_specific_eog_tokens_plus_loaded_vocab_tokenize",
+        "token_text_to_id": token_ids,
+        "llama_eog_token_ids": actual,
+        "antfly_eos_token_ids": expected,
+        "effective_eos_policy_equal": True,
+    }
 
 
 def collect_antfly_prompt_token_contract(
@@ -1820,10 +2094,11 @@ def run_engine_sample(
 ) -> dict[str, Any]:
     run_dir = args.output_dir / "raw" / f"pair-{pair_index:02d}-{engine}"
     run_dir.mkdir(parents=True, exist_ok=False)
-    spec = make_server_spec(args, engine, choose_port(), run_dir)
+    spec = make_server_spec(args, engine, choose_port(), run_dir, fixture)
     environment = os.environ.copy()
     if engine == "antfly":
         environment.update(args.antfly_execution_profile["effective_env"])
+        environment["ANTFLY_INFERENCE_JSON_TOKEN_IDS"] = "1"
     log_path = run_dir / "server.log"
     warmups: list[dict[str, Any]] = []
     with ManagedServer(
@@ -1865,7 +2140,7 @@ def run_engine_sample(
             tokenized, _ = server.post_json(
                 {
                     "content": rendered_prompt,
-                    "add_special": True,
+                    "add_special": not llama_template_summary.get("leading_bos_from_template", False),
                     "parse_special": True,
                 },
                 path="/tokenize",
@@ -1891,6 +2166,10 @@ def run_engine_sample(
                     "prompt token IDs differ between Antfly and llama.cpp: "
                     f"Antfly={prompt_token_contract['sha256']} llama.cpp={llama_token_summary['sha256']}"
                 )
+            llama_eog_policy = verify_llama_gemma4_eog_policy(
+                server, getattr(args, "fixed_length_eos_token_ids")
+            )
+            write_json(run_dir / "llama_eog_policy.json", llama_eog_policy)
         for warmup_index in range(1, args.warmups + 1):
             body = request_body(
                 engine,
@@ -1899,11 +2178,43 @@ def run_engine_sample(
                 fixture,
                 args.output_tokens,
                 args.cache_dtype,
-                stream=False,
+                stream=True,
+                applied_suppress_token_ids=getattr(args, "fixed_length_suppress_token_ids", None),
+                llama_prompt=rendered_prompt if engine == "llama_cpp" else None,
             )
-            response, transport = server.post_nonstream(body)
-            warmup = {"index": warmup_index, **nonstream_summary(response), **transport}
+            priming = server.prime_generation_connection()
+            response, warmup_events = server.post_stream(body)
+            if engine == "antfly":
+                warmup_proof = fixed_length_terminal_metadata(
+                    warmup_events, args.output_tokens
+                )
+            else:
+                warmup_proof = llama_fixed_length_terminal_metadata(
+                    warmup_events,
+                    args.output_tokens,
+                    getattr(args, "fixed_length_eos_token_ids"),
+                    getattr(args, "fixed_length_suppress_token_ids"),
+                )
+                warmup_proof["llama_eog_policy"] = llama_eog_policy
+            if warmup_proof["applied_suppress_token_ids"] != getattr(
+                args, "fixed_length_suppress_token_ids"
+            ):
+                raise RuntimeError(f"{engine} warmup applied a different suppression policy")
+            warmup = {
+                "index": warmup_index,
+                **response,
+                "connection_priming": priming,
+                "fixed_length_token_proof": warmup_proof,
+            }
             warmups.append(warmup)
+            # Persist each completed request before issuing the next one. A
+            # later transport failure must not discard an earlier 300-token
+            # correctness proof.
+            write_json(
+                run_dir / f"warmup-{warmup_index:02d}-stream-events.json",
+                warmup_events,
+            )
+            write_json(run_dir / f"warmup-{warmup_index:02d}-sample.json", warmup)
         body = request_body(
             engine,
             request_model,
@@ -1912,8 +2223,28 @@ def run_engine_sample(
             args.output_tokens,
             args.cache_dtype,
             stream=True,
+            applied_suppress_token_ids=getattr(args, "fixed_length_suppress_token_ids", None),
+            llama_prompt=rendered_prompt if engine == "llama_cpp" else None,
         )
+        measured_priming = server.prime_generation_connection()
         measured, events = server.post_stream(body)
+        measured["connection_priming"] = measured_priming
+        write_json(run_dir / "measured-stream-events.json", events)
+        write_json(run_dir / "measured-response.json", measured)
+
+    if engine == "antfly":
+        fixed_proof = fixed_length_terminal_metadata(events, args.output_tokens)
+    else:
+        fixed_proof = llama_fixed_length_terminal_metadata(
+            events, args.output_tokens,
+            getattr(args, "fixed_length_eos_token_ids"),
+            getattr(args, "fixed_length_suppress_token_ids"),
+        )
+        fixed_proof["llama_eog_policy"] = llama_eog_policy
+    if fixed_proof["applied_suppress_token_ids"] != getattr(
+        args, "fixed_length_suppress_token_ids"
+    ):
+        raise RuntimeError(f"{engine} applied a different suppression policy")
 
     cuda_gqa_prefill_telemetry = (
         parse_cuda_gqa_prefill_telemetry(log_path)
@@ -1967,6 +2298,7 @@ def run_engine_sample(
             },
             "server_command": list(spec.command),
             "server_log": str(log_path),
+            "fixed_length_token_proof": fixed_proof,
         }
     )
     if cuda_gqa_prefill_telemetry is not None:
@@ -1978,6 +2310,31 @@ def run_engine_sample(
     write_json(run_dir / "stream_events.json", events)
     write_json(run_dir / "sample.json", measured)
     return measured
+
+
+def discover_fixed_length_suppression_policy(
+    args: argparse.Namespace, fixture: PromptFixture
+) -> dict[str, Any]:
+    """Capture request-effective suppression authority before paired ordering."""
+    run_dir = args.output_dir / "fixed-length-policy-preflight"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    spec = make_server_spec(args, "antfly", choose_port(), run_dir, fixture)
+    environment = os.environ.copy()
+    environment.update(args.antfly_execution_profile["effective_env"])
+    environment["ANTFLY_INFERENCE_JSON_TOKEN_IDS"] = "1"
+    log_path = run_dir / "server.log"
+    with ManagedServer(
+        spec, log_path, environment, args.startup_timeout, args.request_timeout
+    ) as server:
+        body = request_body(
+            "antfly", args.antfly_model_id, args.backend, fixture,
+            args.output_tokens, args.cache_dtype, stream=True,
+        )
+        _, events = server.post_stream(body)
+    proof = fixed_length_terminal_metadata(events, args.output_tokens)
+    write_json(run_dir / "stream_events.json", events)
+    write_json(run_dir / "policy.json", proof)
+    return proof
 
 
 def command_output(
@@ -2141,8 +2498,14 @@ def visible_model_bundle_files(model_dir: pathlib.Path) -> list[pathlib.Path]:
         (
             path
             for path in model_dir.rglob("*")
-            if not any(
-                part.startswith(".") for part in path.relative_to(model_dir).parts
+            if (
+                (
+                    path.relative_to(model_dir).as_posix() == NATIVE_COMPLETION_RECEIPT
+                    and not path.is_symlink()
+                )
+                or not any(
+                    part.startswith(".") for part in path.relative_to(model_dir).parts
+                )
             )
             and path.is_file()
         ),
@@ -2150,13 +2513,185 @@ def visible_model_bundle_files(model_dir: pathlib.Path) -> list[pathlib.Path]:
     )
 
 
-def model_bundle_layout_errors(model_dir: pathlib.Path) -> list[str]:
+def is_metadata_only_generator_manifest(path: pathlib.Path) -> bool:
+    """Accept only ModelManager's path-free generator capability declaration."""
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        parsed = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=unique_object
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return False
+    return (
+        isinstance(parsed, dict)
+        and set(parsed) == {"type", "tasks", "inputs"}
+        and parsed["type"] == "generator"
+        and parsed["tasks"] == ["generate"]
+        and parsed["inputs"] == ["text", "image", "audio"]
+    )
+
+
+def native_completion_receipt_artifacts(
+    path: pathlib.Path,
+) -> dict[str, tuple[int, str]] | None:
+    """Parse the path-free native v2 completion receipt, rejecting duplicates."""
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        receipt = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=unique_object
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "version",
+        "source",
+        "artifacts",
+    }:
+        return None
+    if type(receipt["version"]) is not int or receipt["version"] != 2:
+        return None
+    source = receipt["source"]
+    source_keys = {
+        "owner",
+        "name",
+        "variant",
+        "requested_revision",
+        "resolved_revision",
+        "selected_format",
+    }
+    if (
+        not isinstance(source, dict)
+        or set(source) != source_keys
+        or any(not isinstance(source[key], str) or not source[key] for key in source_keys)
+    ):
+        return None
+    artifacts = receipt["artifacts"]
+    if not isinstance(artifacts, list) or len(artifacts) != 3:
+        return None
+    parsed: dict[str, tuple[int, str]] = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or set(artifact) != {"path", "size", "sha256"}:
+            return None
+        name, size, digest = (
+            artifact["path"],
+            artifact["size"],
+            artifact["sha256"],
+        )
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@+\-]*", name)
+            or name in parsed
+            or type(size) is not int
+            or size <= 0
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            return None
+        parsed[name] = (size, digest)
+    names = set(parsed)
+    ggufs = [name for name in names if name.endswith(".gguf")]
+    if (
+        "model_manifest.json" not in names
+        or len(ggufs) != 2
+        or sum(name.endswith("-mmproj.gguf") for name in ggufs) != 1
+    ):
+        return None
+    return parsed
+
+
+def native_sha256_cache_digest(path: pathlib.Path) -> str | None:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        cache = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=unique_object
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(cache, dict) or set(cache) != {"signature", "digest"}:
+        return None
+    for key in ("signature", "digest"):
+        value = cache[key]
+        if (
+            not isinstance(value, list)
+            or len(value) != 32
+            or any(type(byte) is not int or byte < 0 or byte > 255 for byte in value)
+        ):
+            return None
+    return bytes(cache["digest"]).hex()
+
+
+def native_completion_receipt_errors(
+    receipt_path: pathlib.Path, files: list[dict[str, Any]] | None
+) -> list[str]:
+    declared = native_completion_receipt_artifacts(receipt_path)
+    if declared is None:
+        return ["native completion receipt is not the exact path-free v2 contract"]
+    if files is None:
+        return ["native completion receipt requires the hashed model-bundle inventory"]
+    inventory = {
+        item.get("path"): (item.get("bytes"), item.get("sha256"))
+        for item in files
+        if item.get("path") != NATIVE_COMPLETION_RECEIPT
+    }
+    actual = {
+        name: identity
+        for name, identity in inventory.items()
+        if not isinstance(name, str) or not name.endswith(NATIVE_SHA256_CACHE_SUFFIX)
+    }
+    if actual != declared:
+        return ["native completion receipt does not match the hashed model-bundle inventory"]
+    for name in inventory:
+        if not isinstance(name, str) or not name.endswith(NATIVE_SHA256_CACHE_SUFFIX):
+            continue
+        artifact_name = name[: -len(NATIVE_SHA256_CACHE_SUFFIX)]
+        if artifact_name not in declared:
+            return ["native SHA-256 cache does not name a declared artifact"]
+        cache_path = receipt_path.parent / name
+        cached_digest = native_sha256_cache_digest(cache_path)
+        if cached_digest is None:
+            return ["native SHA-256 cache is not the exact byte-array contract"]
+        if cached_digest != declared[artifact_name][1]:
+            return ["native SHA-256 cache digest does not match its declared artifact"]
+    return []
+
+
+def model_bundle_layout_errors(
+    model_dir: pathlib.Path, files: list[dict[str, Any]] | None = None
+) -> list[str]:
     errors: list[str] = []
     for path in sorted(
         model_dir.rglob("*"), key=lambda item: item.relative_to(model_dir).as_posix()
     ):
         relative = path.relative_to(model_dir).as_posix()
-        if any(part.startswith(".") for part in path.relative_to(model_dir).parts):
+        completion_receipt = (
+            relative == NATIVE_COMPLETION_RECEIPT
+            and path.is_file()
+            and not path.is_symlink()
+        )
+        if not completion_receipt and any(part.startswith(".") for part in path.relative_to(model_dir).parts):
             errors.append(
                 f"hidden model-bundle path is unsupported for enforced evidence: {relative}"
             )
@@ -2168,11 +2703,18 @@ def model_bundle_layout_errors(model_dir: pathlib.Path) -> list[str]:
             errors.append(
                 f"special model-bundle path is unsupported for enforced evidence: {relative}"
             )
-        if path.is_file() and path.name in UNSAFE_MODEL_CONTROL_FILES:
+        metadata_only_manifest = (
+            path.is_file()
+            and relative == "model_manifest.json"
+            and is_metadata_only_generator_manifest(path)
+        )
+        if path.is_file() and path.name in UNSAFE_MODEL_CONTROL_FILES and not metadata_only_manifest:
             errors.append(
                 "runtime-path manifest is unsupported for enforced evidence until ModelManager "
                 f"exports its resolved dependency closure: {relative}"
             )
+        if completion_receipt:
+            errors.extend(native_completion_receipt_errors(path, files))
     return errors
 
 
@@ -2210,12 +2752,15 @@ def path_provenance(path: pathlib.Path) -> dict[str, Any]:
 
 
 def harness_provenance(script_path: pathlib.Path) -> dict[str, Any]:
-    """Content-address the benchmark and its local behavioral dependency."""
+    """Content-address the benchmark and its local behavioral dependencies."""
     shared_scripts_dir = script_path.resolve().parent.parent
     files = {
         "benchmark": path_provenance(script_path),
         "pairing_support": path_provenance(shared_scripts_dir / "paired_benchmark.py"),
     }
+    metal_support = script_path.resolve().parent / "gemma4_metal_long_output.py"
+    if metal_support.is_file():
+        files["metal_bundle_support"] = path_provenance(metal_support)
     identity = {
         name: {"bytes": value.get("bytes"), "sha256": value.get("sha256")}
         for name, value in sorted(files.items())
@@ -2307,7 +2852,7 @@ def antfly_model_bundle_provenance(
     return {
         "directory": str(model_dir),
         "files": files,
-        "layout_errors": model_bundle_layout_errors(model_dir),
+        "layout_errors": model_bundle_layout_errors(model_dir, files),
         "sha256": canonical_sha256(identity),
     }
 
@@ -2387,9 +2932,26 @@ def dynamic_dependency_provenance(path: pathlib.Path) -> dict[str, Any]:
     resolved_binary = path.resolve()
     try:
         with resolved_binary.open("rb") as binary_file:
-            is_elf = binary_file.read(4) == b"\x7fELF"
+            magic = binary_file.read(4)
+            is_elf = magic == b"\x7fELF"
     except OSError:
+        magic = b""
         is_elf = False
+    if magic in {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe"}:
+        from gemma4_metal_long_output import llama_bundle_manifest, llama_bundle_manifest_sha256
+        manifest = llama_bundle_manifest(resolved_binary.parent)
+        material = [
+            {"name": item["path"], "path": str(resolved_binary.parent / item["path"]),
+             "bytes": item["size"], "sha256": item["sha256"]}
+            for item in manifest["entries"] if item["type"] == "file"
+        ]
+        return {
+            "status": "resolved_bundle", "is_elf": False, "is_macho": True,
+            "material_dependency_files": material, "bundle_manifest": manifest,
+            "unresolved_dependencies": [],
+            "inspection": command_capture(["/usr/bin/otool", "-L", str(resolved_binary)]),
+            "sha256": llama_bundle_manifest_sha256(manifest),
+        }
     inspection = command_capture(["ldd", str(resolved_binary)])
     output = inspection.get("output") or ""
     returncode = inspection.get("returncode")
@@ -2461,20 +3023,84 @@ def stable_executable_build_metadata(version_output: str | None) -> str | None:
     return "\n".join(stable_lines or lines)
 
 
+def tracked_executable_git_provenance(path: pathlib.Path) -> dict[str, Any]:
+    """Return Git provenance only when the repository tracks the executable."""
+    binary = path.resolve()
+    root_text = command_output(
+        ["git", "-C", str(binary.parent), "rev-parse", "--show-toplevel"]
+    )
+    if not root_text:
+        return {"available": False, "reason": "no_git_repository"}
+    root = pathlib.Path(root_text).resolve()
+    try:
+        relative = binary.relative_to(root)
+    except ValueError:
+        return {"available": False, "reason": "repository_does_not_contain_executable"}
+    tracked = command_output(
+        ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", str(relative)]
+    )
+    if tracked is None:
+        return {
+            "available": False,
+            "reason": "enclosing_repository_does_not_track_executable",
+        }
+    status = command_output(
+        ["git", "-C", str(root), "status", "--porcelain=v1", "--", str(relative)]
+    )
+    return {
+        "available": True,
+        "root": str(root),
+        "commit": command_output(["git", "-C", str(root), "rev-parse", "HEAD"]),
+        "dirty": bool(status),
+        "status_sha256": sha256_bytes((status or "").encode("utf-8")),
+        "tracked_executable": str(relative),
+    }
+
+
+def parse_llama_build_revision(build_metadata: str | None) -> dict[str, Any] | None:
+    """Parse llama.cpp's stable embedded build number and source revision."""
+    if not build_metadata:
+        return None
+    match = re.search(
+        r"\bbuild\s+(?P<build>[0-9]+)\s*,\s*commit\s+(?P<revision>[0-9a-fA-F]{7,64})\b",
+        build_metadata,
+    )
+    if not match:
+        return None
+    return {
+        "revision": match.group("revision").lower(),
+        "build_number": int(match.group("build")),
+    }
+
+
 def executable_provenance(
     path: pathlib.Path, *, inspect_dependencies: bool = False
 ) -> dict[str, Any]:
     value = path_provenance(path)
     value["version"] = command_output([str(path.resolve()), "--version"])
     value["build_metadata"] = stable_executable_build_metadata(value["version"])
-    value["git"] = git_provenance(path.resolve().parent)
+    value["git"] = tracked_executable_git_provenance(path)
+    embedded = parse_llama_build_revision(value["build_metadata"])
+    if embedded is not None:
+        value["revision"] = embedded["revision"]
+        value["build_number"] = embedded["build_number"]
+        value["provenance_source"] = "embedded_build_metadata"
+    elif value["git"].get("commit"):
+        value["revision"] = value["git"]["commit"]
+        value["build_number"] = None
+        value["provenance_source"] = "tracked_executable_git_repository"
+    else:
+        value["revision"] = None
+        value["build_number"] = None
+        value["provenance_source"] = "unavailable"
     if inspect_dependencies:
         dependencies = dynamic_dependency_provenance(path)
         value["dynamic_dependencies"] = dependencies
         bundle_identity = {
             "binary_sha256": value.get("sha256"),
             "build_metadata": value.get("build_metadata"),
-            "git_commit": value["git"].get("commit"),
+            "comparator_revision": value.get("revision"),
+            "provenance_source": value.get("provenance_source"),
             "dynamic_dependency_closure_sha256": dependencies["sha256"],
         }
         value["runtime_bundle_sha256"] = canonical_sha256(bundle_identity)
@@ -2492,6 +3118,29 @@ def stable_runtime_identity() -> dict[str, Any]:
     return {**identity, "sha256": canonical_sha256(identity)}
 
 
+def stable_metal_runtime_identity() -> dict[str, Any]:
+    inspection = command_capture(["/usr/sbin/system_profiler", "SPDisplaysDataType", "-json"])
+    devices = []
+    error = None
+    try:
+        displays = json.loads(inspection.get("output") or "")["SPDisplaysDataType"]
+        for device in displays:
+            support = device.get("spdisplays_mtlgpufamilysupport") or device.get("spdisplays_metal")
+            if support:
+                devices.append({"name": device.get("sppci_model"),
+                                "cores": device.get("sppci_cores"),
+                                "metal_support": support})
+        if not devices:
+            error = "no Metal-capable device found"
+        memory = int(command_output(["/usr/sbin/sysctl", "-n", "hw.memsize"]) or "0")
+    except (ValueError, KeyError, TypeError) as exc:
+        error, memory = str(exc), 0
+    identity = {"backend": "metal", "gpu_execution_state": {"selected_gpus": devices, "error": error},
+                "physical_memory_bytes": memory, "cuda_toolchain": None,
+                "host_platform": platform.platform(), "python": platform.python_version()}
+    return {**identity, "sha256": canonical_sha256(identity)}
+
+
 def collect_provenance(
     args: argparse.Namespace, fixture: PromptFixture
 ) -> dict[str, Any]:
@@ -2503,10 +3152,11 @@ def collect_provenance(
             "--format=csv,noheader,nounits",
         ]
     )
-    runtime_identity = stable_runtime_identity()
-    gpu_compute_processes = capture_selected_gpu_compute_processes(
-        runtime_identity["gpu_execution_state"]
-    )
+    runtime_identity = (stable_metal_runtime_identity() if args.backend == "metal"
+                        else stable_runtime_identity())
+    gpu_compute_processes = (capture_selected_gpu_compute_processes(runtime_identity["gpu_execution_state"])
+                            if args.backend == "cuda" else
+                            {"selected_gpu_processes": [], "error": "per-process GPU activity unavailable on this backend"})
     model = path_provenance(args.model)
     return {
         "schema": EVIDENCE_SCHEMA,
@@ -2534,6 +3184,22 @@ def collect_provenance(
 def provenance_validation_errors(
     args: argparse.Namespace, provenance: dict[str, Any]
 ) -> list[str]:
+    if args.enforce_performance and args.backend == "metal":
+        errors = []
+        runtime = provenance.get("runtime_identity") or {}
+        state = runtime.get("gpu_execution_state") or {}
+        if (runtime.get("backend") != "metal" or state.get("error") or
+                not state.get("selected_gpus") or not runtime.get("physical_memory_bytes")):
+            errors.append("enforced Metal evidence requires stable Metal device and physical memory provenance")
+        bundle = provenance.get("antfly_model_bundle") or {}
+        if not bundle.get("sha256") or not bundle.get("files") or bundle.get("layout_errors"):
+            errors.append("enforced Metal evidence requires a hashed, valid model-bundle inventory")
+        deps = (provenance.get("llama_cpp_binary") or {}).get("dynamic_dependencies") or {}
+        if not deps.get("is_macho") or deps.get("status") != "resolved_bundle" or not deps.get("sha256"):
+            errors.append("enforced Metal evidence requires a hashed Mach-O llama.cpp bundle")
+        if any(name.startswith(("DYLD_", "LD_PRELOAD", "LD_LIBRARY_PATH")) for name in os.environ):
+            errors.append("enforced Metal evidence forbids dynamic-loader overrides")
+        return errors
     if not args.enforce_performance or args.backend != "cuda":
         return []
     errors: list[str] = []
@@ -2641,7 +3307,7 @@ def build_lock(
         "schema": LOCK_SCHEMA,
         "model_sha256": provenance["model"].get("sha256"),
         "antfly_model_bundle_sha256": provenance["antfly_model_bundle"].get("sha256"),
-        "llama_cpp_commit": provenance["llama_cpp_binary"].get("git", {}).get("commit"),
+        "llama_cpp_commit": provenance["llama_cpp_binary"].get("revision"),
         "llama_cpp_binary_sha256": provenance["llama_cpp_binary"].get("sha256"),
         "llama_cpp_runtime_bundle_sha256": provenance["llama_cpp_binary"].get(
             "runtime_bundle_sha256"
@@ -2747,7 +3413,6 @@ def evidence_lock_projection(evidence: dict[str, Any]) -> dict[str, Any]:
         if isinstance(provenance.get("llama_cpp_binary"), dict)
         else {}
     )
-    llama_git = llama.get("git") if isinstance(llama.get("git"), dict) else {}
     runtime_identity = (
         provenance.get("runtime_identity")
         if isinstance(provenance.get("runtime_identity"), dict)
@@ -2775,7 +3440,7 @@ def evidence_lock_projection(evidence: dict[str, Any]) -> dict[str, Any]:
         "schema": LOCK_SCHEMA,
         "model_sha256": model.get("sha256"),
         "antfly_model_bundle_sha256": model_bundle.get("sha256"),
-        "llama_cpp_commit": llama_git.get("commit"),
+        "llama_cpp_commit": llama.get("revision"),
         "llama_cpp_binary_sha256": llama.get("sha256"),
         "llama_cpp_runtime_bundle_sha256": llama.get("runtime_bundle_sha256"),
         "runtime_identity_sha256": runtime_identity.get("sha256"),
@@ -2953,7 +3618,7 @@ def baseline_median(baseline: dict[str, Any], metric: str) -> float:
 
 def performance_threshold_contract(args: argparse.Namespace) -> dict[str, Any]:
     """Return the exact performance policy embedded in benchmark evidence."""
-    return {
+    contract = {
         "schema": "antfly.gemma4_long_e2e.performance_thresholds.v1",
         "performance_enforced": bool(args.enforce_performance),
         "antfly_llama": {
@@ -2970,6 +3635,17 @@ def performance_threshold_contract(args: argparse.Namespace) -> dict[str, Any]:
             args.max_baseline_regression
         ),
     }
+    if args.profile == "metal-headline":
+        contract["schema"] = "antfly.gemma4_long_e2e.performance_thresholds.v3"
+        contract["antfly_llama"]["median_total_latency_ratio_max_exclusive"] = (
+            contract["antfly_llama"].pop("median_total_latency_ratio_max_inclusive")
+        )
+        contract["component_metrics_enforced"] = False
+        for component in ("ttft", "decode"):
+            previous = f"paired_{component}_log_ratio_95_ci_upper_max_inclusive"
+            contract["antfly_llama"][previous.replace("inclusive", "exclusive")] = (
+                contract["antfly_llama"].pop(previous))
+    return contract
 
 
 def evaluate(
@@ -3029,9 +3705,14 @@ def evaluate(
     checks: list[dict[str, Any]] = []
 
     def check(
-        name: str, passed: bool, detail: str, *, performance: bool = False
+        name: str,
+        passed: bool,
+        detail: str,
+        *,
+        performance: bool = False,
+        informational: bool = False,
     ) -> None:
-        enforced = not performance or args.enforce_performance
+        enforced = (not performance or args.enforce_performance) and not informational
         checks.append(
             {
                 "name": name,
@@ -3206,18 +3887,28 @@ def evaluate(
                         f"rejections={decode_rejections}",
                         performance=True,
                     )
-            if args.profile == "headline":
+            if args.profile in {"headline", "metal-headline"}:
+                expected_completion_source = (
+                    "final_sse_usage"
+                    if engine == "antfly"
+                    else "ordered_single_id_stream_partials"
+                )
                 check(
                     f"pair_{row['pair']}_{engine}_authoritative_completion_usage",
                     sample.get("completion_token_accounting_source")
-                    == "final_sse_usage",
-                    "completion token count must come from the terminal SSE usage event",
+                    == expected_completion_source,
+                    "completion token count must come from the engine's authoritative measured stream evidence",
                     performance=True,
+                )
+                expected_prompt_source = (
+                    "final_sse_usage"
+                    if engine == "antfly"
+                    else "terminal_tokens_evaluated"
                 )
                 check(
                     f"pair_{row['pair']}_{engine}_authoritative_prompt_usage",
-                    sample.get("prompt_token_accounting_source") == "final_sse_usage",
-                    "prompt token count must come from the measured terminal SSE usage event",
+                    sample.get("prompt_token_accounting_source") == expected_prompt_source,
+                    "prompt token count must come from the engine's authoritative measured stream evidence",
                     performance=True,
                 )
             token_summary = sample.get("prompt_token_ids") or {}
@@ -3284,11 +3975,14 @@ def evaluate(
         f"configured={args.expected_prompt_tokens} fixture={fixture.expected_prompt_tokens}",
     )
 
-    if args.profile == "headline":
+    if args.profile in {"headline", "metal-headline"}:
         check(
             "headline_median_total_ratio",
-            total_ratio <= args.max_median_ratio,
-            f"ratio={total_ratio:.6f} max={args.max_median_ratio:.6f}",
+            (total_ratio < args.max_median_ratio if args.profile == "metal-headline"
+             else total_ratio <= args.max_median_ratio),
+            f"ratio={total_ratio:.6f} "
+            f"max_{'exclusive' if args.profile == 'metal-headline' else 'inclusive'}="
+            f"{args.max_median_ratio:.6f}",
             performance=True,
         )
         check(
@@ -3316,26 +4010,32 @@ def evaluate(
             ttft_ratio <= args.max_component_ratio,
             f"ratio={ttft_ratio:.6f} max={args.max_component_ratio:.6f}",
             performance=True,
+            informational=args.profile == "metal-headline",
         )
         check(
             "headline_decode",
             decode_ratio <= args.max_component_ratio,
             f"ratio={decode_ratio:.6f} max={args.max_component_ratio:.6f}",
             performance=True,
+            informational=args.profile == "metal-headline",
         )
         ttft_ci_upper = float(paired_log_ratio_cis["ttft_ms"]["upper_95"])
         decode_ci_upper = float(paired_log_ratio_cis["decode_ms"]["upper_95"])
         check(
             "headline_ttft_paired_ci",
-            ttft_ci_upper <= args.max_ttft_ci_upper,
+            (ttft_ci_upper < args.max_ttft_ci_upper if args.profile == "metal-headline"
+             else ttft_ci_upper <= args.max_ttft_ci_upper),
             f"upper_95={ttft_ci_upper:.6f} max={args.max_ttft_ci_upper:.6f}",
             performance=True,
+            informational=args.profile == "metal-headline",
         )
         check(
             "headline_decode_paired_ci",
-            decode_ci_upper <= args.max_decode_ci_upper,
+            (decode_ci_upper < args.max_decode_ci_upper if args.profile == "metal-headline"
+             else decode_ci_upper <= args.max_decode_ci_upper),
             f"upper_95={decode_ci_upper:.6f} max={args.max_decode_ci_upper:.6f}",
             performance=True,
+            informational=args.profile == "metal-headline",
         )
 
     baseline_ratios: dict[str, float] | None = None
@@ -3445,7 +4145,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--request-timeout", type=float, default=900.0)
     parser.add_argument("--bootstrap-samples", type=int, default=10_000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260730)
-    parser.add_argument("--max-median-ratio", type=float, default=0.95)
+    parser.add_argument("--max-median-ratio", type=float)
     parser.add_argument("--max-ci-upper", type=float, default=1.0)
     parser.add_argument("--max-cv", type=float, default=0.03)
     parser.add_argument("--max-p95-ratio", type=float, default=1.0)
@@ -3492,6 +4192,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     defaults = PROFILE_DEFAULTS[args.profile]
     args.cache_dtype = args.cache_dtype or defaults["cache_dtype"]
+    if args.max_median_ratio is None:
+        args.max_median_ratio = defaults.get("max_median_ratio", 0.95)
     if args.max_baseline_regression is None:
         args.max_baseline_regression = defaults["max_baseline_regression"]
     return args
@@ -3593,7 +4295,7 @@ def validate_args(args: argparse.Namespace, fixture: PromptFixture) -> None:
         raise ValueError(
             "--lockfile-sha256 must be 64 lowercase hexadecimal characters"
         )
-    if args.profile == "headline" and args.enforce_performance:
+    if args.profile in {"headline", "metal-headline"} and args.enforce_performance:
         if not args.require_lock:
             raise ValueError(
                 "headline enforcement requires a reviewed --lockfile and --require-lock"
@@ -3606,10 +4308,13 @@ def validate_args(args: argparse.Namespace, fixture: PromptFixture) -> None:
             raise ValueError(
                 "headline enforcement forbids an opaque llama.cpp server prefix; use explicit arguments"
             )
-        if args.backend != "cuda" or args.cache_dtype != "f16":
+        expected_backend = "metal" if args.profile == "metal-headline" else "cuda"
+        if args.backend != expected_backend or args.cache_dtype != "f16":
             raise ValueError(
-                "headline enforcement requires CUDA with matched F16 K/V caches"
+                f"{args.profile} enforcement requires {expected_backend.upper()} with matched F16 K/V caches"
             )
+        if args.profile == "metal-headline" and args.antfly_env:
+            raise ValueError("Metal headline does not accept CUDA-only --antfly-env overrides")
         if args.context_size != 4096 or args.output_tokens != 300 or args.warmups != 2:
             raise ValueError(
                 "headline enforcement requires context-size=4096, output-tokens=300, and warmups=2"
@@ -3631,6 +4336,11 @@ def validate_args(args: argparse.Namespace, fixture: PromptFixture) -> None:
             "max_ttft_ci_upper": 1.02,
             "max_decode_ci_upper": 1.02,
         }
+        if args.profile == "metal-headline":
+            # The reviewed Metal lane is total-latency parity: both the median
+            # and paired confidence bound must show a repeatable overall win.
+            # TTFT/decode remain reported diagnostics, not independent gates.
+            accepted_maxima["max_median_ratio"] = 1.0
         for field, accepted in accepted_maxima.items():
             if getattr(args, field) > accepted:
                 raise ValueError(
@@ -3740,6 +4450,14 @@ def main(argv: list[str] | None = None) -> None:
             f"Antfly prompt token count is {prompt_token_contract['count']}, expected {args.expected_prompt_tokens}"
         )
 
+    try:
+        fixed_policy = discover_fixed_length_suppression_policy(args, fixture)
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(f"could not prove fixed-length suppression policy: {exc}") from exc
+    args.fixed_length_suppress_token_ids = fixed_policy["applied_suppress_token_ids"]
+    args.fixed_length_eos_token_ids = fixed_policy["eos_token_ids"]
+    write_json(args.output_dir / "fixed_length_suppression_policy.json", fixed_policy)
+
     runtime_guards: list[dict[str, Any]] = []
 
     def guard_runtime(stage: str) -> None:
@@ -3805,6 +4523,15 @@ def main(argv: list[str] | None = None) -> None:
         "model_loading_included": False,
         "connection_establishment_included": False,
         "sampling": "greedy",
+        "ignore_eos": True,
+        "fixed_length_mask_eos": True,
+        "applied_suppress_token_ids": args.fixed_length_suppress_token_ids,
+        "eos_token_ids": args.fixed_length_eos_token_ids,
+        "generated_token_ids_required_per_timed_request": True,
+        "client_timing_semantics": {
+            "ttft_ms": "first_nonempty_public_content_delta",
+            "decode_ms": "first_nonempty_public_content_delta_to_terminal_usage_or_token_metadata",
+        },
         "chat_template_kwargs": dict(fixture.chat_template_kwargs),
         "response_channel": fixture.response_channel,
         "expected_output_substrings": list(fixture.expected_output_substrings),

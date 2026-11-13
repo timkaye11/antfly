@@ -587,7 +587,8 @@ fn sessionEnablesDebertaRerankerWeightMirrors(
 
 fn sessionEnablesImmutableF32WeightBorrow(
     backend_type: BackendType,
-    arch_type: ArchType,
+    model_type: manifest_mod.ModelType,
+    arch_config: ArchConfig,
     task: SessionTask,
     gliner_span_encoder_family: manifest_mod.GlinerSpanEncoderFamily,
 ) bool {
@@ -595,9 +596,19 @@ fn sessionEnablesImmutableF32WeightBorrow(
     // Finetuning's explicit generic sessions and caller-created WeightStores
     // retain the copying contract; they must never inherit this capability
     // merely because a parameter name resembles an inference weight.
-    if (backend_type != .metal or task != .extractor) return false;
-    return arch_type == .gliner or
-        (arch_type == .modern_bert and gliner_span_encoder_family == .modern_bert);
+    if (backend_type != .metal) return false;
+    return switch (arch_config) {
+        .gliner => task == .extractor,
+        .modern_bert => task == .extractor and gliner_span_encoder_family == .modern_bert,
+        // Generator sessions are constructed over the model-owned lazy GGUF
+        // store. Its mapped tensors outlive every request/backend handle, and
+        // loadWeight pins each borrowed entry until the final handle drains.
+        // Caller-owned/training stores never pass through this constructor
+        // capability and keep WeightStore's default-false contract.
+        .gpt => |cfg| model_type == .generator and task == .generic and
+            cfg.family == .gemma and cfg.gemma4_channel_protocol,
+        else => false,
+    };
 }
 
 fn sessionPrefersImmutableGlinerF32Mps(
@@ -2950,7 +2961,8 @@ fn createGpuHostedSessionWithTaskOverride(
             .prefer_f32_dense_tensors = prefer_f32_dense_tensors,
             .allow_immutable_f32_weight_borrow = sessionEnablesImmutableF32WeightBorrow(
                 backend_type,
-                std.meta.activeTag(arch_config),
+                mf.model_type,
+                arch_config,
                 task,
                 mf.gliner_span_encoder_family,
             ),
@@ -6851,21 +6863,31 @@ test "sessionTaskForModelType maps classifier and extractor tasks" {
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
-test "GLiNER immutable F32 borrow policy includes declared ModernBERT span inference only" {
-    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.extractor, null), .unknown));
-    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.extractor, .extractor), .unknown));
-    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.extractor, .generic), .unknown));
-    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .modern_bert, .extractor, .modern_bert));
-    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .modern_bert, .extractor, .unknown));
-    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .modern_bert, .generic, .modern_bert));
-    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.native, .modern_bert, .extractor, .modern_bert));
+test "immutable F32 borrow policy is inference-only for GLiNER ModernBERT and Gemma4" {
+    const gliner = ArchConfig{ .gliner = .{} };
+    const modern = ArchConfig{ .modern_bert = .{} };
+    const gemma4 = ArchConfig{ .gpt = .{ .family = .gemma, .gemma4_channel_protocol = true } };
+    const gemma3 = ArchConfig{ .gpt = .{ .family = .gemma } };
+    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .extractor, gliner, .extractor, .unknown));
+    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .extractor, gliner, .generic, .unknown));
+    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .extractor, modern, .extractor, .modern_bert));
+    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .extractor, modern, .extractor, .unknown));
+    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .generator, gemma4, .generic, .unknown));
+    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .generator, gemma3, .generic, .unknown));
+    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .embedder, gemma4, .generic, .unknown));
+    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.native, .generator, gemma4, .generic, .unknown));
     try std.testing.expect(sessionPrefersImmutableGlinerF32Mps(.metal, .gliner, .extractor));
     try std.testing.expect(!sessionPrefersImmutableGlinerF32Mps(.metal, .modern_bert, .extractor));
     inline for (std.meta.tags(BackendType)) |backend_type| {
-        inline for (std.meta.tags(ArchType)) |arch_type| {
+        inline for ([_]ArchType{ .gliner, .modern_bert }) |arch_type| {
             inline for (std.meta.tags(SessionTask)) |task| {
+                const config: ArchConfig = switch (arch_type) {
+                    .gliner => .{ .gliner = .{} },
+                    .modern_bert => .{ .modern_bert = .{} },
+                    else => unreachable,
+                };
                 const expected = backend_type == .metal and arch_type == .gliner and task == .extractor;
-                try std.testing.expectEqual(expected, sessionEnablesImmutableF32WeightBorrow(backend_type, arch_type, task, .unknown));
+                try std.testing.expectEqual(expected, sessionEnablesImmutableF32WeightBorrow(backend_type, .extractor, config, task, .unknown));
             }
         }
     }

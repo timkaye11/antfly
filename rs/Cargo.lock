@@ -83,6 +83,7 @@ dependencies = [
 name = "antfly-sdk"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "http",
  "openapiv3",
@@ -96,6 +97,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "syn",
+ "tempfile",
  "tokio",
 ]
 

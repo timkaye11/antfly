@@ -25,6 +25,7 @@ const std = @import("std");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const runtime = @import("../runtime/root.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
+const recent_prefill_capture = @import("../graph/recent_prefill_query_capture.zig");
 const quant_matmul = @import("../graph/quant_matmul.zig");
 const operator_plan = @import("../graph/operator_plan.zig");
 const tensor_mod = @import("../backends/tensor.zig");
@@ -749,6 +750,118 @@ pub const A4bExpertGeometry = backend_contracts.A4bExpertGeometry;
 pub const A4bInferenceConfig = backend_contracts.A4bInferenceConfig;
 
 pub const DecoderRuntimeGreedyRequest = backend_contracts.DecoderRuntimeGreedyRequest;
+pub const DecoderRuntimeF16MirrorCohort = enum(u32) {
+    e2b_full35_gate_up_down = 1,
+    e4b_prefix26_gate_up = 2,
+};
+/// Legacy type name retained to avoid widening this experimental patch's API
+/// surface. `cohort` is the closed authority for E2 full35 vs E4 prefix26.
+pub const DecoderRuntimeE2bF16MirrorAdmission = struct {
+    cohort: DecoderRuntimeF16MirrorCohort,
+    model_layer_count: usize,
+    backend_cap_bytes: u64,
+    // Set only after full immutable family and LM-head staging is complete.
+    // Zero additional bytes then means known-resident, not unknown.
+    weights_complete: bool = false,
+    // Set only by a whole-model route after embedding, head, PLE and prefill
+    // planning have all completed successfully. The Metal backend still owns
+    // physical linear-slot materialization before weights_complete may become true.
+    nonlinear_weights_complete: bool = false,
+    adapters_active: bool = true,
+    additional_unprepared_weight_bytes: u64 = 0,
+    declared_backend_kv_bytes: u64,
+    declared_backend_scratch_bytes: u64,
+    /// Typed subset of declared scratch reserved for phase-only E4 transient
+    /// down buffers. Zero preserves every legacy caller.
+    e4_transient_down_scratch_bytes: u64 = 0,
+    max_context_tokens: usize,
+    max_prefill_rows: usize,
+    first_layer: usize = 0,
+    layer_count: usize,
+    pub fn requestFactsValid(self: @This()) bool {
+        if (self.backend_cap_bytes == 0 or self.backend_cap_bytes > @as(u64, 8) * 1024 * 1024 * 1024) return false;
+        if (self.declared_backend_kv_bytes == 0 or self.declared_backend_scratch_bytes == 0) return false;
+        if (self.max_context_tokens == 0 or self.max_prefill_rows == 0 or self.max_prefill_rows > 512 or self.layer_count == 0) return false;
+        const end = std.math.add(usize, self.first_layer, self.layer_count) catch return false;
+        const geometry_valid = switch (self.cohort) {
+            .e2b_full35_gate_up_down => self.model_layer_count == 35 and self.first_layer == 0 and self.layer_count == 35,
+            .e4b_prefix26_gate_up => self.model_layer_count == 42 and self.first_layer == 0 and self.layer_count == 26,
+        };
+        if (!geometry_valid or end > self.model_layer_count) return false;
+        if (self.e4_transient_down_scratch_bytes != 0 and
+            (self.e4_transient_down_scratch_bytes != 62_914_560 or
+                self.cohort != .e4b_prefix26_gate_up or
+                self.e4_transient_down_scratch_bytes > self.declared_backend_scratch_bytes)) return false;
+        _ = std.math.add(u64, self.declared_backend_kv_bytes, self.declared_backend_scratch_bytes) catch return false;
+        return true;
+    }
+    pub fn valid(self: @This()) bool {
+        return self.weights_complete and self.nonlinear_weights_complete and !self.adapters_active and self.requestFactsValid();
+    }
+};
+
+test "E2B mirror admission requires both nonlinear and physical weight completion" {
+    var value: DecoderRuntimeE2bF16MirrorAdmission = .{
+        .cohort = .e2b_full35_gate_up_down,
+        .model_layer_count = 35,
+        .backend_cap_bytes = 7 * 1024 * 1024 * 1024,
+        .adapters_active = false,
+        .declared_backend_kv_bytes = 1,
+        .declared_backend_scratch_bytes = 1,
+        .max_context_tokens = 2048,
+        .max_prefill_rows = 512,
+        .layer_count = 35,
+    };
+    try std.testing.expect(value.requestFactsValid());
+    try std.testing.expect(!value.valid());
+    value.nonlinear_weights_complete = true;
+    try std.testing.expect(!value.valid());
+    value.weights_complete = true;
+    try std.testing.expect(value.valid());
+    value.adapters_active = true;
+    try std.testing.expect(!value.valid());
+}
+
+test "F16 mirror admission cohorts are closed over model and mirror layer counts" {
+    var e4: DecoderRuntimeE2bF16MirrorAdmission = .{
+        .cohort = .e4b_prefix26_gate_up,
+        .model_layer_count = 42,
+        .backend_cap_bytes = 7 * 1024 * 1024 * 1024,
+        .weights_complete = true,
+        .nonlinear_weights_complete = true,
+        .adapters_active = false,
+        .declared_backend_kv_bytes = 1,
+        .declared_backend_scratch_bytes = 1,
+        .max_context_tokens = 2048,
+        .max_prefill_rows = 512,
+        .layer_count = 26,
+    };
+    try std.testing.expect(e4.valid());
+    e4.declared_backend_scratch_bytes = 62_914_560;
+    e4.e4_transient_down_scratch_bytes = 62_914_560;
+    try std.testing.expect(e4.requestFactsValid());
+    e4.declared_backend_scratch_bytes = 1;
+    try std.testing.expect(!e4.requestFactsValid());
+    e4.declared_backend_scratch_bytes = 62_914_560;
+    e4.e4_transient_down_scratch_bytes = 1;
+    try std.testing.expect(!e4.requestFactsValid());
+    e4.e4_transient_down_scratch_bytes = 62_914_560;
+    e4.cohort = .e2b_full35_gate_up_down;
+    try std.testing.expect(!e4.requestFactsValid());
+    e4.cohort = .e4b_prefix26_gate_up;
+    e4.e4_transient_down_scratch_bytes = 0;
+    e4.layer_count = 25;
+    try std.testing.expect(!e4.requestFactsValid());
+    e4.layer_count = 26;
+    e4.model_layer_count = 41;
+    try std.testing.expect(!e4.requestFactsValid());
+    e4.model_layer_count = 42;
+    e4.first_layer = 1;
+    try std.testing.expect(!e4.requestFactsValid());
+    e4.first_layer = 0;
+    e4.cohort = .e2b_full35_gate_up_down;
+    try std.testing.expect(!e4.requestFactsValid());
+}
 pub const DecoderRuntimePrepareAbsoluteEmbeddingsRequest = backend_contracts.DecoderRuntimePrepareAbsoluteEmbeddingsRequest;
 pub const DecoderRuntimeEmbedAbsolutePositionRequest = backend_contracts.DecoderRuntimeEmbedAbsolutePositionRequest;
 pub const DecoderRuntimePrepareLayerNormRequest = backend_contracts.DecoderRuntimePrepareLayerNormRequest;
@@ -1309,6 +1422,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q6_k_linear_reduce_f16_input: u64 = 0,
     metal_runtime_q6_k_high_row_mm_matrix_dispatches: u64 = 0,
     metal_runtime_lm_head_q4_q6_refine_dispatches: u64 = 0,
+    metal_runtime_lm_head_q6_full_argmax_dispatches: u64 = 0,
     metal_runtime_lm_head_q4_resident_sampling_rejections: u64 = 0,
     /// Generated small-batch quant kernel dispatch counters indexed by
     /// [quant_matmul.GeneratedQuantFormatIndex][quant_matmul.GeneratedQuantEpilogueIndex].
@@ -1493,6 +1607,12 @@ pub const NativeQuantTimingStats = struct {
     quantized_gated_ffn_type_mismatches: u64 = 0,
     quantized_gated_ffn_unsupported_types: u64 = 0,
     quantized_gated_ffn_runtime_failures: u64 = 0,
+    e4_fused_half_attempts: u64 = 0,
+    e4_fused_half_hits: u64 = 0,
+    e4_fused_half_pair_dispatches: u64 = 0,
+    e4_fused_half_down_dispatches: u64 = 0,
+    e4_fused_half_fallbacks: u64 = 0,
+    e4_fused_half_fatal_failures: u64 = 0,
     compressed_attention_residual_fused_successes: u64 = 0,
     compressed_attention_residual_update_span_failures: u64 = 0,
     compressed_attention_residual_attention_span_failures: u64 = 0,
@@ -2033,6 +2153,12 @@ pub const ComputeBackend = struct {
         /// Embedding table lookup: weight[ids[i]] for each i. Returns [total, dim].
         embeddingLookup: *const fn (ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT,
 
+        /// Typed Gemma PLE authority. A true result means the backend has
+        /// selected a bounded fail-closed route and prewarm must not gather a
+        /// row through the generic whole-table path.
+        prepareBoundedPleEmbedding: ?*const fn (ctx: *anyopaque, weight: CT, dim: usize) anyerror!bool = null,
+        boundedPleQ6Active: ?*const fn (ctx: *anyopaque) bool = null,
+
         /// Embedding table lookup with an output scale fused into the backend gather.
         /// Backends may return null to use embeddingLookup plus a scalar multiply.
         embeddingLookupScaled: ?*const fn (ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize, scale: f32) anyerror!?CT = null,
@@ -2263,6 +2389,8 @@ pub const ComputeBackend = struct {
         decoderRuntimeSetWhisperPipelinedFrames: ?*const fn (ctx: *anyopaque, enabled: bool) bool = null,
         decoderRuntimeSubmitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         decoderRuntimeWaitSubmittedFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        encodeRecentPrefillQueryCapture: ?*const fn (ctx: *anyopaque, descriptor: recent_prefill_capture.Descriptor, q_rope: CT, consumer_layer: u32, donor_layer: u32, first_absolute_position: u32, row_count: u16, num_heads: u16, head_dim: u16) anyerror!bool = null,
+        decoderRuntimeLastCompletedRecentQueryCaptureFrameNonce: ?*const fn (ctx: *anyopaque, capture_domain: *anyopaque) u64 = null,
 
         /// Planned variant for graph executors that already selected a
         /// backend-specific operator. Backends that leave this null use
@@ -3003,6 +3131,9 @@ pub const ComputeBackend = struct {
         /// decoder-only model. Backends return false when unsupported so the
         /// caller can fall back to the existing decode path.
         decoderRuntimePrepareGreedy: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeGreedyRequest) anyerror!bool = null,
+        decoderRuntimeFinalizeE2bF16Mirrors: ?*const fn (ctx: *anyopaque, admission: ?*const DecoderRuntimeE2bF16MirrorAdmission) anyerror!bool = null,
+        decoderRuntimeFinishBoundedPlePrefill: ?*const fn (ctx: *anyopaque, admission: *const DecoderRuntimeE2bF16MirrorAdmission) anyerror!bool = null,
+        decoderRuntimeResetBoundedPleRequest: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
 
         /// Reset runtime-owned mutable state for the backend whole-token
         /// decode path while keeping resident model weights/slots intact.
@@ -3285,6 +3416,7 @@ pub const ComputeBackend = struct {
         /// owned whole-token submission and return the post-residual
         /// [1, hidden_size] tensor.
         runGatedFfnResidual: ?*const fn (ctx: *anyopaque, request: *const RunGatedFfnResidualRequest) anyerror!?CT = null,
+        residentGatedFfnFusionCandidate: ?*const fn (ctx: *anyopaque) bool = null,
 
         /// Apply a gated FFN strip without a residual epilogue. Backends may
         /// fuse gate/up projection, activation/multiply, and down projection.
@@ -3496,6 +3628,16 @@ pub const ComputeBackend = struct {
 
     pub fn embeddingLookup(self: *const ComputeBackend, weight: CT, ids: []const i64, total: usize, dim: usize) !CT {
         return self.vtable.embeddingLookup(self.ptr, weight, ids, total, dim);
+    }
+
+    pub fn prepareBoundedPleEmbedding(self: *const ComputeBackend, weight: CT, dim: usize) !bool {
+        const op = self.vtable.prepareBoundedPleEmbedding orelse return false;
+        return op(self.ptr, weight, dim);
+    }
+
+    pub fn boundedPleQ6Active(self: *const ComputeBackend) bool {
+        const op = self.vtable.boundedPleQ6Active orelse return false;
+        return op(self.ptr);
     }
 
     pub fn embeddingLookupScaled(self: *const ComputeBackend, weight: CT, ids: []const i64, total: usize, dim: usize, scale: f32) !?CT {
@@ -4331,6 +4473,20 @@ pub const ComputeBackend = struct {
     /// when none is in flight.
     pub fn decoderRuntimeWaitSubmittedFrame(self: *const ComputeBackend) !void {
         if (self.vtable.decoderRuntimeWaitSubmittedFrame) |op| return op(self.ptr);
+    }
+
+    pub fn encodeRecentPrefillQueryCapture(self: *const ComputeBackend, descriptor: recent_prefill_capture.Descriptor, q_rope: CT, consumer_layer: u32, donor_layer: u32, first_absolute_position: u32, row_count: u16, num_heads: u16, head_dim: u16) !bool {
+        try descriptor.validate();
+        try self.checkExecutionControl();
+        const op = self.vtable.encodeRecentPrefillQueryCapture orelse return false;
+        const encoded = try op(self.ptr, descriptor, q_rope, consumer_layer, donor_layer, first_absolute_position, row_count, num_heads, head_dim);
+        try self.checkExecutionControl();
+        return encoded;
+    }
+
+    pub fn decoderRuntimeLastCompletedRecentQueryCaptureFrameNonce(self: *const ComputeBackend, capture_domain: *anyopaque) u64 {
+        const op = self.vtable.decoderRuntimeLastCompletedRecentQueryCaptureFrameNonce orelse return 0;
+        return op(self.ptr, capture_domain);
     }
 
     pub fn addLayerNorm(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
@@ -5597,6 +5753,25 @@ pub const ComputeBackend = struct {
         return false;
     }
 
+    pub fn decoderRuntimeFinalizeE2bF16Mirrors(self: *const ComputeBackend, admission: ?*const DecoderRuntimeE2bF16MirrorAdmission) !bool {
+        if (self.vtable.decoderRuntimeFinalizeE2bF16Mirrors) |op| return op(self.ptr, admission);
+        return false;
+    }
+
+    /// Fenced transition from request-scoped bounded PLE prefill storage to
+    /// the exact immutable whole-Q6 table required by pipelined decode.
+    pub fn decoderRuntimeFinishBoundedPlePrefill(self: *const ComputeBackend, admission: *const DecoderRuntimeE2bF16MirrorAdmission) !bool {
+        const op = self.vtable.decoderRuntimeFinishBoundedPlePrefill orelse return false;
+        return op(self.ptr, admission);
+    }
+
+    /// Explicit request-boundary cleanup. Internal decoder/KV span resets must
+    /// not call this because bounded PLE authority spans every prefill chunk.
+    pub fn decoderRuntimeResetBoundedPleRequest(self: *const ComputeBackend) !bool {
+        const op = self.vtable.decoderRuntimeResetBoundedPleRequest orelse return false;
+        return op(self.ptr);
+    }
+
     pub fn decoderRuntimeResetState(self: *const ComputeBackend) !void {
         if (self.vtable.decoderRuntimeResetState) |op| {
             return op(self.ptr);
@@ -6116,6 +6291,11 @@ pub const ComputeBackend = struct {
             return op(self.ptr, request);
         }
         return null;
+    }
+
+    pub fn residentGatedFfnFusionCandidate(self: *const ComputeBackend) bool {
+        const op = self.vtable.residentGatedFfnFusionCandidate orelse return false;
+        return op(self.ptr);
     }
 
     pub fn gatedFfnNoBias(self: *const ComputeBackend, request: *const GatedFfnNoBiasRequest) !?CT {

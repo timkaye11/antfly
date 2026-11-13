@@ -32,7 +32,6 @@ inline float fit_reduce(threadgroup float *scratch, uint lane, float value, bool
     threadgroup_barrier(mem_flags::mem_threadgroup);
     return result;
 }
-
 inline void fit_add(thread float &sum, thread float &correction, float value) {
     const float adjusted = value - correction;
     const float next = sum + adjusted;
@@ -45,7 +44,7 @@ inline void fit_add(thread float &sum, thread float &correction, float value) {
 kernel void metal_attention_match_fit(
     device const float *keys [[buffer(0)]], device const float *values [[buffer(1)]],
     device const float *queries [[buffer(2)]], device const float *bias [[buffer(3)]],
-    device uchar *unused4 [[buffer(4)]], device uchar *unused5 [[buffer(5)]],
+    device uchar *raw4 [[buffer(4)]], device uchar *unused5 [[buffer(5)]],
     device uchar *unused6 [[buffer(6)]], device float *out [[buffer(7)]],
     constant Params &p [[buffer(8)]], uint lane [[thread_index_in_threadgroup]],
     uint local_group [[threadgroup_position_in_grid]]) {
@@ -53,11 +52,37 @@ kernel void metal_attention_match_fit(
     if (group >= p.groups) return;
     threadgroup float reduction[128];
     device const float *query = queries + group * p.dim;
+    if (p.op == 2) {
+        device const float *pairs = (device const float *)raw4;
+        // Captured-page replay addresses immutable all-query inputs globally,
+        // but its bounded output is always tile-local.
+        device float *page = out + local_group * p.stride;
+        const float maximum = pairs[group * 2];
+        const float denominator = pairs[group * 2 + 1];
+        for (uint local = lane; local < p.stride; local += 128) {
+            const uint row = p.position + local;
+            float dot = 0, correction = 0;
+            for (uint col = 0; col < p.dim; ++col) {
+                const uint key_index = p.mode == 1 ? col * p.n + row : row * p.dim + col;
+                fit_add(dot, correction, keys[key_index] * query[col]);
+            }
+            dot *= p.scale;
+            if (!isfinite(dot)) dot = NAN;
+            else if (p.reserved > 0) dot = p.reserved * tanh(dot / p.reserved);
+            page[local] = exp(dot + bias[row] - maximum) / denominator;
+        }
+        return;
+    }
     device float *probabilities = out + group * p.n;
     float maximum = -INFINITY;
     for (uint row = lane; row < p.n; row += 128) {
         float dot = 0, correction = 0;
-        for (uint col = 0; col < p.dim; ++col) fit_add(dot, correction, keys[row * p.dim + col] * query[col]);
+        // mode=1 changes only physical addressing. Every lane retains the
+        // legacy col order, multiplication and compensated accumulation.
+        for (uint col = 0; col < p.dim; ++col) {
+            const uint key_index = p.mode == 1 ? col * p.n + row : row * p.dim + col;
+            fit_add(dot, correction, keys[key_index] * query[col]);
+        }
         dot *= p.scale;
         if (!isfinite(dot)) dot = NAN;
         else if (p.reserved > 0) dot = p.reserved * tanh(dot / p.reserved);
@@ -81,5 +106,11 @@ kernel void metal_attention_match_fit(
         for (uint row = 0; row < p.n; ++row) fit_add(value, error, probabilities[row] * values[row * p.dim + col]);
         targets[col] = value;
     }
-    if (lane == 0) out[p.groups * (p.n + p.dim) + group] = maximum + log(sum);
+    if (lane == 0) {
+        if (p.op == 1) {
+            device float *pairs = out + p.groups * (p.n + p.dim);
+            pairs[group * 2] = maximum;
+            pairs[group * 2 + 1] = sum;
+        } else out[p.groups * (p.n + p.dim) + group] = maximum + log(sum);
+    }
 }

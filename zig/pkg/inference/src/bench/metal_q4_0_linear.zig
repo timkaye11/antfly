@@ -1003,7 +1003,24 @@ fn compareQ4E2bDisabledBaseline(
         "q4_e2b_disabled_baseline_parity mode={s} rows={d} in={d} out={d} baseline_hash={x} candidate_hash={x}\n",
         .{ cfg.mode.name(), cfg.rows, cfg.in_dim, cfg.out_dim, baseline_hash, candidate_hash },
     );
-    if (!std.mem.eql(u8, baseline_bytes, candidate_bytes)) return error.Q4E2bDisabledBaselineMismatch;
+    if (!std.mem.eql(u8, baseline_bytes, candidate_bytes)) {
+        var differing_values: usize = 0;
+        var nonfinite_values: usize = 0;
+        var max_abs_error: f64 = 0;
+        for (baseline_values, candidate_values) |reference, actual| {
+            if (@as(u32, @bitCast(reference)) != @as(u32, @bitCast(actual))) differing_values += 1;
+            if (!std.math.isFinite(reference) or !std.math.isFinite(actual)) {
+                nonfinite_values += 1;
+            } else {
+                max_abs_error = @max(max_abs_error, @abs(@as(f64, actual) - @as(f64, reference)));
+            }
+        }
+        std.debug.print(
+            "q4_e2b_disabled_baseline_difference differing_values={d} nonfinite_values={d} max_abs_error={d:.9}\n",
+            .{ differing_values, nonfinite_values, max_abs_error },
+        );
+        return error.Q4E2bDisabledBaselineMismatch;
+    }
 }
 
 fn applyPleOnce(
@@ -1439,6 +1456,10 @@ pub fn main(init: std.process.Init) !void {
         const q_values = try output.q.toHostSlice();
         const k_values = try output.k.toHostSlice();
         const v_values = try output.v.toHostSlice();
+        for ([_][]const f32{ q_values, k_values, v_values }) |values| {
+            for (values) |value| if (!std.math.isFinite(value)) return error.NonfiniteBenchmarkOutput;
+        }
+        std.debug.print("output_nonfinite_values=0\n", .{});
         var output_hasher = std.hash.Wyhash.init(0);
         output_hasher.update(std.mem.sliceAsBytes(q_values));
         output_hasher.update(std.mem.sliceAsBytes(k_values));
@@ -1466,6 +1487,8 @@ pub fn main(init: std.process.Init) !void {
         } else try applyFfnOutput(runtime, input, cfg);
         defer output.deinit();
         const values = try output.toHostSlice();
+        for (values) |value| if (!std.math.isFinite(value)) return error.NonfiniteBenchmarkOutput;
+        std.debug.print("output_nonfinite_values=0\n", .{});
         const output_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(values));
         if (cfg.expect_output_hash) |expected_hash| {
             if (output_hash != expected_hash) {

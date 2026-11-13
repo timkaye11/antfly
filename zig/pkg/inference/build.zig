@@ -1203,6 +1203,8 @@ pub fn build(b: *std.Build) void {
     // inference_internal already owns the native backend links. Configuring
     // Metal again here compiles metal_kernels.m twice into this executable.
     metal_bench_exe.root_module.link_libc = true;
+    b.step("build-inference-metal-bench", "Build the focused Metal kernel benchmark without running GPU work")
+        .dependOn(&b.addInstallArtifact(metal_bench_exe, .{}).step);
     const run_metal_bench = b.addRunArtifact(metal_bench_exe);
     run_metal_bench.addPassthruArgs();
     const metal_bench_step = b.step(
@@ -1338,6 +1340,7 @@ pub fn build(b: *std.Build) void {
         .{ .variant = "m32-n64", .rows = "31", .route = "m32-n64-tail", .hash = "74bf31c81f60ad14" },
         .{ .variant = "m32-n32", .rows = "31", .route = "m32-n32-tail", .hash = "74bf31c81f60ad14" },
         .{ .variant = "m32-n64", .rows = "2003", .route = "m32-n64-tail", .hash = "34e1a1753b4c4dfe" },
+        .{ .variant = "m32-n32", .rows = "2003", .route = "m32-n32-tail", .hash = "34e1a1753b4c4dfe" },
     };
     q4_pair_route_tail = &q4_pair_mmv_kill_switch_check.step;
     for (q4_pair_mm_cases) |case| {
@@ -1378,16 +1381,21 @@ pub fn build(b: *std.Build) void {
         if (e2b_prefill_route_tail) |tail| check.step.dependOn(tail);
         e2b_prefill_route_tail = &check.step;
     }
-    const e2b_q4_pair_cases = [_]struct { rows: []const u8, out_dim: []const u8, route: []const u8 }{
-        .{ .rows = "32", .out_dim = "6144", .route = "m32-n64-aligned" },
-        .{ .rows = "31", .out_dim = "6144", .route = "m32-n64-tail" },
-        .{ .rows = "32", .out_dim = "12288", .route = "m32-n64-aligned" },
-        .{ .rows = "31", .out_dim = "12288", .route = "m32-n64-tail" },
+    const e2b_q4_pair_cases = [_]struct { variant: []const u8, rows: []const u8, out_dim: []const u8, route: []const u8 }{
+        .{ .variant = "m32-n64", .rows = "32", .out_dim = "6144", .route = "m32-n64-aligned" },
+        .{ .variant = "m32-n64", .rows = "31", .out_dim = "6144", .route = "m32-n64-tail" },
+        .{ .variant = "m32-n64", .rows = "32", .out_dim = "12288", .route = "m32-n64-aligned" },
+        .{ .variant = "m32-n64", .rows = "31", .out_dim = "12288", .route = "m32-n64-tail" },
+        .{ .variant = "m32-n32", .rows = "32", .out_dim = "6144", .route = "m32-n32-aligned" },
+        .{ .variant = "m32-n32", .rows = "31", .out_dim = "6144", .route = "m32-n32-tail" },
+        .{ .variant = "m32-n32", .rows = "32", .out_dim = "12288", .route = "m32-n32-aligned" },
+        .{ .variant = "m32-n32", .rows = "31", .out_dim = "12288", .route = "m32-n32-tail" },
     };
     for (e2b_q4_pair_cases) |case| {
         const check = b.addRunArtifact(metal_bench_exe);
         check.setEnvironmentVariable("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM", "1");
         check.setEnvironmentVariable("TERMITE_METAL_DISABLE_E2B_Q4_0_PAIR_ACTIVATION_MM", "0");
+        check.setEnvironmentVariable("TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MM_VARIANT", case.variant);
         check.addArg("--skip-unless-apple-m4");
         check.addArgs(&.{ "--mode", "ffn", "--rows", case.rows, "--in", "1536", "--out", case.out_dim, "--warmup", "1", "--iters", "3", "--compare-q4-e2b-disabled-baseline", "--expect-q4-pair-mm-route", case.route });
         if (e2b_prefill_route_tail) |tail| check.step.dependOn(tail);

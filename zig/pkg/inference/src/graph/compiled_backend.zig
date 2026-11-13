@@ -63,7 +63,13 @@ pub const AttachContext = struct {
     kv_dtype: ?runtime_mod.kv.pool.KvDType = null,
     shared_moe_cache: ?*runtime_mod.moe.shared.SharedExpertCache = null,
     attention_mode: ?cache_mod.AttentionMode = null,
+    /// Trusted identity derived by the loaded-model boundary from native4
+    /// weights plus the effective model layout. Callers must not fabricate it.
+    model_identity: ?runtime_mod.kv.attention_match_checkpoint.Identity = null,
     attachment_target: AttachmentTarget = .partitioned,
+    /// Borrowed only by the call-time direct-session binder. Compiled
+    /// executors and graph entries must never retain this request pointer.
+    context_owner_binding: ?model_runtime.ContextOwnerBinding = null,
 };
 
 pub const Definition = struct {
@@ -164,7 +170,10 @@ pub fn modelRuntimeForSessionExecutor(
     attachment_target: cache_mod.CompiledAttachmentTarget,
     model_executor: *model_runtime.ModelExecutor,
 ) !*model_runtime.ModelRuntime {
-    if (cache.getSessionCompiledModelRuntime(backend_kind, attachment_target)) |runtime_value| return runtime_value;
+    if (cache.getSessionCompiledModelRuntime(backend_kind, attachment_target)) |runtime_value| {
+        if (!model_runtime.sameOptionalModelIdentity(runtime_value.model_identity, model_executor.model_identity)) return error.CompiledModelIdentityMismatch;
+        return runtime_value;
+    }
 
     // The runtime is cached on the session for the model's lifetime, so it
     // must allocate from the cache's allocator. Callers often pass a
@@ -186,8 +195,14 @@ pub fn modelRuntimeForExecutor(
     attachment_target: cache_mod.CompiledAttachmentTarget,
     model_executor: *const model_runtime.ModelExecutor,
 ) !*model_runtime.ModelRuntime {
-    if (entry.compiled_model_runtime) |*runtime_value| return runtime_value;
-    if (cache.getSessionCompiledModelRuntime(backend_kind, attachment_target)) |runtime_value| return runtime_value;
+    if (entry.compiled_model_runtime) |*runtime_value| {
+        if (!model_runtime.sameOptionalModelIdentity(runtime_value.model_identity, model_executor.model_identity)) return error.CompiledModelIdentityMismatch;
+        return runtime_value;
+    }
+    if (cache.getSessionCompiledModelRuntime(backend_kind, attachment_target)) |runtime_value| {
+        if (!model_runtime.sameOptionalModelIdentity(runtime_value.model_identity, model_executor.model_identity)) return error.CompiledModelIdentityMismatch;
+        return runtime_value;
+    }
 
     // Cached for the entry's lifetime: allocate from the cache, not the request.
     _ = allocator;
@@ -521,4 +536,31 @@ test "modelRuntimeForExecutor promotes backend-owned runtimes to session scope" 
     try std.testing.expect(first == second);
     try std.testing.expect(cache.getSessionCompiledModelRuntime(.pjrt, .whole_model) == first);
     try std.testing.expectEqual(@as(usize, 1), mock.created);
+}
+
+test "session runtime cache rejects none upgrade and full identity mismatch" {
+    const allocator = std.testing.allocator;
+    const identity_a = @import("../runtime/kv/attention_match_checkpoint.zig").Identity{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) };
+    var identity_b = identity_a;
+    identity_b.template[0] ^= 1;
+
+    var none_cache = cache_mod.GraphCache.init(allocator);
+    defer none_cache.deinit();
+    var none_mock = RuntimeCachingMock{ .ownership = .backend_owned };
+    var none_executor = none_mock.executor();
+    defer none_executor.deinit();
+    _ = try modelRuntimeForSessionExecutor(allocator, &none_cache, .metal, .whole_model, &none_executor);
+    none_executor.model_identity = identity_a;
+    try std.testing.expectError(error.CompiledModelIdentityMismatch, modelRuntimeForSessionExecutor(allocator, &none_cache, .metal, .whole_model, &none_executor));
+
+    var bound_cache = cache_mod.GraphCache.init(allocator);
+    defer bound_cache.deinit();
+    var bound_mock = RuntimeCachingMock{ .ownership = .backend_owned };
+    var bound_executor = bound_mock.executor();
+    defer bound_executor.deinit();
+    bound_executor.model_identity = identity_a;
+    _ = try modelRuntimeForSessionExecutor(allocator, &bound_cache, .metal, .whole_model, &bound_executor);
+    _ = try modelRuntimeForSessionExecutor(allocator, &bound_cache, .metal, .whole_model, &bound_executor);
+    bound_executor.model_identity = identity_b;
+    try std.testing.expectError(error.CompiledModelIdentityMismatch, modelRuntimeForSessionExecutor(allocator, &bound_cache, .metal, .whole_model, &bound_executor));
 }

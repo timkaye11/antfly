@@ -23,9 +23,14 @@ def _get_kwargs(
         "url": "/ai/v1/generate/context/resume/batch",
     }
 
-    _kwargs["content"] = body.payload
+    if isinstance(body, File):
+        _kwargs["content"] = body.payload
 
-    headers["Content-Type"] = "application/vnd.antfly.attachments.v1"
+        headers["Content-Type"] = "application/vnd.antfly.attachments.v1"
+    if isinstance(body, File):
+        _kwargs["content"] = body.payload
+
+        headers["Content-Type"] = "application/vnd.antfly.attachments.v2"
 
     _kwargs["headers"] = headers
     return _kwargs
@@ -88,8 +93,10 @@ def sync_detailed(
 ) -> Response[InferenceError | InferenceGenerateBatchResponse | InferenceTransientCapacityError]:
     """Resume one checkpoint and generate serial ordinary siblings
 
-     Accepts one AFATT001 envelope whose JSON metadata is a GenerateBatchRequest
-    and whose single application/vnd.antfly.kv-checkpoint attachment belongs
+     Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateBatchRequest;
+    AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+    string contains the GenerateBatchRequest. Its single
+    application/vnd.antfly.kv-checkpoint attachment belongs
     to the first request. The remaining requests use ordinary exact generation.
     All requests run serially in submission order and release their private
     generation state before the next request starts. The checkpoint remains
@@ -112,6 +119,7 @@ def sync_detailed(
     Parent cancellation and its absolute deadline apply to every item.
 
     Args:
+        body (File):
         body (File):
 
     Raises:
@@ -140,8 +148,10 @@ def sync(
 ) -> InferenceError | InferenceGenerateBatchResponse | InferenceTransientCapacityError | None:
     """Resume one checkpoint and generate serial ordinary siblings
 
-     Accepts one AFATT001 envelope whose JSON metadata is a GenerateBatchRequest
-    and whose single application/vnd.antfly.kv-checkpoint attachment belongs
+     Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateBatchRequest;
+    AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+    string contains the GenerateBatchRequest. Its single
+    application/vnd.antfly.kv-checkpoint attachment belongs
     to the first request. The remaining requests use ordinary exact generation.
     All requests run serially in submission order and release their private
     generation state before the next request starts. The checkpoint remains
@@ -165,6 +175,7 @@ def sync(
 
     Args:
         body (File):
+        body (File):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -187,8 +198,10 @@ async def asyncio_detailed(
 ) -> Response[InferenceError | InferenceGenerateBatchResponse | InferenceTransientCapacityError]:
     """Resume one checkpoint and generate serial ordinary siblings
 
-     Accepts one AFATT001 envelope whose JSON metadata is a GenerateBatchRequest
-    and whose single application/vnd.antfly.kv-checkpoint attachment belongs
+     Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateBatchRequest;
+    AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+    string contains the GenerateBatchRequest. Its single
+    application/vnd.antfly.kv-checkpoint attachment belongs
     to the first request. The remaining requests use ordinary exact generation.
     All requests run serially in submission order and release their private
     generation state before the next request starts. The checkpoint remains
@@ -211,6 +224,7 @@ async def asyncio_detailed(
     Parent cancellation and its absolute deadline apply to every item.
 
     Args:
+        body (File):
         body (File):
 
     Raises:
@@ -237,8 +251,10 @@ async def asyncio(
 ) -> InferenceError | InferenceGenerateBatchResponse | InferenceTransientCapacityError | None:
     """Resume one checkpoint and generate serial ordinary siblings
 
-     Accepts one AFATT001 envelope whose JSON metadata is a GenerateBatchRequest
-    and whose single application/vnd.antfly.kv-checkpoint attachment belongs
+     Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateBatchRequest;
+    AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+    string contains the GenerateBatchRequest. Its single
+    application/vnd.antfly.kv-checkpoint attachment belongs
     to the first request. The remaining requests use ordinary exact generation.
     All requests run serially in submission order and release their private
     generation state before the next request starts. The checkpoint remains
@@ -261,6 +277,7 @@ async def asyncio(
     Parent cancellation and its absolute deadline apply to every item.
 
     Args:
+        body (File):
         body (File):
 
     Raises:

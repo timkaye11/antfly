@@ -578,11 +578,12 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (ctx.cb != null) return;
             var cb = try session_factory.getComputeBackendWithBudget(ctx.model.session, ctx.allocator, &ctx.budget);
             errdefer cb.deinit();
-            // The device hook owns CUDA KV bytes. Both epoch pools retain
-            // logical pages without allocating a second pair of host mirrors.
-            const config = generation.requestKvManagerPoolConfig(generation.kvPoolConfig(if (ctx.model.session.backend() == .cuda) .cuda else .metal, kv_dtype, ctx.cfg, Hooks.generationKvSlidingTrimForced()));
-            ctx.pool = try ctx.manager.addPool(config);
-            ctx.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, config);
+            // The manager owns logical pages only. CUDA numerical storage
+            // remains device-authoritative; Metal numerical storage retains
+            // its original host fallback instead of inheriting manager policy.
+            const configs = generation.requestKvPoolConfigs(generation.kvPoolConfig(if (ctx.model.session.backend() == .cuda) .cuda else .metal, kv_dtype, ctx.cfg, Hooks.generationKvSlidingTrimForced()));
+            ctx.pool = try ctx.manager.addPool(configs.manager);
+            ctx.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, configs.storage);
             errdefer ctx.storage.deinit();
             try cb.provisionKvDeviceWriteHook(&ctx.storage);
             if (comptime build_options.enable_metal) {

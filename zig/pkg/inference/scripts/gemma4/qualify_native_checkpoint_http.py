@@ -17,9 +17,11 @@
 """Public native checkpoint roundtrip qualification; no private compaction flags."""
 
 import argparse
+import base64
 import contextlib
 import copy
 import http.client
+import importlib.util
 import json
 import math
 import os
@@ -66,6 +68,74 @@ METAL_LOADER_HEADROOM_INTERVAL_SECONDS = 10
 METAL_LOADER_HEADROOM_MAX_WAIT_SECONDS = 1800
 METAL_TEST_MINIMUM_SAVINGS_HEADER = "X-Antfly-Qualification-Minimum-Savings"
 PORTABLE_IDENTITY_FIELDS = {"weights", "tokenizer", "template", "layout"}
+
+
+def _native_kv_v2_module():
+    """Load the canonical stdlib-only SDK framing module from this checkout."""
+    name = "antfly_qualification_native_kv_v2"
+    module = sys.modules.get(name)
+    if module is not None:
+        return module
+    relative = Path("py/packages/sdk/src/antfly/native_kv.py")
+    path = next((root / relative for root in Path(__file__).resolve().parents if (root / relative).is_file()), None)
+    if path is None:
+        raise RuntimeError("canonical AFATT002 transport unavailable")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("canonical AFATT002 transport unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def _receive_compiled_checkpoint(response, destination, model, content_type):
+    wire = _native_kv_v2_module()
+    if content_type != wire.CONTENT_TYPE_V2:
+        raise AssertionError("compiled full-cli prepare requires AFATT002")
+    saved = wire.receive_checkpoint(response, destination, model, content_type=content_type)
+    raw = base64.b64decode(saved.prepared_metadata_base64, validate=True)
+    producer = json.loads(raw)
+    return {
+        "metadata": producer,
+        "file_sha256": saved.sha256,
+        "bytes": os.stat(saved.path).st_size,
+        "identity": dict(saved.identity),
+        "envelope_version": saved.envelope_version,
+        "prepared_metadata_base64": saved.prepared_metadata_base64,
+        "producer_outcome": saved.producer_outcome,
+    }
+
+
+def _send_compiled_resume(connection, path, metadata, checkpoint, prepared_metadata_base64, mutate=None):
+    if mutate is not None:
+        raise ValueError("AFATT002 mutation is unsupported")
+    if not isinstance(prepared_metadata_base64, str) or not prepared_metadata_base64:
+        raise ValueError("AFATT002 prepared producer metadata required")
+    wire = _native_kv_v2_module()
+    with Path(checkpoint).open("rb") as source:
+        length, chunks = wire.checkpoint_upload(source, metadata, prepared_metadata_base64)
+        connection.putrequest("POST", path)
+        connection.putheader("Content-Type", wire.CONTENT_TYPE_V2)
+        connection.putheader("Content-Length", str(length))
+        connection.endheaders()
+        try:
+            for chunk in chunks:
+                connection.send(chunk)
+        except (BrokenPipeError, ConnectionResetError) as upload_error:
+            try:
+                response = connection.getresponse()
+            except (OSError, http.client.HTTPException) as response_error:
+                raise upload_error from response_error
+            if response.status < 400:
+                response.close()
+                raise upload_error
+            return response
+    return connection.getresponse()
 
 
 class MetalProcessSampler:
@@ -422,8 +492,21 @@ def validate_metal_memory(memory, max_rss_bytes=METAL_COMBINED_RSS_LIMIT_BYTES):
 
 
 def validate_backend_configuration(args):
-    if (args.backend == "metal") != (args.server_kind == "metal-test"):
-        raise ValueError("--backend metal requires --server-kind metal-test and vice versa")
+    compiled_prepare = getattr(args, "compiled_prefill_prepare", False)
+    if type(compiled_prepare) is not bool:
+        raise ValueError("--compiled-prefill-prepare must be boolean")
+    full_cli_prepare = compiled_prepare and args.server_kind == "full-cli"
+    if compiled_prepare and (args.backend != "metal" or not full_cli_prepare):
+        raise ValueError(
+            "--compiled-prefill-prepare requires --backend metal --server-kind full-cli"
+        )
+    if args.backend == "metal":
+        if args.server_kind not in ("metal-test", "full-cli"):
+            raise ValueError("--backend metal requires a Metal server kind")
+        if args.server_kind == "full-cli" and not full_cli_prepare:
+            raise ValueError("--server-kind full-cli requires --compiled-prefill-prepare")
+    elif args.server_kind in ("metal-test", "full-cli"):
+        raise ValueError("Metal server kinds require --backend metal")
     if args.backend == "metal" and args.encoding not in ("f16", "fp8", "rotated4"):
         raise ValueError("Metal qualification supports only f16, fp8, and rotated4 checkpoints")
     if args.backend == "metal" and (
@@ -460,6 +543,25 @@ def prepare_headers(args):
     return headers
 
 
+def prepare_transport_headers(args):
+    headers = prepare_headers(args)
+    if compiled_prefill_prepare_requested(args):
+        _validate_compiled_v2_scope(args)
+        wire = _native_kv_v2_module()
+        headers["Accept"] = f"{wire.CONTENT_TYPE_V2}, {wire.CONTENT_TYPE}"
+    return headers
+
+
+def _validate_compiled_v2_scope(args):
+    if getattr(args, "encoding", None) != "f16":
+        raise ValueError("compiled AFATT002 prepare currently supports only f16")
+    minimum = getattr(args, "minimum_savings", None)
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)) or not math.isfinite(minimum) or float(minimum) != 1.5:
+        raise ValueError("compiled AFATT002 prepare requires minimum_savings=1.5")
+    if getattr(args, "minimum_fp8_heads", 0) != 0:
+        raise ValueError("compiled AFATT002 prepare does not support FP8 head claims")
+
+
 def normalize_request_body(args, body):
     """Bind Metal checkpoint qualification to direct eager execution."""
     if getattr(args, "backend", "cuda") != "metal":
@@ -476,9 +578,27 @@ def normalize_request_body(args, body):
     return normalized
 
 
+def compiled_prefill_prepare_requested(args):
+    requested = getattr(args, "compiled_prefill_prepare", False)
+    if type(requested) is not bool:
+        raise ValueError("compiled_prefill_prepare must be boolean")
+    if not requested:
+        return False
+    if getattr(args, "backend", "cuda") != "metal" or getattr(
+        args, "server_kind", "inference"
+    ) != "full-cli":
+        raise ValueError("compiled prefill prepare requires Metal full-cli")
+    return True
+
+
 def prepare_request_body(args, body):
     """Prepare never streams; preserve the caller's public measurement body."""
-    normalized = normalize_request_body(args, body)
+    if compiled_prefill_prepare_requested(args):
+        if "mode" in body:
+            raise ValueError("compiled full-cli prepare requires mode to be omitted")
+        normalized = body
+    else:
+        normalized = normalize_request_body(args, body)
     prepared = copy.deepcopy(normalized)
     prepared["stream"] = False
     return prepared
@@ -847,11 +967,12 @@ def prepare(args, body, record):
     )
     try:
         start = time.monotonic()
+        request_headers = prepare_transport_headers(args)
         connection.request(
             "POST",
             "/ai/v1/generate/context/checkpoint",
             json.dumps(body).encode(),
-            prepare_headers(args),
+            request_headers,
         )
         response = connection.getresponse()
         if response.status != 200:
@@ -859,13 +980,14 @@ def prepare(args, body, record):
                 f"prepare HTTP {response.status}: {response.read(65536)!r}"
             )
         headers = response_headers(response, record, args)
-        if headers.get("content-type", "").split(";")[0] != CONTENT_TYPE:
-            raise AssertionError("wrong export content type")
-        result = receive_checkpoint(
-            response,
-            args.checkpoint,
-            allow_rotated4=getattr(args, "encoding", "f16") == "rotated4",
-        )
+        content_type = headers.get("content-type", "").split(";")[0]
+        compiled = compiled_prefill_prepare_requested(args)
+        if compiled:
+            result = _receive_compiled_checkpoint(response, args.checkpoint, args.model, content_type)
+        else:
+            if content_type != CONTENT_TYPE:
+                raise AssertionError("wrong export content type")
+            result = receive_checkpoint(response, args.checkpoint, allow_rotated4=getattr(args, "encoding", "f16") == "rotated4")
         metadata = result["metadata"]
         if (
             getattr(args, "backend", "cuda") == "metal"
@@ -873,22 +995,18 @@ def prepare(args, body, record):
         ):
             raise AssertionError("checkpoint identity differs from loaded Metal model")
         encoding = getattr(args, "encoding", "f16")
-        if (
-            metadata.get("encoding") != encoding
-            or metadata.get("wire_version")
-            != {"f32": 2, "f16": 3, "fp8": 3, "rotated4": 4}[encoding]
-        ):
+        if metadata.get("encoding") != encoding or (not compiled and metadata.get("wire_version") != {"f32": 2, "f16": 3, "fp8": 3, "rotated4": 4}[encoding]):
             raise AssertionError("checkpoint did not use the requested encoding")
         if (
             metadata["model"] != args.model
             or metadata["outcome"] != args.expected_outcome
         ):
             raise AssertionError(metadata)
-        if metadata["outcome"] == "compacted":
+        if not compiled and metadata["outcome"] == "compacted":
             savings = metadata["global_savings_ratio"]
             if not math.isfinite(savings) or savings < args.minimum_savings:
                 raise AssertionError(metadata)
-        if encoding == "rotated4":
+        if not compiled and encoding == "rotated4":
             from qualify_attention_match_queries import validate_quantization_evidence
 
             validate_quantization_evidence(
@@ -896,7 +1014,7 @@ def prepare(args, body, record):
                 encoding,
                 require_actual=args.expected_outcome == "compacted",
             )
-        if metadata.get("fp8_heads", 0) < getattr(args, "minimum_fp8_heads", 0):
+        if not compiled and metadata.get("fp8_heads", 0) < getattr(args, "minimum_fp8_heads", 0):
             raise AssertionError("FP8 campaign did not exercise enough quantized heads")
         record["requests"].append(
             {
@@ -932,9 +1050,10 @@ def resume(args, body, record, prepared, label, expected_status=200, mutate=None
     )
     try:
         start = time.monotonic()
-        response = send_resume(
-            connection, "/ai/v1/generate/context/resume", body, args.checkpoint, mutate
-        )
+        if prepared.get("envelope_version") == 2:
+            response = _send_compiled_resume(connection, "/ai/v1/generate/context/resume", body, args.checkpoint, prepared.get("prepared_metadata_base64"), mutate)
+        else:
+            response = send_resume(connection, "/ai/v1/generate/context/resume", body, args.checkpoint, mutate)
         if response.status != expected_status:
             raise AssertionError(
                 f"{label} HTTP {response.status}, wanted {expected_status}: {response.read(65536)!r}"

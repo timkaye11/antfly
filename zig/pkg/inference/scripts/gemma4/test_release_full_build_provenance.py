@@ -68,6 +68,34 @@ class FullReleaseBuild(unittest.TestCase):
     def refresh_receipt(self): self.write('receipt',self.value)
     def test_valid_full_release_build_evidence(self):
         self.assertTrue(self.audit()['release_build_evidence'])
+    def test_complete_8244_file_archive_is_accepted(self):
+        # Reproduce the complete-tree archive that the recorder produced but
+        # the old 8192-entry validator rejected after a successful build.
+        for index in range(8243):
+            self.source['files'][f'zig/fixture/source-{index:05d}.zig'] = H(b'')
+        self.write_archive()
+        with zipfile.ZipFile(self.archive, 'a', compression=zipfile.ZIP_DEFLATED) as bundle:
+            for name in self.source['files']:
+                if name != self.source_name:
+                    bundle.writestr(name, b'')
+        self.value['source_archive'].update(
+            sha256=sha(self.archive), bytes=self.archive.stat().st_size, files=8244)
+        self.refresh_receipt()
+        self.assertTrue(self.audit()['release_build_evidence'])
+    def test_source_metadata_over_shared_limit_is_rejected(self):
+        for field in ('files', 'deleted', 'gitlinks'):
+            with self.subTest(field=field):
+                original = self.source[field]
+                names = [f'zig/fixture/source-{i:05d}.zig'
+                         for i in range(release.FULL_RELEASE_MAX_SOURCE_FILES + 1)]
+                self.source[field] = (names if field == 'deleted' else
+                    dict.fromkeys(names, H(b'') if field == 'files' else 'b' * 40))
+                try:
+                    self.refresh_receipt()
+                    with self.assertRaisesRegex(ValueError, 'invalid full release source manifest'):
+                        self.audit()
+                finally:
+                    self.source[field] = original
     def test_scoped_release_ineligible_capture_is_rejected(self):
         self.write('receipt',{'schema_version':1,'evidence_scope':'numerical_capture_and_metal_lifecycle_only',
                               'release_eligible':False,'binary_sha256':sha(self.root/'bin')})

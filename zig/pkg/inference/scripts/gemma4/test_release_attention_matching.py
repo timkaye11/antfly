@@ -26,6 +26,23 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 import release_attention_matching as release
+
+
+def full_ttft(variant, identity, ttft_ms):
+    names = sorted(release.FULL_TTFT_PHASES[variant])
+    start, total = 1_000_000_000, int(ttft_ms * 1e6)
+    phases, cursor = [], start
+    for index, name in enumerate(names):
+        end = start + total if index + 1 == len(names) else start + total * (index + 1) // len(names)
+        phases.append({"name": name, "start_ns": cursor, "end_ns": end,
+                       "authority": "client_monotonic_boundary"})
+        cursor = end
+    return {"schema": "antfly.attention-matching-full-ttft-attempt.v1", "clock": "posix_CLOCK_MONOTONIC",
+            "timing_scope": "full_request_pipeline_to_first_public_content",
+            "outer_start_ns": start, "first_public_content_ns": start + total,
+            "first_public_content_kind": "nonempty_public_delta", "phases": phases,
+            "fresh_owner_id": "owner-" + identity, "fresh_artifact_id": "artifact-" + identity,
+            "restore_ttft_ms": min(1.0, ttft_ms) if variant == "attention_matching" else None}
 import release_build_fixture
 import exact_context_qualify as exact_context
 
@@ -237,6 +254,9 @@ class ReleaseV2Tests(ReleaseTests):
             variants["attention_matching"].update(ttft_ms=125.0, decode_tokens_per_second=94.0,
                                                    committed_context_bytes=7000, published=True,
                                                    exact_fallback=False)
+            for variant, value in variants.items():
+                value["full_ttft_authority"] = full_ttft(
+                    variant, f"{prefix_name}-{index}-{variant}", value["ttft_ms"])
             return {"pair_id": f"{prefix_name}-{index}",
                     "prompt_sha256": hashlib.sha256(f"{prefix_name}-prompt-{index}".encode()).hexdigest(),
                     "settings_sha256": "f" * 64, "context_tokens": length,
@@ -351,6 +371,31 @@ class ReleaseV2Tests(ReleaseTests):
         self.assertFalse(result["evidence_passed"])
         self.assertTrue(result["diagnostic_only"])
         self.assertFalse(result["serving_qualified"])
+        self.assertIn("full_ingestion_performance_12_cells", result["incomplete_gates"])
+
+    def test_v2_full_inclusive_manifest_is_typed_and_requires_all_twelve_cells(self):
+        manifest = self.v2_manifest()
+        identity = manifest["models"][0]["semantic_identity"]
+        origin = manifest["models"][0]["provenance"]
+        malformed = {"schema": "antfly.release-full-ingestion-performance-manifest.v1", "models": [{
+            "model": "gemma4-e2b", "semantic_identity": identity, "provenance": origin,
+            "cells": [], "authorities": {}, "entries": []}]}
+        with self.assertRaisesRegex(ValueError, "twelve cells"):
+            release.audit(manifest, self.root, malformed)
+
+    def test_v2_attention_ttft_uses_faster_exact_baseline(self):
+        manifest = self.v2_manifest()
+        def faster_packed(record):
+            for row in record["warmups"] + record["samples"]:
+                row["exact"]["ttft_ms"] = 100.0
+                row["packed_exact"]["ttft_ms"] = 80.0
+                row["attention_matching"]["ttft_ms"] = 110.0
+                for variant in release.PERFORMANCE_VARIANTS:
+                    row[variant]["full_ttft_authority"] = full_ttft(
+                        variant, row[variant]["attempt_id"], row[variant]["ttft_ms"])
+        self.v2_rewrite(manifest, "performance", faster_packed)
+        with self.assertRaisesRegex(ValueError, "attention-matching TTFT regression"):
+            release.audit(manifest, self.root)
 
     def test_v2_rejects_sparse_samples_claimed_savings_and_binary_mismatch(self):
         manifest = self.v2_manifest()

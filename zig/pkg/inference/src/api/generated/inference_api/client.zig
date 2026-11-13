@@ -234,7 +234,7 @@ pub const Client = struct {
 
     /// Prepare a portable native KV checkpoint
     /// POST /generate/context/checkpoint
-    pub fn prepareNativeKvCheckpoint(self: *@This(), body: types.GenerateRequest, x_antfly_kv_encoding: ?[]const u8) !RawResponse {
+    pub fn prepareNativeKvCheckpoint(self: *@This(), body: types.GenerateRequest, accept: ?[]const u8, x_antfly_kv_encoding: ?[]const u8) !RawResponse {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/generate/context/checkpoint", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
@@ -242,6 +242,7 @@ pub const Client = struct {
         var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
         defer request_headers.deinit(self.allocator);
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
         if (x_antfly_kv_encoding) |value| try request_headers.append(self.allocator, .{ "X-Antfly-KV-Encoding", value });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         defer resp.deinit();

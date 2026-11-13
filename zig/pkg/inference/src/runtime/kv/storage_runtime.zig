@@ -38,6 +38,59 @@ pub fn swaRingPageCount(
     return std.math.divCeil(usize, padded_span, page_size_tokens) catch return error.KvCapacityTooSmall;
 }
 
+test "exact layer range export validates ordering bounds aliases and cap" {
+    var a: u8 = 0;
+    var b: u8 = 0;
+    var ranges = [_]ExactLayerRangeExport{.{ .layer_index = 4, .source_start = 4, .rows = 4, .num_kv_heads = 1, .head_dim = 8, .destination_k = .{ .handle = &a, .byte_offset = 0, .byte_len = 64 }, .destination_v = .{ .handle = &b, .byte_offset = 0, .byte_len = 64 } }};
+    var request: ExactLayerRangeExportRequest = .{ .source_sequence = 1, .expected_written_tokens = 8, .ranges = &ranges, .max_bytes = 128 };
+    try std.testing.expectEqual(@as(usize, 128), try request.validate());
+    request.max_bytes = 127;
+    try std.testing.expectError(error.ExactLayerRangeExportBudgetExceeded, request.validate());
+    request.max_bytes = 128;
+    ranges[0].source_start = 5;
+    try std.testing.expectError(error.InvalidExactLayerRangeExport, request.validate());
+    ranges[0].source_start = 4;
+    ranges[0].destination_v.handle = &a;
+    try std.testing.expectError(error.InvalidExactLayerRangeExport, request.validate());
+    ranges[0].destination_v.handle = &b;
+    var adjacent = [_]ExactLayerRangeExport{
+        .{ .layer_index = 4, .source_start = 4, .rows = 4, .num_kv_heads = 1, .head_dim = 8, .destination_k = .{ .handle = &a, .byte_offset = 0, .byte_len = 64 }, .destination_v = .{ .handle = &b, .byte_offset = 0, .byte_len = 64 } },
+        .{ .layer_index = 9, .source_start = 4, .rows = 4, .num_kv_heads = 1, .head_dim = 8, .destination_k = .{ .handle = &a, .byte_offset = 64, .byte_len = 64 }, .destination_v = .{ .handle = &b, .byte_offset = 64, .byte_len = 64 } },
+    };
+    request.ranges = &adjacent;
+    request.max_bytes = 256;
+    try std.testing.expectEqual(@as(usize, 256), try request.validate());
+    adjacent[1].destination_k.byte_offset = 63;
+    try std.testing.expectError(error.InvalidExactLayerRangeExport, request.validate());
+    adjacent[1].destination_k.byte_offset = std.math.maxInt(usize) - 31;
+    adjacent[1].destination_k.byte_len = 64;
+    try std.testing.expectError(error.Overflow, request.validate());
+    var head_major = [_]ExactLayerRangeExport{.{ .layer_index = 4, .source_start = 4, .rows = 4, .num_kv_heads = 2, .head_dim = 8, .destination_layout = .head_major, .destination_head_capacity_rows = 8, .destination_k = .{ .handle = &a, .byte_offset = 0, .byte_len = 256 }, .destination_v = .{ .handle = &b, .byte_offset = 0, .byte_len = 256 } }};
+    request.ranges = &head_major;
+    request.max_bytes = 256;
+    try std.testing.expectEqual(@as(usize, 256), try request.validate());
+    head_major[0].destination_head_capacity_rows = 3;
+    try std.testing.expectError(error.InvalidExactLayerRangeExport, request.validate());
+    head_major[0].destination_head_capacity_rows = 8;
+    head_major[0].destination_k.byte_len = 255;
+    try std.testing.expectError(error.InvalidExactLayerRangeExport, request.validate());
+    head_major[0].destination_k.byte_len = 256;
+    head_major[0].destination_layout = .token_major_ring;
+    head_major[0].destination_head_capacity_rows = 0;
+    head_major[0].destination_ring_capacity_rows = 8;
+    try std.testing.expectEqual(@as(usize, 256), try request.validate());
+    head_major[0].destination_ring_capacity_rows = 3;
+    try std.testing.expectError(error.InvalidExactLayerRangeExport, request.validate());
+    head_major[0].destination_ring_capacity_rows = 8;
+    head_major[0].destination_k.byte_offset = 1;
+    try std.testing.expectError(error.InvalidExactLayerRangeExport, request.validate());
+    head_major[0].destination_k.byte_offset = 0;
+    head_major[0].source_start = std.math.maxInt(u32);
+    head_major[0].rows = 2;
+    request.expected_written_tokens = @as(usize, std.math.maxInt(u32)) + 2;
+    try std.testing.expectError(error.InvalidExactLayerRangeExport, request.validate());
+}
+
 pub fn physicalPageForLogical(logical_page: usize, ring_page_count: usize) usize {
     return if (ring_page_count > 0) logical_page % ring_page_count else logical_page;
 }
@@ -162,6 +215,170 @@ pub const DeviceKvRef = struct {
     byte_offset: usize,
     byte_len: usize,
 };
+
+pub const ExactLayerRangeExport = struct {
+    pub const DestinationLayout = enum(u32) { token_major, head_major, token_major_ring };
+    layer_index: u32,
+    source_start: usize,
+    rows: usize,
+    num_kv_heads: u32,
+    head_dim: u32,
+    destination_layout: DestinationLayout = .token_major,
+    /// Required for head-major output; each head owns this many rows.
+    destination_head_capacity_rows: usize = 0,
+    destination_ring_capacity_rows: usize = 0,
+    destination_k: DeviceKvRef,
+    destination_v: DeviceKvRef,
+};
+
+fn exactExportRefsOverlap(a: DeviceKvRef, b: DeviceKvRef) !bool {
+    if (a.handle != b.handle) return false;
+    const a_end = try std.math.add(usize, a.byte_offset, a.byte_len);
+    const b_end = try std.math.add(usize, b.byte_offset, b.byte_len);
+    return a.byte_offset < b_end and b.byte_offset < a_end;
+}
+
+pub const ExactLayerRangeExportRequest = struct {
+    source_sequence: SequenceId,
+    expected_written_tokens: usize,
+    expected_position_offset: usize = 0,
+    ranges: []const ExactLayerRangeExport,
+    max_bytes: usize,
+    check_ctx: ?*anyopaque = null,
+    check_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+
+    pub fn check(self: @This()) !void {
+        if (self.check_fn) |f| try f(self.check_ctx);
+    }
+    pub fn validate(self: @This()) !usize {
+        if (self.expected_written_tokens == 0 or self.ranges.len == 0 or self.ranges.len > 256 or self.max_bytes == 0)
+            return error.InvalidExactLayerRangeExport;
+        var total: usize = 0;
+        for (self.ranges, 0..) |range, i| {
+            if (range.rows == 0 or range.num_kv_heads == 0 or range.head_dim == 0 or
+                range.rows > std.math.maxInt(u32) or range.source_start > std.math.maxInt(u32) or range.destination_head_capacity_rows > std.math.maxInt(u32) or range.destination_ring_capacity_rows > std.math.maxInt(u32) or
+                range.source_start > self.expected_written_tokens or range.rows > self.expected_written_tokens - range.source_start or
+                (i > 0 and range.layer_index <= self.ranges[i - 1].layer_index))
+                return error.InvalidExactLayerRangeExport;
+            const row_bytes = try std.math.mul(usize, try std.math.mul(usize, range.num_kv_heads, range.head_dim), @sizeOf(f16));
+            if (try std.math.mul(usize, range.rows, try std.math.mul(usize, range.num_kv_heads, range.head_dim)) > std.math.maxInt(u32)) return error.InvalidExactLayerRangeExport;
+            if (range.destination_k.byte_offset % @sizeOf(f16) != 0 or range.destination_v.byte_offset % @sizeOf(f16) != 0)
+                return error.InvalidExactLayerRangeExport;
+            const bytes = try std.math.mul(usize, range.rows, row_bytes);
+            const destination_bytes = switch (range.destination_layout) {
+                .token_major => blk: {
+                    if (range.destination_head_capacity_rows != 0 or range.destination_ring_capacity_rows != 0) return error.InvalidExactLayerRangeExport;
+                    break :blk bytes;
+                },
+                .head_major => blk: {
+                    if (range.destination_head_capacity_rows < range.rows or range.destination_ring_capacity_rows != 0) return error.InvalidExactLayerRangeExport;
+                    if (try std.math.mul(usize, range.destination_head_capacity_rows, try std.math.mul(usize, range.num_kv_heads, range.head_dim)) > std.math.maxInt(u32))
+                        return error.InvalidExactLayerRangeExport;
+                    break :blk try std.math.mul(usize, try std.math.mul(usize, range.destination_head_capacity_rows, range.num_kv_heads), try std.math.mul(usize, range.head_dim, @sizeOf(f16)));
+                },
+                .token_major_ring => blk: {
+                    if (range.destination_head_capacity_rows != 0 or range.destination_ring_capacity_rows == 0 or range.rows > range.destination_ring_capacity_rows) return error.InvalidExactLayerRangeExport;
+                    if (try std.math.add(usize, range.source_start, range.rows - 1) > std.math.maxInt(u32) or
+                        try std.math.mul(usize, range.destination_ring_capacity_rows, try std.math.mul(usize, range.num_kv_heads, range.head_dim)) > std.math.maxInt(u32))
+                        return error.InvalidExactLayerRangeExport;
+                    break :blk try std.math.mul(usize, range.destination_ring_capacity_rows, row_bytes);
+                },
+            };
+            _ = try std.math.add(usize, range.destination_k.byte_offset, range.destination_k.byte_len);
+            _ = try std.math.add(usize, range.destination_v.byte_offset, range.destination_v.byte_len);
+            if (destination_bytes > range.destination_k.byte_len or destination_bytes > range.destination_v.byte_len or
+                range.destination_k.handle == range.destination_v.handle)
+                return error.InvalidExactLayerRangeExport;
+            for (self.ranges[0..i]) |prior| if (try exactExportRefsOverlap(range.destination_k, prior.destination_k) or
+                try exactExportRefsOverlap(range.destination_k, prior.destination_v) or try exactExportRefsOverlap(range.destination_v, prior.destination_k) or
+                try exactExportRefsOverlap(range.destination_v, prior.destination_v)) return error.InvalidExactLayerRangeExport;
+            total = try std.math.add(usize, total, try std.math.mul(usize, bytes, 2));
+        }
+        if (total > self.max_bytes) return error.ExactLayerRangeExportBudgetExceeded;
+        return total;
+    }
+};
+
+pub const ExactLayerRangeExportResult = struct {
+    copied_bytes: usize,
+    layers: usize,
+    fenced: bool,
+    /// Backend-observed peak host staging. Null preserves legacy exporters
+    /// whose ABI predates measured staging; activation callers must require a
+    /// known value rather than treating unknown as zero.
+    peak_host_staging_bytes: ?usize = null,
+};
+
+pub const ExactLayerRangeSourceAuthority = struct {
+    model_weights_sha256: [32]u8,
+    model_identity_layout_sha256: [32]u8,
+    context_layout_sha256: [32]u8,
+    token_stream_sha256: [32]u8,
+    source_revision: u64,
+    source_sequence: SequenceId,
+    logical_tokens: usize,
+    pub fn validate(self: @This()) !void {
+        if (std.mem.allEqual(u8, &self.model_weights_sha256, 0) or
+            std.mem.allEqual(u8, &self.model_identity_layout_sha256, 0) or
+            std.mem.allEqual(u8, &self.context_layout_sha256, 0) or
+            std.mem.allEqual(u8, &self.token_stream_sha256, 0) or
+            self.source_revision == 0 or self.source_sequence == 0 or self.logical_tokens == 0)
+            return error.InvalidExactLayerRangeExportAuthority;
+    }
+};
+
+/// Erased authority-preserving source. The only backend implementation is a
+/// ModelRuntime callback; raw source Metal handles never cross this boundary.
+pub const ExactLayerRangeExporter = struct {
+    ctx: *anyopaque,
+    export_fn: *const fn (*anyopaque, ExactLayerRangeSourceAuthority, []const ExactLayerRangeExport, usize, ?*anyopaque, ?*const fn (?*anyopaque) anyerror!void) anyerror!ExactLayerRangeExportResult,
+    pub fn exportRanges(self: @This(), authority: ExactLayerRangeSourceAuthority, ranges: []const ExactLayerRangeExport, max_bytes: usize, check_ctx: ?*anyopaque, check_fn: ?*const fn (?*anyopaque) anyerror!void) !ExactLayerRangeExportResult {
+        try authority.validate();
+        const expected = try (ExactLayerRangeExportRequest{
+            .source_sequence = authority.source_sequence,
+            .expected_written_tokens = authority.logical_tokens,
+            .ranges = ranges,
+            .max_bytes = max_bytes,
+            .check_ctx = check_ctx,
+            .check_fn = check_fn,
+        }).validate();
+        const result = try self.export_fn(self.ctx, authority, ranges, max_bytes, check_ctx, check_fn);
+        if (!result.fenced or result.layers != ranges.len or result.copied_bytes != expected)
+            return error.InvalidExactLayerRangeExportReceipt;
+        return result;
+    }
+};
+
+test "exact layer range exporter rejects short byte receipts" {
+    const digest: [32]u8 = @splat(1);
+    var k: u8 = 0;
+    var v: u8 = 0;
+    const ranges = [_]ExactLayerRangeExport{.{
+        .layer_index = 4,
+        .source_start = 0,
+        .rows = 2,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+        .destination_k = .{ .handle = &k, .byte_offset = 0, .byte_len = 32 },
+        .destination_v = .{ .handle = &v, .byte_offset = 0, .byte_len = 32 },
+    }};
+    const Harness = struct {
+        fn run(_: *anyopaque, _: ExactLayerRangeSourceAuthority, requested: []const ExactLayerRangeExport, _: usize, _: ?*anyopaque, _: ?*const fn (?*anyopaque) anyerror!void) anyerror!ExactLayerRangeExportResult {
+            return .{ .copied_bytes = 63, .layers = requested.len, .fenced = true };
+        }
+    };
+    var context: u8 = 0;
+    const exporter: ExactLayerRangeExporter = .{ .ctx = &context, .export_fn = Harness.run };
+    try std.testing.expectError(error.InvalidExactLayerRangeExportReceipt, exporter.exportRanges(.{
+        .model_weights_sha256 = digest,
+        .model_identity_layout_sha256 = digest,
+        .context_layout_sha256 = digest,
+        .token_stream_sha256 = digest,
+        .source_revision = 1,
+        .source_sequence = 1,
+        .logical_tokens = 2,
+    }, &ranges, 64, null, null));
+}
 
 pub const KvSuffixWrite = struct {
     sequence_id: SequenceId,
@@ -318,6 +535,11 @@ pub const DeviceWriteHook = struct {
         /// locked by the caller. Success fences copies; failure leaves both
         /// bindings unchanged. No aliasing or implicit host fallback is allowed.
         cloneExactPrefix: ?*const fn (ctx: *anyopaque, source: DeviceWriteHook, request: device_clone.Request) anyerror!device_clone.Result = null,
+        exportExactLayerRanges: ?*const fn (ctx: *anyopaque, request: ExactLayerRangeExportRequest) anyerror!ExactLayerRangeExportResult = null,
+        /// Physically discard one exclusively owned exact-clone source after
+        /// its independent destination is fenced. Implementations must reject
+        /// any other live sequence/binding and must not discard shared slots.
+        discardExactCloneSource: ?*const fn (ctx: *anyopaque, sequence_id: SequenceId) anyerror!ExactCloneSourceDiscard = null,
         writeLayerKvSuffix: *const fn (
             ctx: *anyopaque,
             write: KvSuffixWrite,
@@ -416,6 +638,12 @@ pub const DeviceWriteHook = struct {
         try request.check();
         return clone_fn(self.ctx, source, request);
     }
+    pub fn exportExactLayerRanges(self: DeviceWriteHook, request: ExactLayerRangeExportRequest) !ExactLayerRangeExportResult {
+        const f = self.vtable.exportExactLayerRanges orelse return error.DeviceKvExportUnsupported;
+        _ = try request.validate();
+        try request.check();
+        return f(self.ctx, request);
+    }
 
     pub fn gatherLayerKv(
         self: DeviceWriteHook,
@@ -467,6 +695,11 @@ pub const DeviceWriteHook = struct {
         release_fn(self.ctx, sequence_id);
     }
 
+    pub fn discardExactCloneSource(self: DeviceWriteHook, sequence_id: SequenceId) !ExactCloneSourceDiscard {
+        const discard_fn = self.vtable.discardExactCloneSource orelse return error.UnsupportedExactPagedKvHandoff;
+        return discard_fn(self.ctx, sequence_id);
+    }
+
     pub fn supportsSelectedGlobalKv(self: DeviceWriteHook) bool {
         const supports_fn = self.vtable.supportsSelectedGlobalKv orelse return false;
         return supports_fn(self.ctx);
@@ -487,6 +720,13 @@ pub const DeviceWriteHook = struct {
     }
 };
 
+pub const ExactCloneSourceDiscard = struct {
+    slots: usize,
+    live_bytes_before: u64,
+    live_bytes_after: u64,
+    physically_released_bytes: u64,
+};
+
 pub const DeviceAllocationSnapshot = struct {
     available: bool = false,
     live_bytes: u64 = 0,
@@ -496,6 +736,8 @@ pub const DeviceAllocationSnapshot = struct {
 };
 
 pub const KvStorageRuntime = struct {
+    pub const NumericalAuthority = enum { host_fallback, compiled_whole_model };
+
     allocator: std.mem.Allocator,
     owner_allocation_tracker: ?*owner_alloc.HostAllocationTracker = null,
     storage: storage_mod.KvStorage,
@@ -506,6 +748,15 @@ pub const KvStorageRuntime = struct {
     /// When set, `writeLayerKvSuffixDevice` goes through the hook; otherwise
     /// callers must materialize host slices and use `writeLayerKvSuffix`.
     device_write_hook: ?DeviceWriteHook = null,
+    numerical_authority: NumericalAuthority = .host_fallback,
+
+    pub fn setNumericalAuthorityBeforeUse(self: *KvStorageRuntime, authority: NumericalAuthority) !void {
+        if (self.sequences.items.len != 0 or self.device_write_hook != null) return error.KvNumericalAuthorityAlreadyActive;
+        if (authority == .compiled_whole_model and
+            (self.storage.config.backend != .metal or self.storage.config.dtype != .f16 or self.storage.config.store_cpu_bytes))
+            return error.InvalidKvNumericalAuthority;
+        self.numerical_authority = authority;
+    }
 
     pub fn init(allocator: std.mem.Allocator, config: pool_mod.KvPoolConfig) !KvStorageRuntime {
         return initTracked(allocator, config, null);
@@ -531,6 +782,29 @@ pub const KvStorageRuntime = struct {
 
     pub fn ownerAllocationTracker(self: *const KvStorageRuntime) ?*owner_alloc.HostAllocationTracker {
         return self.owner_allocation_tracker;
+    }
+
+    fn hasActiveSequences(self: *const KvStorageRuntime) bool {
+        for (self.sequences.items) |sequence| if (sequence.active) return true;
+        return false;
+    }
+
+    pub fn bindRequestOwnerTracker(self: *KvStorageRuntime, tracker: *owner_alloc.HostAllocationTracker) !void {
+        if (self.owner_allocation_tracker != null or self.hasActiveSequences())
+            return error.ContextFrameOwnershipMismatch;
+        const hook = self.device_write_hook orelse return error.ContextPhysicalAccountingUnavailable;
+        const metal = try @import("../../backends/metal_kv_storage.zig").MetalKvStorage.fromDeviceWriteHook(hook);
+        try metal.bindRequestOwnerTracker(tracker);
+        self.owner_allocation_tracker = tracker;
+    }
+
+    pub fn unbindRequestOwnerTracker(self: *KvStorageRuntime, tracker: *owner_alloc.HostAllocationTracker) !void {
+        if (self.owner_allocation_tracker != tracker or self.hasActiveSequences())
+            return error.ContextFrameOwnershipMismatch;
+        const hook = self.device_write_hook orelse return error.ContextPhysicalAccountingUnavailable;
+        const metal = try @import("../../backends/metal_kv_storage.zig").MetalKvStorage.fromDeviceWriteHook(hook);
+        try metal.unbindRequestOwnerTracker(tracker);
+        self.owner_allocation_tracker = null;
     }
 
     pub fn bindContextOwnerScope(
@@ -936,6 +1210,7 @@ pub const KvStorageRuntime = struct {
         k_rows: []const f32,
         v_rows: []const f32,
     ) !void {
+        if (self.numerical_authority == .compiled_whole_model) return error.CompiledWholeModelKvFallbackForbidden;
         const sequence_state = try self.sequenceMut(sequence_id);
         const key_width = self.storage.keyValuesPerToken();
         const value_width = self.storage.valueValuesPerToken();
@@ -961,6 +1236,7 @@ pub const KvStorageRuntime = struct {
         k_rows: []const f32,
         v_rows: []const f32,
     ) !void {
+        if (self.numerical_authority == .compiled_whole_model) return error.CompiledWholeModelKvFallbackForbidden;
         const sequence_state = try self.sequenceMut(sequence_id);
         const key_width = self.storage.keyValuesPerToken();
         const value_width = self.storage.valueValuesPerToken();
@@ -1045,6 +1321,8 @@ pub const KvStorageRuntime = struct {
             return .{ .k = k, .v = v };
         }
 
+        if (self.numerical_authority == .compiled_whole_model)
+            return error.CompiledWholeModelKvFallbackForbidden;
         for (0..token_count) |token_idx| {
             const block_idx = token_idx / self.storage.config.page_size_tokens;
             const token_offset = token_idx % self.storage.config.page_size_tokens;
@@ -1327,6 +1605,26 @@ test "storage runtime reuses released sequence slots" {
     try std.testing.expectEqual(first, second);
     try std.testing.expectEqual(@as(usize, 1), runtime.sequences.items.len);
     try std.testing.expectEqual(@as(?usize, 0), runtime.tokenCount(second));
+}
+
+test "owner binding emptiness accepts retained inactive sequence metadata and rejects active" {
+    const allocator = std.testing.allocator;
+    var runtime = try KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+    });
+    defer runtime.deinit();
+
+    try std.testing.expect(!runtime.hasActiveSequences());
+    const sequence = try runtime.attachSequence(runtime.poolId());
+    try std.testing.expect(runtime.hasActiveSequences());
+    try runtime.releaseSequence(sequence);
+    try std.testing.expect(runtime.sequences.items.len != 0);
+    try std.testing.expect(!runtime.hasActiveSequences());
 }
 
 const TestDeviceWriteHookContext = struct {

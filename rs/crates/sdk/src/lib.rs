@@ -18,6 +18,8 @@
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
+pub mod native_kv;
+
 pub const MAX_ARTIFACT_SOURCES: usize = 64;
 
 /// A successful metadata mutation. `Committed` is not a failed write: observe

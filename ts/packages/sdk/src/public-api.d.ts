@@ -5085,7 +5085,10 @@ export interface paths {
          *     to f16 and reject other cache precisions. Draft models, media, prompt caches, compiled/graph
          *     execution and other context/cache policies are unsupported.
          *
-         *     The response is an AFATT001 envelope: JSON metadata followed by exactly
+         *     The response is an AFATT001 or AFATT002 envelope, selected from Accept:
+         *     AFATT002 uses application/vnd.antfly.attachments.v2 and carries opaque
+         *     prepared-producer authority; AFATT001 remains application/vnd.antfly.attachments.v1.
+         *     Both contain JSON metadata followed by exactly
          *     one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
          *     a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions, fitted global KV,
          *     exact local KV, saved next-token logits, loaded-model fingerprints and
@@ -5118,8 +5121,10 @@ export interface paths {
         put?: never;
         /**
          * Generate from a portable native KV checkpoint
-         * @description Accepts one AFATT001 envelope whose JSON metadata is a GenerateRequest
-         *     and whose single application/vnd.antfly.kv-checkpoint attachment is a
+         * @description Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateRequest;
+         *     AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+         *     string contains the GenerateRequest. Its single
+         *     application/vnd.antfly.kv-checkpoint attachment is a
          *     complete native checkpoint. The metadata supplies the complete messages,
          *     tool definitions and template options. Their rendered tokens must have
          *     the checkpoint tokens as an exact prefix; prefix rewriting is rejected.
@@ -5152,8 +5157,10 @@ export interface paths {
         put?: never;
         /**
          * Resume one checkpoint and generate serial ordinary siblings
-         * @description Accepts one AFATT001 envelope whose JSON metadata is a GenerateBatchRequest
-         *     and whose single application/vnd.antfly.kv-checkpoint attachment belongs
+         * @description Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateBatchRequest;
+         *     AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+         *     string contains the GenerateBatchRequest. Its single
+         *     application/vnd.antfly.kv-checkpoint attachment belongs
          *     to the first request. The remaining requests use ordinary exact generation.
          *     All requests run serially in submission order and release their private
          *     generation state before the next request starts. The checkpoint remains
@@ -25594,6 +25601,16 @@ export interface components {
              */
             ignore_eos?: boolean;
             /**
+             * @description Qualification-only fixed-length greedy policy. When true, every primary and additional
+             *     end-of-sequence token is suppressed from request-local token selection until `max_tokens`
+             *     is reached. Requires `ignore_eos=true`, deterministic greedy sampling, and no speculative
+             *     decoding. HTTP serving also requires the operator qualification opt-in
+             *     `ANTFLY_INFERENCE_JSON_TOKEN_IDS=1`. Omitted or false preserves the existing `ignore_eos`
+             *     behavior.
+             * @default false
+             */
+            fixed_length_mask_eos?: boolean;
+            /**
              * @description List of tools (functions) the model can call.
              *     Only supported by models with tool_call_format configured.
              */
@@ -26068,6 +26085,14 @@ export interface components {
              */
             usage?: components["schemas"]["InferenceGenerateUsage"] | null;
             speculation?: components["schemas"]["InferenceGenerateSpeculationStatus"] | null;
+            /** @description Qualification-only unfiltered generated token IDs on terminal usage chunks. */
+            generated_token_ids?: number[];
+            /** @description Exact deduplicated request-local suppression union applied during token selection. */
+            applied_suppress_token_ids?: number[];
+            /** @description EOS token IDs used by the request-scoped fixed-length mask. */
+            eos_token_ids?: number[];
+            /** @description True when request-scoped EOS suppression was active. */
+            fixed_length_mask_eos?: boolean;
         };
         InferenceGenerateChunkChoice: {
             index: number;
@@ -44367,6 +44392,8 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
+                /** @description Supported native checkpoint envelope media types. Send application/vnd.antfly.attachments.v2, application/vnd.antfly.attachments.v1 to prefer AFATT002 while retaining legacy fallback. If none of the requested media types is supported, the server returns 406 rather than silently changing framing. */
+                Accept?: string;
                 /** @description Checkpoint encoding. f16 is lossless for the supported cache. fp8 stores validated fitted history in FP8 and restores it to f16, with per-head f16 fallback. rotated4 stores and serves validated fitted rows in a mixed rotated 4-bit/f16 representation, preserving protected rows exactly. f32 exports legacy V2. */
                 "X-Antfly-KV-Encoding"?: "f32" | "f16" | "fp8" | "rotated4";
             };
@@ -44379,13 +44406,14 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Native checkpoint envelope; metadata conforms to NativeKvCheckpointMetadata */
+            /** @description Native checkpoint envelope; AFATT001 metadata conforms to NativeKvCheckpointMetadata and AFATT002 outer metadata conforms to NativeKvEnvelopeV2 */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/vnd.antfly.attachments.v1": string;
+                    "application/vnd.antfly.attachments.v2": string;
                 };
             };
             /** @description Invalid request or unsupported model/runtime */
@@ -44399,6 +44427,15 @@ export interface operations {
             };
             /** @description Authentication is enabled and valid credentials were not supplied */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description No requested native checkpoint envelope media type is supported */
+            406: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -44438,6 +44475,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/vnd.antfly.attachments.v1": string;
+                "application/vnd.antfly.attachments.v2": string;
             };
         };
         responses: {
@@ -44501,6 +44539,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/vnd.antfly.attachments.v1": string;
+                "application/vnd.antfly.attachments.v2": string;
             };
         };
         responses: {

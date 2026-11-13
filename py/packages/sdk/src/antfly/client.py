@@ -1185,7 +1185,7 @@ class AntflyClient:
         unchanged fallback is reported in the returned metadata. Failed or
         truncated transfers leave an existing destination intact.
         """
-        from .native_kv import CHUNK_BYTES, CONTENT_TYPE, ChunkReader, receive_checkpoint
+        from .native_kv import CHUNK_BYTES, CONTENT_TYPE, CONTENT_TYPE_V2, ChunkReader, receive_checkpoint
 
         if encoding not in ("f32", "f16", "fp8", "rotated4"):
             raise ValueError("checkpoint encoding must be f32, f16, fp8, or rotated4")
@@ -1196,16 +1196,18 @@ class AntflyClient:
             "POST",
             "/ai/v1/generate/context/checkpoint",
             json=body,
-            headers={"Accept": CONTENT_TYPE, "X-Antfly-KV-Encoding": encoding},
+            headers={"Accept": f"{CONTENT_TYPE_V2}, {CONTENT_TYPE}", "X-Antfly-KV-Encoding": encoding},
             follow_redirects=False,
         ) as response:
             if response.status_code != 200:
                 _raise_inference_error(response)
             content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
-            if content_type != CONTENT_TYPE:
+            if content_type not in (CONTENT_TYPE, CONTENT_TYPE_V2):
                 raise AntflyException(f"checkpoint export returned content type {content_type!r}")
             try:
-                return receive_checkpoint(ChunkReader(response.iter_bytes(CHUNK_BYTES)), destination, request.model)
+                return receive_checkpoint(
+                    ChunkReader(response.iter_bytes(CHUNK_BYTES)), destination, request.model, content_type=content_type
+                )
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 raise AntflyException(f"invalid or incomplete checkpoint export: {exc}") from exc
 
@@ -1213,20 +1215,32 @@ class AntflyClient:
     def _native_kv_resume_response(
         self, request: InferenceGenerateRequest, checkpoint: str | Path | NativeKvCheckpoint, *, stream: bool
     ) -> Iterator[Response]:
-        from .native_kv import CONTENT_TYPE, checkpoint_upload
+        from .native_kv import checkpoint_upload, checkpoint_upload_content_type
 
         path = checkpoint.path if isinstance(checkpoint, NativeKvCheckpoint) else Path(checkpoint)
         body = request.to_dict()
         body["stream"] = stream
         try:
+            if isinstance(checkpoint, NativeKvCheckpoint) and (
+                (checkpoint.envelope_version == 2) != (checkpoint.prepared_metadata_base64 is not None)
+                or checkpoint.envelope_version not in (1, 2)
+            ):
+                raise ValueError("checkpoint envelope version and producer metadata disagree")
             with path.open("rb") as source:
-                length, chunks = checkpoint_upload(source, body)
+                length, chunks = checkpoint_upload(
+                    source,
+                    body,
+                    checkpoint.prepared_metadata_base64 if isinstance(checkpoint, NativeKvCheckpoint) else None,
+                )
+                content_type = checkpoint_upload_content_type(
+                    checkpoint.prepared_metadata_base64 if isinstance(checkpoint, NativeKvCheckpoint) else None
+                )
                 with self._client.get_httpx_client().stream(
                     "POST",
                     "/ai/v1/generate/context/resume",
                     content=chunks,
                     headers={
-                        "Content-Type": CONTENT_TYPE,
+                        "Content-Type": content_type,
                         "Content-Length": str(length),
                         "Accept": "text/event-stream" if stream else "application/json",
                     },

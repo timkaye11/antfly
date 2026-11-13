@@ -33,6 +33,7 @@ SQL_OPERATIONS = [
     Path(f"api/data_operations/{operation}.py")
     for operation in ("execute_sql", "prepare_sql", "execute_prepared_sql", "close_prepared_sql")
 ]
+NATIVE_CHECKPOINT_BODY = re.compile(r"body:\s+File\s+\|\s+File\s+\|\s+Unset\s*=\s*UNSET")
 NATIVE_CHECKPOINT_RESUME_OPERATIONS = [
     Path("api/default/resume_native_kv_checkpoint.py"),
     Path("api/default/resume_native_kv_checkpoint_batch.py"),
@@ -213,8 +214,23 @@ def fix_generated_client(root: Path) -> None:
     for operation in NATIVE_CHECKPOINT_RESUME_OPERATIONS:
         path = root / operation
         source = path.read_text(encoding="utf-8")
-        if source.count('_kwargs["content"] = body.payload') != 1:
+        # AFATT001 and AFATT002 are two declared binary media alternatives for
+        # one File body. openapi-python-client emits two ordered isinstance
+        # branches; the latter selects v2 while retaining v1 in the contract.
+        # Accept only that exact pair so another media type or generator shape
+        # cannot silently alter upload framing.
+        if (
+            len(NATIVE_CHECKPOINT_BODY.findall(source)) != 5
+            or source.count('_kwargs["content"] = body.payload') != 2
+            or source.count('headers["Content-Type"] = "application/vnd.antfly.attachments.v1"') != 1
+            or source.count('headers["Content-Type"] = "application/vnd.antfly.attachments.v2"') != 1
+            or source.index("application/vnd.antfly.attachments.v1")
+            > source.index("application/vnd.antfly.attachments.v2")
+        ):
             raise RuntimeError(f"unexpected generated shape in {operation}: binary file body")
+        # The schema requires one binary body. Duplicate media alternatives
+        # cause the generator to make it optional and omit the Unset import.
+        source = NATIVE_CHECKPOINT_BODY.sub("body: File", source)
         for original, replacement in (
             (
                 "from ...client import",

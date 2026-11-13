@@ -15,6 +15,9 @@
 
 //! Focused native attention-matching tests, independent of full model loading.
 test {
+    _ = @import("runtime/kv/attention_match_train32_augmentation_reader.zig");
+    _ = @import("runtime/kv/attention_match_case_replay_native.zig");
+    _ = @import("runtime/kv/attention_match_joint_adaptive_quality.zig");
     _ = @import("runtime/kv/attention_match.zig");
     _ = @import("runtime/kv/attention_match_study.zig");
     _ = @import("backends/context_attention_match.zig");
@@ -25,6 +28,8 @@ test {
     _ = @import("ops/metal_attention_match_fit.zig");
     _ = @import("ops/metal_attention_match_storage.zig");
     _ = @import("runtime/kv/attention_match_engine.zig");
+    _ = @import("runtime/kv/attention_match_rejected_fixture.zig");
+    _ = @import("runtime/kv/attention_match_rejected_replay.zig");
     _ = @import("runtime/kv/attention_match_checkpoint.zig");
     _ = @import("runtime/kv/attention_match_resume.zig");
     if (@import("build_options").enable_metal) _ = @import("ops/metal_compute.zig");

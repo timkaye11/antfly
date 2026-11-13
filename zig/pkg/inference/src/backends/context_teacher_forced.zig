@@ -200,6 +200,39 @@ pub fn promptTokenDigest(tokens: []const i64) ![32]u8 {
     return result;
 }
 
+/// Digest the complete logical operator prompt. This namespace deliberately
+/// differs from promptTokenDigest, which authenticates raw teacher rows.
+pub fn operatorPromptTokenDigest(prefix: []const u32, append: anytype) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly.operator-logical-prompt.v1\x00");
+    var encoded: [8]u8 = undefined;
+    const total = std.math.add(usize, prefix.len, append.len) catch return error.InvalidTeacherForcedRequest;
+    std.mem.writeInt(u64, &encoded, @intCast(total), .little);
+    hash.update(&encoded);
+    for (prefix) |token| {
+        std.mem.writeInt(i64, &encoded, @intCast(token), .little);
+        hash.update(&encoded);
+    }
+    for (append) |raw| {
+        const token: i64 = @intCast(raw);
+        if (token < 0) return error.InvalidTeacherForcedToken;
+        std.mem.writeInt(i64, &encoded, token, .little);
+        hash.update(&encoded);
+    }
+    return hash.finalResult();
+}
+
+test "context operator prompt digest has stable split canonical namespace" {
+    const prefix = [_]u32{ 3, 5 };
+    const append = [_]i64{ 7, 11 };
+    const full = [_]i64{ 3, 5, 7, 11 };
+    const expected = [_]u8{ 0x54, 0x78, 0x90, 0xce, 0x85, 0xe9, 0x76, 0x0a, 0xd8, 0x6d, 0xbe, 0xcf, 0xed, 0x9b, 0x0f, 0x87, 0xc8, 0xcc, 0xc7, 0x3e, 0x92, 0x45, 0xa4, 0x35, 0x96, 0xd3, 0x76, 0xd1, 0xb2, 0xf9, 0xcf, 0xac };
+    const split = try operatorPromptTokenDigest(&prefix, &append);
+    try std.testing.expectEqualSlices(u8, &expected, &split);
+    try std.testing.expectEqualSlices(u8, &split, &try operatorPromptTokenDigest(&.{}, &full));
+    try std.testing.expect(!std.mem.eql(u8, &split, &try promptTokenDigest(&full)));
+}
+
 pub fn logProbability(logits: []const f32, target: u32) !f64 {
     if (logits.len == 0 or target >= logits.len) return error.InvalidTeacherForcedToken;
     var maximum = -std.math.inf(f64);

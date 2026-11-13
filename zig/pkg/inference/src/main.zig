@@ -358,6 +358,8 @@ pub fn runFromArgs(
         }
     } else if (std.mem.eql(u8, command, "compare")) {
         try inference.compare_generate.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "verify-native-kv-envelope")) {
+        try inference.native_kv_verify_v2.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "finetune")) {
         try inference.finetune_cli.main(init, command_args);
     } else if (std.mem.eql(u8, command, "cuda-info")) {
@@ -468,6 +470,19 @@ fn consumeParsedMaxLoadedModelsOption(args: []const []const u8, index: *usize) b
 
 /// Also used by the focused resident-server benchmark executable, so its
 /// argument parsing, resource ownership and HTTP routes remain production code.
+fn validateQualifiedPrivateStartupOptions(native_binding: ?[]const u8, qualified_binding: ?[]const u8, qualified_sha256: ?[]const u8) !void {
+    if ((qualified_binding == null) != (qualified_sha256 == null) or
+        (qualified_binding != null and native_binding != null))
+        return error.InvalidQualifiedPrivateBinding;
+}
+
+test "qualified private CLI requires pair and excludes staged binding" {
+    try validateQualifiedPrivateStartupOptions(null, "/qualified.json", "abcd");
+    try std.testing.expectError(error.InvalidQualifiedPrivateBinding, validateQualifiedPrivateStartupOptions(null, "/qualified.json", null));
+    try std.testing.expectError(error.InvalidQualifiedPrivateBinding, validateQualifiedPrivateStartupOptions(null, null, "abcd"));
+    try std.testing.expectError(error.InvalidQualifiedPrivateBinding, validateQualifiedPrivateStartupOptions("/staged.json", "/qualified.json", "abcd"));
+}
+
 pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
@@ -476,6 +491,9 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     var models_dir: []const u8 = defaultModelsDir(allocator);
     var ml_dir: []const u8 = defaultMlDir(allocator);
     var config_path: ?[]const u8 = null;
+    var native_kv_qualification_binding: ?[]const u8 = null;
+    var qualified_private_startup_binding: ?[]const u8 = null;
+    var qualified_private_startup_binding_sha256: ?[]const u8 = null;
     const max_loaded_models_override = try inference.run_options.parseMaxLoadedModelsOverride(args);
     var max_concurrent_requests_override: ?usize = null;
     var max_work_units_override: ?usize = null;
@@ -493,6 +511,10 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
+        if ((std.mem.eql(u8, args[i], "--native-kv-qualification-binding") or
+            std.mem.eql(u8, args[i], "--qualified-private-startup-binding") or
+            std.mem.eql(u8, args[i], "--qualified-private-startup-binding-sha256")) and i + 1 >= args.len)
+            return error.InvalidQualifiedPrivateBinding;
         if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
             host = args[i + 1];
             i += 1;
@@ -509,6 +531,18 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--native-kv-qualification-binding") and i + 1 < args.len) {
+            if (native_kv_qualification_binding != null) return error.InvalidQualificationCandidate;
+            native_kv_qualification_binding = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--qualified-private-startup-binding") and i + 1 < args.len) {
+            if (qualified_private_startup_binding != null) return error.InvalidQualifiedPrivateBinding;
+            qualified_private_startup_binding = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--qualified-private-startup-binding-sha256") and i + 1 < args.len) {
+            if (qualified_private_startup_binding_sha256 != null) return error.InvalidQualifiedPrivateBinding;
+            qualified_private_startup_binding_sha256 = args[i + 1];
             i += 1;
         } else if (consumeParsedMaxLoadedModelsOption(args, &i)) {
             // Parsed once above so duplicate flags retain the documented
@@ -676,6 +710,16 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
     try node.attachIo(io);
+
+    // This single operator-only binding is consumed before any model load or
+    // request surface publication. Its loader verifies a full release receipt,
+    // the running executable, the exact staged profile and the built-in
+    // compaction implementation identity. It is not a public fit-policy knob.
+    try validateQualifiedPrivateStartupOptions(native_kv_qualification_binding, qualified_private_startup_binding, qualified_private_startup_binding_sha256);
+    if (native_kv_qualification_binding) |path|
+        try inference.context_native_kv_operator_candidate.installFromConfigFile(allocator, io, &node, path);
+    if (qualified_private_startup_binding) |path|
+        try inference.context_qualified_private_startup.installFromConfigFile(allocator, io, &node, path, qualified_private_startup_binding_sha256.?);
 
     try node.warmConfiguredModelsBeforeServing(allocator);
     node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();

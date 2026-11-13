@@ -36,6 +36,8 @@ import subprocess
 import sys
 import zipfile
 
+from context_release_limits import MAX_SOURCE_FILES, MAX_UNCOMPRESSED_BYTES
+
 SCHEMA_V1 = "antfly.context-release-build.v1"
 SCHEMA_V2 = "antfly.context-release-build.v2"
 SCHEMA_V3 = "antfly.context-release-build.v3"
@@ -60,8 +62,8 @@ LIMITS = {"timeout": 3600, "max_rss_mib": 8192, "min_free_percent": 15,
           "max_swap_growth_mib": 512, "min_disk_free_mib": 4096}
 # Bound archive metadata separately from the total source byte limit. The
 # complete runtime tree includes more than 8192 Git-visible source inputs.
-MAX_FILES = 16384
-MAX_UNCOMPRESSED = 768 * 1024 * 1024
+MAX_FILES = MAX_SOURCE_FILES
+MAX_UNCOMPRESSED = MAX_UNCOMPRESSED_BYTES
 EXPECTED_STRIPPED_COMPILER_PROFILE = {"strip_debug_info": True, "have_error_return_tracing": False}
 COMPILER_PROFILE_PREFIX = "context_compiler_profile: "
 
