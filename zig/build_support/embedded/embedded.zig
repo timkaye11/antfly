@@ -295,12 +295,21 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         if (options.server_integration_tests) "antfly-runtime-enrichment_compute" else "antfly-embedded-enrichment",
         @as(u64, if (antfly_imports.darwin_release_memory or antfly_imports.darwin_cross_release_memory) 3 else 8) * 1024 * 1024 * 1024,
     );
+    // Source-level embedded API consumers can use compiled media without a
+    // shared storage engine. Link that owner independently of storage discovery.
+    if (antfly_imports.image_native_contract != null or antfly_imports.pdf_native_contract != null)
+        embedded_api_mod.linkLibrary(native_enrichment);
+    // Contract tests can render shared PDF templates directly from their
+    // local C API root. Its consumer must link the compute owner even when
+    // no embedded API facade (or installed shared library) is reachable.
+    if (antfly_imports.shared_pdf_templates)
+        capi_root_mod.linkLibrary(native_enrichment);
     const native_storage = if (antfly_imports.storage_boundary.shared_core) blk: {
         const owner_options = b.addOptions();
         owner_options.addOption(bool, "shared_storage_core", true);
         owner_options.addOption(bool, "storage_engine_owner", true);
         capi_mod.addOptions("storage_engine_options", owner_options);
-        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", @import("shared_library.zig").storageCompileMaxRss(target.result.os.tag, antfly_imports.darwin_shared_storage_sdk27, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory));
+        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", @import("shared_library.zig").nativeStorageCompileMaxRss(b.graph.host.result, target.result, optimize, @import("shared_library.zig").storageCompileMaxRss(target.result.os.tag, antfly_imports.darwin_shared_storage_sdk27, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory)));
         owner.link_function_sections = true;
         owner.link_data_sections = true;
         @import("source_owner.zig").registerStorageProvider(owner, b.allocator.dupe(*std.Build.Step.Compile, &.{ native_inference, native_enrichment }) catch @panic("OOM"));
@@ -527,7 +536,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite standalone snapshots",
         "issue1015",
         "capi SQL",
+        "capi path gate",
         "storage owner runtime status",
+        "capi storage owner candidate batches",
         "storage owner remote content source",
         "capi relational expression errors preserve public status semantics",
         "bounded Lite retirement admission is retryable while uncertain publication is not",
@@ -544,6 +555,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi concurrent calls and closes on one handle never touch freed memory",
         "capi text and dense searches succeed while writes commit",
         "capi execute graph queries honors identity read generation",
+        "capi embedded graph catalog and query retain table identities across reopen",
         "capi fact relationships preserve identities and filter before ranking",
         "capi fact path serialization and parsing release partial allocations",
         "capi fact algebraic paths retain provenance and respect frontier limits",
@@ -589,6 +601,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inline resolver ownership",
         "capi retired resolver identities",
         "capi query retry errors",
+        "capi Cypher authority",
         "capi resolver",
         "resolver import cross",
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
@@ -637,6 +650,23 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")
         .dependOn(&run_capi_models.step);
+    const maintenance_activity_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/capi/maintenance_activity.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) });
+    const run_maintenance_activity = b.addRunArtifact(maintenance_activity_tests);
+    run_capi_tests.step.dependOn(&run_maintenance_activity.step);
+    b.step("capi-maintenance-activity-test", "Verify manual drains yield admission to detached publishers")
+        .dependOn(&run_maintenance_activity.step);
+    const cypher_capi_tests = b.addTest(.{
+        .root_module = capi_root_mod,
+        .filters = &.{ "capi embedded graph", "capi Cypher authority" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("capi-cypher-test", "Qualify local graph catalog and retained Cypher queries")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_capi_tests).step);
     const lake_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/lake_test_root.zig"),
         .target = target,
@@ -648,7 +678,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .root_module = lake_test_mod,
         // Compile reader/cursor regressions, not unrelated server fixture tests
         // reachable through shared schema and credential modules.
-        .filters = selectTestFilters(b, &.{ "lake SQL", "lake catalog", "Parquet ", "parquet ", "Iceberg ", "iceberg ", "external source inventory", "external lake identities", "external lake pruning", "lake host resolver" }),
+        .filters = selectTestFilters(b, &.{ "lake SQL", "lake catalog", "Parquet ", "parquet ", "Iceberg ", "iceberg ", "external source inventory", "external lake identities", "external lake pruning", "external lake retirement", "external lake bootstrap", "external lake immutable", "lake host resolver" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("embedded-lake-test", "Test lake readers and SQL cursors without the server")

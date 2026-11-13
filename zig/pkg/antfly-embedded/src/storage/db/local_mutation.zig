@@ -262,6 +262,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const loadDenseArtifactCounterBootstrap = materialization.loadDenseArtifactCounterBootstrap;
         pub const loadDenseArtifactTargetCounter = materialization.loadDenseArtifactTargetCounter;
         pub const lockApplyForPortableRuntime = commit.lockApplyForPortableRuntime;
+        pub const tryLockApplyForPortableRuntime = commit.tryLockApplyForPortableRuntime;
         pub const maintenanceRequiresOrderedApply = commit.maintenanceRequiresOrderedApply;
         pub const markPrecomputedEnrichmentAppliedForSync = commit.markPrecomputedEnrichmentAppliedForSync;
         pub const maybeFinalizePendingRowPolicyPublication = commit.maybeFinalizePendingRowPolicyPublication;
@@ -278,12 +279,9 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const projectedBatchLsmAdmissionBytes = preparation.projectedBatchLsmAdmissionBytes;
         pub const rememberBulkIngestAllNewIdentityUpserts = commit.rememberBulkIngestAllNewIdentityUpserts;
         pub const replicationMutationBarrier = commit.replicationMutationBarrier;
-        pub const resetCoalescedEntryToDelete = preparation.resetCoalescedEntryToDelete;
         pub const resolveTransactionIntentsInternal = commit.resolveTransactionIntentsInternal;
         pub const resolveTransactionIntentsPrepared = commit.resolveTransactionIntentsPrepared;
         pub const restoreStagingStatus = commit.restoreStagingStatus;
-        pub const setCoalescedEntryToBorrowedWrite = preparation.setCoalescedEntryToBorrowedWrite;
-        pub const setCoalescedEntryToOwnedWrite = preparation.setCoalescedEntryToOwnedWrite;
         pub const shouldApplySplitReplicationLocked = commit.shouldApplySplitReplicationLocked;
         pub const splitMarkerMatches = commit.splitMarkerMatches;
         pub const storedDocumentValuesEqual = preparation.storedDocumentValuesEqual;
@@ -431,6 +429,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const clearGeneratedSparseMemoJobs = preparation.clearGeneratedSparseMemoJobs;
         pub const clearGraphArtifactStatePaged = materialization.clearGraphArtifactStatePaged;
         pub const clearPrecomputeAssetProducerBatchItems = materialization.clearPrecomputeAssetProducerBatchItems;
+        pub const applyAssetPublicationMetadataContext = materialization.applyAssetPublicationMetadataContext;
         pub const clearPublishedAssetArtifactRepairIssuesContext = materialization.clearPublishedAssetArtifactRepairIssuesContext;
         pub const clearPublishedEmbeddingArtifactRepairIssueContext = materialization.clearPublishedEmbeddingArtifactRepairIssueContext;
         pub const clearPublishedEmbeddingArtifactRepairIssuesContext = materialization.clearPublishedEmbeddingArtifactRepairIssuesContext;
@@ -487,7 +486,6 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const derivedCoverageOutcomeCounterValueForStore = materialization.derivedCoverageOutcomeCounterValueForStore;
         pub const directGraphNeighborContextHintsAlloc = materialization.directGraphNeighborContextHintsAlloc;
         pub const documentExtractionFailureManifestPayloadAlloc = materialization.documentExtractionFailureManifestPayloadAlloc;
-        pub const documentExtractionFingerprintAlloc = materialization.documentExtractionFingerprintAlloc;
         pub const documentExtractionKeyIndex = materialization.documentExtractionKeyIndex;
         pub const documentExtractionManifestGeneration = materialization.documentExtractionManifestGeneration;
         pub const documentExtractionManifestHasLastError = materialization.documentExtractionManifestHasLastError;
@@ -528,6 +526,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const encodeStoreLookupKeyWithPinnedSchemaAlloc = commit.encodeStoreLookupKeyWithPinnedSchemaAlloc;
         pub const encodeThinReplayRecordPayload = commit.encodeThinReplayRecordPayload;
         pub const encodeTimestampValue = preparation.encodeTimestampValue;
+        pub const encodeDocumentTimestampValue = preparation.encodeDocumentTimestampValue;
         pub const enforcePortableRuntimeGateOptional = commit.enforcePortableRuntimeGateOptional;
         pub const envBoolEnabled = commit.envBoolEnabled;
         pub const extractAssetSourceValue = materialization.extractAssetSourceValue;

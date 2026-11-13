@@ -146,6 +146,14 @@ pub const Config = struct {
         return parsed.value;
     }
 
+    fn parseCooperativeExecution(alloc: std.mem.Allocator, raw: ?std.json.Value) !platform.inference_settings.CooperativeExecution {
+        const object = raw orelse return .{};
+        const value = object.object.get("cooperative_execution") orelse return .{};
+        const parsed = try std.json.parseFromValue(platform.inference_settings.CooperativeExecution, alloc, value, .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub const MetadataConfig = struct {
         pub const NodeUrl = struct {
             node_id: u64,
@@ -193,6 +201,8 @@ pub const Config = struct {
         protected_bytes: usize = 256 * 1024 * 1024,
     };
     pub const LakeIndexConfig = struct {
+        /// Opt in after upgrading all writers; ownership is durably fenced.
+        serving_cuts: struct { enabled: bool = false } = .{},
         /// Optional verified identity construction owns an independent scratch
         /// quota. Exhaustion selects physical rebuilding, never unavailability.
         row_identity: struct { max_spill_bytes: u64 = 1024 * 1024 * 1024 } = .{},
@@ -204,8 +214,16 @@ pub const Config = struct {
         navigation_warming: struct { enabled: bool = true } = .{},
         query_cursors: struct {
             retention_ms: u64 = 300_000,
+            /// Per-shard disposable local cursor cache.
             max_native_cuts: usize = 64,
             max_native_retained_bytes: u64 = 64 * 1024 * 1024 * 1024,
+            /// Store-wide durable bindings and conservative inventory bytes.
+            max_durable_native_cuts: usize = 4096,
+            max_durable_native_bytes: u64 = 64 * 1024 * 1024 * 1024,
+            /// One optional local checkpoint; never a speculative durable upload.
+            max_native_warm_bytes: u64 = 256 * 1024 * 1024,
+            /// Explicit opt-in only. Serverless immutable reads use their own pins.
+            background_warming: ?bool = null,
         } = .{},
         text_cache: struct {
             /// Maximum corpus admitted by one streaming ranking window.
@@ -222,6 +240,11 @@ pub const Config = struct {
             max_marked: usize = 262144,
             max_read_bytes: u64 = 512 * 1024 * 1024,
         } = .{},
+
+        pub fn nativeSnapshotWarmingEnabled(self: LakeIndexConfig, deployment: DeploymentMode) bool {
+            _ = deployment;
+            return self.query_cursors.background_warming orelse false;
+        }
     };
 
     pub const StorageConfig = struct {
@@ -435,6 +458,7 @@ pub const Config = struct {
         // openapi path.
         prompt_cache_configured: bool = false,
         generation_batching: platform.inference_settings.GenerationBatching = .{},
+        cooperative_execution: platform.inference_settings.CooperativeExecution = .{},
         max_loaded_models: ?i64 = null,
         http_max_body_mb: usize = 10,
         pool_size: usize = 2,
@@ -983,6 +1007,7 @@ pub const Config = struct {
                 .prompt_cache = prompt_cache,
                 .keep_alive = if (inference.keep_alive) |value| try alloc.dupe(u8, value) else null,
                 .generation_batching = try parseGenerationBatching(alloc, raw_root.get("inference")),
+                .cooperative_execution = try parseCooperativeExecution(alloc, raw_root.get("inference")),
                 .max_loaded_models = inference.max_loaded_models,
                 .http_max_body_mb = if (inference.http_max_body_mb) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 10,
                 .pool_size = if (inference.pool_size) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 2,
@@ -1813,26 +1838,111 @@ pub fn remoteContentSecurityJsonAlloc(
     return try std.json.Stringify.valueAlloc(alloc, security, .{});
 }
 
-/// Preserve scoped GCS content connections as well as destination policy
-/// across the storage-owner boundary. Secret references stay unresolved until
-/// the destination has passed connection selection and scope validation.
+/// Preserve destination policy and every scoped credential (S3, HTTP and GCS)
+/// across the storage-owner boundary, where table enrichments render remote
+/// templates. Secret references stay unresolved until the destination has
+/// passed credential selection and scope validation.
 pub fn remoteContentSnapshotJsonAlloc(
     alloc: std.mem.Allocator,
     remote_content: *const scraping.RemoteContentConfig,
 ) ![]u8 {
     var snapshot = try remote_content.acquire();
     defer snapshot.deinit();
-    const config = snapshot.config;
-    const entries = try alloc.alloc(scraping.RemoteContentSnapshotData.NamedGcsConnection, config.gcs_connections.count());
-    defer alloc.free(entries);
-    var it = config.gcs_connections.iterator();
-    var index: usize = 0;
-    while (it.next()) |entry| : (index += 1) {
-        entries[index] = .{ .name = entry.key_ptr.*, .connection = entry.value_ptr.* };
+    return remoteContentConfigJsonAlloc(alloc, snapshot.config);
+}
+
+pub const RemoteContentSnapshotUpdate = struct {
+    revision: [32]u8,
+    /// Null means the caller's revision still names the acquired publication.
+    json: ?[]u8 = null,
+};
+
+test "remote content snapshot updates hash mutable configurations and roll back allocation failures" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var data = try std.json.parseFromSlice(scraping.RemoteContentSnapshotData, alloc,
+                \\{"default_s3":"r2","s3":[{"name":"r2","credential":{"buckets":["media"],"secret_access_key":"${secret:key}"}}],"http":[{"name":"github","base_url":"https://api.github.com/","headers":[{"name":"Authorization","value":"${secret:token}"}]}]}
+            , .{ .allocate = .alloc_always });
+            defer data.deinit();
+            var config = try data.value.configAlloc(alloc);
+            defer scraping.RemoteContentSnapshotData.deinitConfig(&config, alloc);
+            const facade = &config;
+            const initial = try remoteContentSnapshotUpdateAlloc(alloc, facade, null);
+            defer alloc.free(initial.json.?);
+            const same = try remoteContentSnapshotUpdateAlloc(alloc, facade, &initial.revision);
+            try std.testing.expect(same.json == null);
+            facade.http.getPtr("github").?.headers.clearRetainingCapacity();
+            // Removed strings still belong to the parsed snapshot arena.
+            const changed = try remoteContentSnapshotUpdateAlloc(alloc, facade, &initial.revision);
+            defer alloc.free(changed.json.?);
+            try std.testing.expect(!std.mem.eql(u8, &initial.revision, &changed.revision));
+            var parsed = try std.json.parseFromSlice(scraping.RemoteContentSnapshotData, alloc, changed.json.?, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            var restored = try parsed.value.configAlloc(alloc);
+            defer scraping.RemoteContentSnapshotData.deinitConfig(&restored, alloc);
+            try std.testing.expectEqualStrings("${secret:key}", restored.getS3("r2").?.secret_access_key.?);
+            try std.testing.expectEqual(@as(usize, 0), restored.getHttp("github").?.headers.count());
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+/// Check the identity held by the same lease as the configuration. A separate
+/// health read could race a reload and associate bytes with the wrong revision.
+/// Publishers without immutable identities retain the safe serialize/hash path.
+/// That fallback costs O(serialized configuration bytes) even when unchanged;
+/// a cheap warm path requires a revision bound to an immutable publication.
+pub fn remoteContentSnapshotUpdateAlloc(
+    alloc: std.mem.Allocator,
+    remote_content: *const scraping.RemoteContentConfig,
+    previous: ?*const [32]u8,
+) !RemoteContentSnapshotUpdate {
+    var snapshot = try remote_content.acquire();
+    defer snapshot.deinit();
+    if (snapshot.revision) |revision| {
+        if (previous) |old| if (std.mem.eql(u8, old, &revision)) return .{ .revision = revision };
     }
-    return try std.json.Stringify.valueAlloc(alloc, scraping.RemoteContentSnapshotData{
+    const json = try remoteContentConfigJsonAlloc(alloc, snapshot.config);
+    const revision = snapshot.revision orelse blk: {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(json, &hash, .{});
+        break :blk hash;
+    };
+    if (previous) |old| if (std.mem.eql(u8, old, &revision)) {
+        alloc.free(json);
+        return .{ .revision = revision };
+    };
+    return .{ .revision = revision, .json = json };
+}
+
+fn remoteContentConfigJsonAlloc(alloc: std.mem.Allocator, config: *const scraping.RemoteContentConfig) ![]u8 {
+    const Data = scraping.RemoteContentSnapshotData;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    const s3 = try scratch.alloc(Data.NamedS3Credential, config.s3.count());
+    for (config.s3.keys(), config.s3.values(), s3) |name, credential, *out| {
+        out.* = .{ .name = name, .credential = credential };
+    }
+    const http = try scratch.alloc(Data.NamedHttpCredential, config.http.count());
+    for (config.http.keys(), config.http.values(), http) |name, credential, *out| {
+        const headers = try scratch.alloc(Data.NamedHttpCredential.Header, credential.headers.count());
+        for (credential.headers.keys(), credential.headers.values(), headers) |header_name, value, *header| {
+            header.* = .{ .name = header_name, .value = value };
+        }
+        out.* = .{ .name = name, .base_url = credential.base_url, .headers = headers, .security = credential.security };
+    }
+    const gcs = try scratch.alloc(Data.NamedGcsConnection, config.gcs_connections.count());
+    for (config.gcs_connections.keys(), config.gcs_connections.values(), gcs) |name, connection, *out| {
+        out.* = .{ .name = name, .connection = connection };
+    }
+    return try std.json.Stringify.valueAlloc(alloc, Data{
         .security = config.security orelse .{},
-        .gcs_connections = entries,
+        .default_s3 = config.default_s3,
+        .s3 = s3,
+        .http = http,
+        .gcs_connections = gcs,
     }, .{});
 }
 
@@ -2511,6 +2621,7 @@ fn contentSecurityFromOpenApi(
     else
         null;
     out.allowed_paths = if (value.allowed_paths) |paths| try dupOwnedStringSlice(alloc, paths) else null;
+    out.source_media_base_urls = if (value.source_media_base_urls) |urls| try dupOwnedStringSlice(alloc, urls) else null;
     out.user_agent = if (value.user_agent) |user_agent| try alloc.dupe(u8, user_agent) else null;
     scraping.validateNat64Prefixes(out) catch return error.InvalidConfig;
     return out;
@@ -3974,9 +4085,30 @@ fn parseLakeIndexConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.La
     if (text.admission_window_segments == 0 or text.admission_window_segments > 64 or text.admission_window_bytes == 0 or text.admission_window_bytes > 32 * 1024 * 1024) return error.InvalidConfig;
     const cursors = parsed.value.query_cursors;
     if (cursors.retention_ms < 1000 or cursors.retention_ms > std.time.ms_per_hour or cursors.max_native_cuts == 0 or cursors.max_native_cuts > 4096 or cursors.max_native_retained_bytes == 0 or cursors.max_native_retained_bytes > 1024 * 1024 * 1024 * 1024) return error.InvalidConfig;
+    if (cursors.max_durable_native_cuts == 0 or cursors.max_durable_native_cuts > 4096 or cursors.max_durable_native_bytes == 0 or cursors.max_durable_native_bytes > 1024 * 1024 * 1024 * 1024 or cursors.max_native_warm_bytes == 0 or cursors.max_native_warm_bytes > 1024 * 1024 * 1024 * 1024) return error.InvalidConfig;
     const gc = parsed.value.artifact_gc;
     if (gc.interval_ms < 1000 or gc.interval_ms > std.time.ms_per_day or gc.max_deleted == 0 or gc.max_deleted > 65536 or gc.max_marked == 0 or gc.max_marked > 1048576 or gc.max_read_bytes == 0 or gc.max_read_bytes > 1024 * 1024 * 1024) return error.InvalidConfig;
     return parsed.value;
+}
+
+test "external lake native snapshot warming defaults by deployment and accepts explicit overrides" {
+    const a = std.testing.allocator;
+    var defaults = try Config.parseFromSlice(a, "{}");
+    defer defaults.deinit();
+    try std.testing.expect(defaults.lake_indexes.query_cursors.background_warming == null);
+    inline for (std.meta.tags(DeploymentMode)) |deployment| {
+        try std.testing.expect(!defaults.lake_indexes.nativeSnapshotWarmingEnabled(deployment));
+    }
+    for ([_]bool{ false, true }) |enabled| {
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .lake_indexes = .{ .query_cursors = .{ .background_warming = enabled } } }, .{});
+        defer a.free(bytes);
+        var config = try Config.parseFromSlice(a, bytes);
+        defer config.deinit();
+        inline for (std.meta.tags(DeploymentMode)) |deployment| {
+            try std.testing.expectEqual(enabled, config.lake_indexes.nativeSnapshotWarmingEnabled(deployment));
+        }
+    }
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, "{\"lake_indexes\":{\"query_cursors\":{\"background_warming\":\"false\"}}}"));
 }
 
 test "external lake native artifact collection config validates bounded operator controls" {
@@ -4038,6 +4170,10 @@ test "external lake cursor retention and capacity policy reject unbounded admiss
         "{\"lake_indexes\":{\"query_cursors\":{\"retention_ms\":0}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"retention_ms\":3600001}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_cuts\":0}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_durable_native_cuts\":0}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_durable_native_cuts\":4097}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_durable_native_bytes\":0}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_native_warm_bytes\":0}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_retained_bytes\":0}}}",
     }) |bytes| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, bytes));
 }

@@ -63,6 +63,14 @@ const row_policy_bundle_mod = @import("row_policy_bundle.zig");
 const runtime_failure_abi = @import("runtime_failure_abi");
 const schema_registry_mod = @import("schema_registry.zig");
 const std = @import("std");
+/// Fails the next primary batch just after it became durable, then disarms.
+/// Exercises every caller's committed-but-failed classification.
+pub var test_fail_after_primary_commit: if (@import("builtin").is_test) ?anyerror else void = if (@import("builtin").is_test) null else {};
+/// Runs once just before the next primary batch's durable store write
+/// (including transaction resolution), then disarms. Returning an error fails
+/// the batch before its decision; a hook may instead arm a storage fault.
+pub const TestHook = struct { ptr: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
+pub var test_before_primary_commit: if (@import("builtin").is_test) ?TestHook else void = if (@import("builtin").is_test) null else {};
 const table_catalog_mod = @import("table_catalog.zig");
 const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
@@ -157,6 +165,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const directGraphNeighborContextHintsAlloc = S.directGraphNeighborContextHintsAlloc;
         const documentRangeLowerAlloc = S.documentRangeLowerAlloc;
         const encodeTimestampValue = S.encodeTimestampValue;
+        const encodeDocumentTimestampValue = S.encodeDocumentTimestampValue;
         const freeOwnedKeySlice = S.freeOwnedKeySlice;
         const generatedPrecomputeModeForSyncLevel = S.generatedPrecomputeModeForSyncLevel;
         const graphCleanupReplayWritesAlloc = S.graphCleanupReplayWritesAlloc;
@@ -190,6 +199,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn batchContext(self: anytype) BatchExecutionContext {
             const resources = S.ownerField(self, "core").*.batchExecutionResources();
             return .{
+                .ordered_artifact_publication_required = S.ownerField(self, "local_execution").*.artifact_publication_dispatcher != null,
                 .alloc = S.ownerField(self, "alloc").*,
                 .store = resources.store,
                 .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
@@ -412,7 +422,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (S.ownerField(self, "core").*.index_manager.resource_manager) |manager| {
                 try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
             }
-            const preparation_timestamp_ns = if (req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
+            const preparation_timestamp_ns = if (req.document_version_scheme == .revision_v1 or req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
             const preparation_alloc = prepared_row_allocator.allocator();
 
             // Resolve request ordering and transforms before row preparation. A
@@ -476,6 +486,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .row_policy_principal_proof = req.row_policy_principal_proof,
                 .row_policy_database = req.row_policy_database,
                 .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+                .normalized_graph_rows = req.normalized_graph_rows,
                 .range_guards = req.range_guards,
                 .restore_staging_scope = req.restore_staging_scope,
                 .restore_staging_plan_id = req.restore_staging_plan_id,
@@ -498,7 +509,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .graph_deletes = effective_graph_deletes,
                 .transforms = &.{},
                 .predicates = req.predicates,
-                .timestamp_ns = req.timestamp_ns,
+                .timestamp_ns = preparation_timestamp_ns,
+                .document_version_scheme = if (req.document_version_scheme != .admit_current) req.document_version_scheme else if (opts.ordered_apply_receipt != null) .legacy else .revision_v1,
                 .sync_level = req.sync_level,
                 .reject_graph_transform_projections = req.reject_graph_transform_projections,
                 .split_checkpoint = req.split_checkpoint,
@@ -681,6 +693,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                         effect.timestamp_value = try encodeTimestampValue(effects_alloc, write_timestamp_ns);
                                     }
                                 }
+                                // Receipt validation ran against the pinned plan
+                                // before preparation released its parsed scratch.
                                 for (row.extracted.dense_embeddings) |*embedding| {
                                     if (embedding.artifact_key != null) continue;
                                     embedding.artifact_key = try appendEmbeddingArtifactWrite(
@@ -923,7 +937,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or opts.group_source_command != null))
                 preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
             const apply_lock_wait_start_ns = monotonicTimeNs();
-            try self.lockApplyForPortableRuntime();
+            if (opts.ordered_apply_receipt != null) {
+                // A committed Raft entry must yield its progress mutex when
+                // apply is busy, including a reader arriving after preflight.
+                try tryLockApplyForPortableRuntime(self);
+            } else {
+                try self.lockApplyForPortableRuntime();
+            }
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
             if (S.ownerField(self, "local_execution").*.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;
@@ -1283,6 +1303,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 preparation_timestamp_ns;
 
+            // Current local writes and tagged ordered commands allocate a
+            // revision independently of their admitted wall-clock timestamp.
+            // Untagged historical commands retain their original semantics.
+            const document_revisions = effective_req.document_version_scheme != .legacy;
+            const document_version = if (document_revisions and relationalColumns(self) == null)
+                try @import("../ttl.zig").nextDocumentVersion(S.ownerField(self, "core").*.store, S.ownerField(self, "alloc").*, batch_timestamp_ns, effective_req.writes, effective_req.deletes)
+            else
+                null;
+
             if (opts.row_policy_principal) |principal| {
                 const policy_schema_view = if (use_preprepared_rows)
                     request_schema_view orelse return error.RowPolicyCatalogChanged
@@ -1301,6 +1330,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // instead of scanning every outstanding transaction.
             if (opts.transaction_resolution == null) {
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
+                var graph_sources: std.ArrayList(types.BatchWrite) = .empty;
+                defer graph_sources.deinit(S.ownerField(self, "alloc").*);
+                for (effective_req.graph_writes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.source, .value = "" });
+                for (effective_req.graph_deletes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.source, .value = "" });
+                try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(graph_sources.items, &.{});
             }
             try self.validateTransformReadSnapshot(transform_snapshot);
             // Catches a concurrent commit to one of this batch's own write keys
@@ -1371,6 +1405,40 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .use_preprepared_rows = use_preprepared_rows,
             };
             defer write_buffers.deinit();
+            // Live rows alone cannot preserve the history of absent keys.
+            // Max-merge the certified source floor with restored versions and
+            // local admission, in the same transaction as the page receipt.
+            var incoming_floor: u64 = @max(opts.restore_document_version_floor, if (effective_req.merge_page) |page| page.document_version_floor else 0);
+            // An unversioned legacy apply must not introduce new allocator
+            // state on only the upgraded replicas of a rolling deployment.
+            // Copy senders carry an explicit protected floor; local/current
+            // admissions already require the document revision protocol.
+            if (document_revisions or incoming_floor != 0) if (opts.restore_timestamps) |timestamps| {
+                var versions = timestamps.valueIterator();
+                while (versions.next()) |version| incoming_floor = @max(incoming_floor, version.*);
+            };
+            var persisted_floor = document_version;
+            if (incoming_floor != 0 and relationalColumns(self) == null) {
+                const previous = if (document_version) |version| version else blk: {
+                    const store = S.ownerField(self, "core").*.store;
+                    const raw = store.get(S.ownerField(self, "alloc").*, @import("../ttl.zig").document_version_watermark_key) catch |err| switch (err) {
+                        error.NotFound => break :blk @as(u64, 0),
+                        else => return err,
+                    };
+                    defer S.ownerField(self, "alloc").*.free(raw);
+                    if (raw.len != 8) return error.InvalidTimestamp;
+                    break :blk std.mem.readInt(u64, raw[0..8], .little);
+                };
+                persisted_floor = @max(previous, incoming_floor);
+            }
+            if (persisted_floor) |version| {
+                const bytes = try encodeTimestampValue(S.ownerField(self, "alloc").*, version);
+                write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, bytes) catch |err| {
+                    S.ownerField(self, "alloc").*.free(bytes);
+                    return err;
+                };
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("../ttl.zig").document_version_watermark_key, .value = bytes });
+            }
             if (S.ownerField(self, "local_execution").*.row_policy_table_name) |table_name| {
                 try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = internal_keys.graph_owning_table_key, .value = table_name });
             }
@@ -1384,6 +1452,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = ranges.activation_key, .value = ranges.activation_value });
                 }
             }
+            // A graph-only mutation changes the source's adjacency domain.
+            // Touch its primary storage key so existing SQL range observations
+            // detect graph phantoms and prepared graph writers fence outsiders.
+            var touched_graph_sources = std.StringHashMapUnmanaged(void).empty;
+            defer touched_graph_sources.deinit(S.ownerField(self, "alloc").*);
+            inline for (.{ effective_req.graph_writes, effective_req.graph_deletes }) |edges| for (edges) |edge| {
+                if (touched_graph_sources.contains(edge.source)) continue;
+                try touched_graph_sources.put(S.ownerField(self, "alloc").*, edge.source, {});
+                var primary_written = false;
+                for (effective_ops.writes) |write| if (std.mem.eql(u8, write.key, edge.source)) {
+                    primary_written = true;
+                    break;
+                };
+                for (effective_ops.deletes) |key| if (std.mem.eql(u8, key, edge.source)) {
+                    primary_written = true;
+                    break;
+                };
+                if (primary_written) continue;
+                const key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, edge.source);
+                defer S.ownerField(self, "alloc").*.free(key);
+                const existing = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, existing) catch |err| {
+                    S.ownerField(self, "alloc").*.free(existing);
+                    return err;
+                };
+                const copied_key = try S.ownerField(self, "alloc").*.dupe(u8, key);
+                write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, copied_key) catch |err| {
+                    S.ownerField(self, "alloc").*.free(copied_key);
+                    return err;
+                };
+                try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = copied_key, .value = existing });
+            };
             const vector_field_names_start_ns = monotonicTimeNs();
             write_buffers.vector_store_field_names = if (relationalColumns(self) == null)
                 try S.ownerField(self, "core").*.index_manager.vectorStoreFieldNamesAlloc(S.ownerField(self, "alloc").*)
@@ -1599,6 +1702,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     write_buffers.prepared_embedding_artifact_count = write_buffers.explicit_embedding_artifact_writes.items.len;
                     effects.embedding_writes.clearRetainingCapacity();
                 } else {
+                    if (prepared_relational) |*prepared|
+                        try S.ownerField(self, "core").*.index_manager.validateExternalVectorSpacesParsed(extracted[i].dense_embeddings, prepared.parsedValue())
+                    else
+                        try S.ownerField(self, "core").*.index_manager.validateExternalVectorSpaces(S.ownerField(self, "alloc").*, extracted[i].dense_embeddings, write.value);
                     for (extracted[i].dense_embeddings) |*embedding| {
                         if (embedding.artifact_key != null) continue;
                         embedding.artifact_key = try appendEmbeddingArtifactWrite(
@@ -1659,15 +1766,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         const logical = try std.json.parseFromSliceLeaky(std.json.Value, group_alloc, cleaned, .{});
                         group_changes[i] = try plan.prepareRow(group_alloc, write.key, logical);
                     };
-                    const resolved_write_timestamp_ns: ?u64 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
-                        (if (opts.restore_timestamps) |timestamps| timestamps.get(write.key) else null) orelse if (prepared_relational) |*prepared|
-                            try resolveWriteTimestampFromValue(self, batch_timestamp_ns, prepared.parsedValue())
-                        else
-                            try resolveWriteTimestampNs(self, batch_timestamp_ns, write.value)
+                    const restored_source = if (opts.restore_ttl_sources) |sources| sources.get(write.key) else null;
+                    const restored_version = if (opts.restore_timestamps) |timestamps| timestamps.get(write.key) else null;
+                    const resolved_write_timestamp_ns: ?i128 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
+                        if (prepared_relational) |*prepared|
+                            if (restored_version) |version| @as(i128, version) else try resolveWriteTimestampFromValue(self, batch_timestamp_ns, prepared.parsedValue())
+                        else if (restored_source) |source| source else if (opts.restore_ttl_sources != null and restored_version != null and restored_version.? == 0) 0 else try resolveWriteTimestampNs(self, restored_version orelse batch_timestamp_ns, write.value)
                     else
                         null;
                     if (!use_preprepared_rows) if (prepared_relational) |*prepared|
-                        try prepared.finalizeMetadata(resolved_write_timestamp_ns orelse 0);
+                        try prepared.finalizeMetadata(std.math.cast(u64, resolved_write_timestamp_ns orelse 0) orelse return error.InvalidArgument);
                     // Covering values carry the authoritative full-row timestamp
                     // and semantic hash. Prepare/stage fallback index effects only
                     // after those metadata fields have been finalized.
@@ -1725,12 +1833,31 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     });
                     try write_buffers.identity_upsert_keys.append(S.ownerField(self, "alloc").*, write.key);
                     try write_buffers.identity_upsert_write_indexes.append(S.ownerField(self, "alloc").*, i);
-                    if (shouldWriteTimestamp(write.key)) {
+                    if (shouldWriteTimestamp(write.key)) timestamp: {
+                        // The transfer map uses zero with no source slot for a
+                        // missing sidecar. An explicit epoch source has a slot,
+                        // so absence never becomes a receiver-policy timestamp.
+                        if (!use_preprepared_rows and prepared_relational == null and restored_version != null and restored_version.? == 0 and restored_source == null and opts.restore_ttl_sources != null) {
+                            const missing_key = try makeTimestampKey(S.ownerField(self, "alloc").*, write.key);
+                            write_buffers.timestamp_delete_keys.append(S.ownerField(self, "alloc").*, missing_key) catch |err| {
+                                S.ownerField(self, "alloc").*.free(missing_key);
+                                return err;
+                            };
+                            try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, missing_key);
+                            break :timestamp;
+                        }
                         const timestamp_start_ns = monotonicTimeNs();
                         const timestamp_key = if (use_preprepared_rows) preparation.effects.?[i].timestamp_key.? else try makeTimestampKey(S.ownerField(self, "alloc").*, write.key);
+                        errdefer if (!use_preprepared_rows) S.ownerField(self, "alloc").*.free(timestamp_key);
                         const timestamp_value = if (use_preprepared_rows) preparation.effects.?[i].timestamp_value.? else blk: {
-                            break :blk try encodeTimestampValue(S.ownerField(self, "alloc").*, resolved_write_timestamp_ns.?);
+                            break :blk if (prepared_relational != null)
+                                try encodeTimestampValue(S.ownerField(self, "alloc").*, @intCast(resolved_write_timestamp_ns.?))
+                            else if (!document_revisions and restored_version == null)
+                                try encodeTimestampValue(S.ownerField(self, "alloc").*, std.math.cast(u64, resolved_write_timestamp_ns.?) orelse return error.InvalidArgument)
+                            else
+                                try encodeDocumentTimestampValue(S.ownerField(self, "alloc").*, if (effective_req.document_version_scheme == .revision_v1) document_version orelse batch_timestamp_ns else batch_timestamp_ns, resolved_write_timestamp_ns.?, restored_version);
                         };
+                        errdefer if (!use_preprepared_rows) S.ownerField(self, "alloc").*.free(timestamp_value);
                         try write_buffers.timestamp_writes.append(S.ownerField(self, "alloc").*, .{
                             .key = timestamp_key,
                             .value = timestamp_value,
@@ -2078,7 +2205,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, store_key);
                 if (shouldWriteTimestamp(key)) {
                     const timestamp_key = try makeTimestampKey(S.ownerField(self, "alloc").*, key);
-                    try write_buffers.timestamp_delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key);
+                    write_buffers.timestamp_delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key) catch |err| {
+                        S.ownerField(self, "alloc").*.free(timestamp_key);
+                        return err;
+                    };
                     try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key);
                 }
             }
@@ -2323,7 +2453,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     matched_entry = entry;
                     break;
                 };
-                if (!matched and command.action != .retire and command.action != .activate) return error.PreparedGenerationChanged;
+                if (!matched and command.action != .retire and !command.isActivation()) return error.PreparedGenerationChanged;
                 const table = try group_mutations.tableIdentity(&group_overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
                 if (table != command.definition.table_incarnation) return error.InvalidGroupedSourceCommand;
                 var namespace: [24]u8 = undefined;
@@ -2334,17 +2464,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 const route = try command.routeAlloc(group_alloc);
                 if (!S.ownerField(self, "core").*.byteRange().contains(route)) return error.KeyOutOfRange;
-                if (command.action == .activate) {
+                if (command.isActivation()) {
                     const entry = opts.ordered_apply_receipt orelse return error.InvalidGroupedSourceCommand;
                     const inventory = @import("artifact_inventory.zig");
                     const publication = @import("artifact_publication.zig");
                     const catalogs = try inventory.catalogs(&group_overlay);
                     const active = try publication.authority(&group_overlay);
                     const status = try inventory.status(group_alloc, &group_overlay, namespace);
-                    const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
+                    const planned: ?inventory.Command = if (command.action == .activate_catalog) try inventory.desiredCommand(group_alloc, &group_overlay, namespace, catalogs, status, 16) else null;
+                    const required_protocol: u16 = if (planned) |current| current.binding.effect_protocol else 0;
+                    const ready = if (active) |value| status.ready and status.ordered != null and status.ordered.?.effect_protocol >= required_protocol and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
                     if (!ready) {
                         try @import("artifact_catalog_mutability.zig").requireMutable(group_alloc, &group_overlay, namespace, null);
-                        const ordered = if (status.ready and status.ordered.?.effect_protocol == 16) blk: {
+                        // Legacy controls keep their original deterministic
+                        // replay behavior. The versioned action shares normal
+                        // inventory planning, including monotonic protocol floors.
+                        const ordered = if (planned) |current| current else if (status.ready and status.ordered.?.effect_protocol >= 16) blk: {
                             var installed = (try inventory.load(group_alloc, &group_overlay)).?;
                             defer installed.deinit();
                             var current = installed.value.command;
@@ -2932,6 +3067,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &write_buffers.owned_store_values,
             );
             try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
+            if (opts.outcome_marker_write) |marker| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, marker);
             if (req.merge_page) |page| if (page.integrity.len != 0) {
                 // Private page shape, exact generation/ownership and replay cursor
                 // have been checked under this same apply fence. The physical
@@ -3039,6 +3175,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             defer authored_acceptance.deinit();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
+                test_before_primary_commit = null;
+                try hook.run(hook.ptr);
+            };
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
                 const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                     resolution.txn_id,
@@ -3076,7 +3216,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             local_coverage_guard.release();
             if (opts.primary_committed) |committed| committed.* = true;
+            if (opts.prepared_commit_disposition) |disposition| disposition.markPrimaryCommitted();
             if (graph_publication) |*lease| lease.release();
+            if (comptime @import("builtin").is_test) if (test_fail_after_primary_commit) |err| {
+                test_fail_after_primary_commit = null;
+                return err;
+            };
             if (!transaction_applied.applied) {
                 // Recovery may have committed this participant before the
                 // requesting owner retries it. Its visibility wait must yield
@@ -3272,22 +3417,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try types.validateMergeArtifacts(req);
             const max_prepared_generation_retries = 2;
             var retry_count: usize = 0;
-            // Provider results are semantic request data, not schema/index-plan
-            // data. Keep them across optimistic publication retries so catalog
-            // churn cannot multiply expensive external work.
+            // Keep provider results across optimistic retries under their
+            // captured input, revision, epoch and forced document incarnation.
+            // Unrelated catalog churn reuses valid work; a new target cannot
+            // relabel the preceding attempt's result.
             var generated_memo = GeneratedEmbeddingMemo.init(allocator_guard.allocator());
             // Cache restoration is an internal preservation operation. Ordinary
             // writes and explicit regeneration retain their provider semantics.
             generated_memo.reuse_stored_artifacts = if (opts.restore_staging) |admission| !admission.rewrite else false;
             defer generated_memo.deinit();
             while (true) {
-                self.batchInternalPrepared(req, profile, opts, &generated_memo, allocator_guard) catch |err| switch (err) {
-                    error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
-                        if (retry_count >= max_prepared_generation_retries) return err;
-                        retry_count += 1;
-                        continue;
-                    },
-                    else => return err,
+                var disposition: execution_resources.PreparedCommitDisposition = .{};
+                var attempt_options = opts;
+                attempt_options.prepared_commit_disposition = &disposition;
+                self.batchInternalPrepared(req, profile, attempt_options, &generated_memo, allocator_guard) catch |err| {
+                    if (!disposition.permitsPreparationRetry(err) or retry_count >= max_prepared_generation_retries) return err;
+                    retry_count += 1;
+                    continue;
                 };
                 // Completion errors happen after commit. Keep this outside the
                 // preparation retry handler so they cannot replay the user batch.
@@ -3686,6 +3832,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.startsWith(u8, key, protection.index_writer_prefix);
         }
 
+        pub fn tryLockApplyForPortableRuntime(self: anytype) !void {
+            try self.enforcePortableRuntimeGate();
+            if (!S.ownerField(self, "core").*.tryLockApplyExclusive()) return error.WriterLocked;
+            errdefer S.ownerField(self, "core").*.unlockApply();
+            try self.enforcePortableRuntimeGate();
+        }
+
         pub fn lockApplyForPortableRuntime(self: anytype) !void {
             try self.enforcePortableRuntimeGate();
             lockApply(self);
@@ -3702,11 +3855,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn markPrecomputedEnrichmentAppliedForSync(self: anytype, sync_level: types.SyncLevel, sequence: u64) !void {
             if (sync_level != .enrichments or sequence == 0) return;
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
-            const runtime_stats = runtime.stats();
+            const cut = try runtime.replayCutForVisibility(sequence);
+            if (cut.applied >= sequence) return;
             // A contiguous sequence may still retain a producer that requires
             // committed graph state. Only the replay lane proves no work remains.
-            if (try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence)) {
-                try runtime.markAppliedThrough(sequence);
+            if (try self.noPendingEnrichmentReplayThrough(cut.applied, sequence)) {
+                try runtime.markAppliedThroughAtCut(sequence, cut);
             }
         }
 
@@ -3918,6 +4072,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                         break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                     } else &.{};
+                    if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
+                        test_before_primary_commit = null;
+                        hook.run(hook.ptr) catch |err| {
+                            S.ownerField(self, "core").*.unlockApply();
+                            return err;
+                        };
+                    };
                     const outcome = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                         txn_id,
                         status,
@@ -3939,18 +4100,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return;
                 }
 
-                const writes = try alloc.alloc(types.BatchWrite, intents.writes.len);
-                defer alloc.free(writes);
-                for (intents.writes, 0..) |write, i| writes[i] = .{ .key = write.key, .value = write.value };
+                var graph_arena = std.heap.ArenaAllocator.init(alloc);
+                defer graph_arena.deinit();
+                const graph_batch = try @import("graph_transaction_effects.zig").materialize(graph_arena.allocator(), intents);
                 var durable_rows = std.StringHashMapUnmanaged([]const u8).empty;
                 defer durable_rows.deinit(alloc);
                 for (intents.prepared_rows, 0..) |maybe_row, i| if (maybe_row) |row| {
                     try durable_rows.put(alloc, intents.writes[i].key, row);
                 };
                 self.batchInternalWithPreparationAllocator(.{
-                    .writes = writes,
-                    .deletes = intents.deletes,
+                    .writes = graph_batch.writes,
+                    .deletes = graph_batch.deletes,
+                    .graph_writes = graph_batch.graph_writes,
+                    .graph_deletes = graph_batch.graph_deletes,
                     .timestamp_ns = commit_version,
+                    .document_version_scheme = if (intents.document_revisions) .revision_v1 else .legacy,
                     .sync_level = commit_sync_level,
                     .restore_staging_scope = restore_scope,
                 }, null, .{
@@ -4628,6 +4792,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
                 if (internal_keys.isAssetArtifactKey(key)) {
                     try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
+                    // Match generated publication records: even an unchanged
+                    // source can publish a newer healthy manifest whose repair
+                    // effect must reach every consumer before target advance.
+                    inline for (.{ .full_text, .dense_vector, .sparse_vector, .algebraic }) |hint|
+                        try appendUniqueReplayRecordHint(alloc, &target_hints, hint);
                 }
                 // A committed resolution artifact re-drives sibling resolvers over
                 // the same source (compositional event identity composes sibling

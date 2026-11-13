@@ -14,6 +14,42 @@
 // limitations under the License.
 
 const std = @import("std");
+
+/// Literal-only validation details, owned by the public request. Bindings are
+/// stackable so nested calls and reused executor threads cannot leak failures.
+pub const ValidationDiagnostic = struct {
+    pointer: []const u8,
+    message: []const u8,
+};
+pub const ValidationDiagnosticStorage = struct {
+    diagnostic: ?ValidationDiagnostic = null,
+};
+threadlocal var validation_diagnostic_storage: ?*ValidationDiagnosticStorage = null;
+pub const ValidationDiagnosticBinding = struct {
+    previous: ?*ValidationDiagnosticStorage,
+    pub fn deinit(self: @This()) void {
+        validation_diagnostic_storage = self.previous;
+    }
+};
+pub fn bindValidationDiagnostic(storage: *ValidationDiagnosticStorage) ValidationDiagnosticBinding {
+    const previous = validation_diagnostic_storage;
+    validation_diagnostic_storage = storage;
+    return .{ .previous = previous };
+}
+pub fn resetValidationDiagnostic() void {
+    if (validation_diagnostic_storage) |storage| storage.diagnostic = null;
+}
+pub fn takeValidationDiagnostic() ?ValidationDiagnostic {
+    const storage = validation_diagnostic_storage orelse return null;
+    const diagnostic = storage.diagnostic;
+    storage.diagnostic = null;
+    return diagnostic;
+}
+fn invalidQueryField(comptime pointer: []const u8, comptime message: []const u8) error{InvalidQueryRequest} {
+    if (validation_diagnostic_storage) |storage| storage.diagnostic = .{ .pointer = pointer, .message = message };
+    return error.InvalidQueryRequest;
+}
+
 const relationship_filter = @import("../graph/relationship_filter.zig");
 const builtin = @import("builtin");
 const ant_json = @import("antfly-json");
@@ -603,6 +639,7 @@ pub const QueryResponseMeta = struct {
     merge: ?MergeProfile = null,
     dense_search: ?DenseSearchProfile = null,
     aggregation_results: []aggregations_mod.SearchAggregationResult = &.{},
+    aggregation_execution: ?[]const u8 = null,
 
     pub fn deinit(self: *QueryResponseMeta, alloc: std.mem.Allocator) void {
         if (self.evaluation_json) |data| alloc.free(data);
@@ -2522,8 +2559,9 @@ fn applyCommonSearchRequestOptions(
     if (request.count) |count| req.count_only = count;
     if (request.remote_snapshot) |snapshot| {
         const retained_lake = (std.mem.startsWith(u8, snapshot, "lake2:") or std.mem.startsWith(u8, snapshot, "native2:")) and snapshot.len > 64 and (snapshot.len <= 512 or @import("../serverless/manifest/artifact_ref.zig").retainedGenerationToken(snapshot));
-        if (snapshot.len != 64 and !retained_lake) return error.InvalidQueryRequest;
-        if (retained_lake) for (snapshot) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidQueryRequest;
+        const owned_lake = std.mem.startsWith(u8, snapshot, "lake3:") and snapshot.len > 64 and snapshot.len <= 16 * 1024;
+        if (snapshot.len != 64 and !retained_lake and !owned_lake) return error.InvalidQueryRequest;
+        if (retained_lake or owned_lake) for (snapshot) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidQueryRequest;
         req.remote_snapshot = try alloc.dupe(u8, snapshot);
     }
     const has_result_page_options =
@@ -2990,13 +3028,17 @@ pub fn parseQueryRequestWithDeadline(
     // generated public contract strips private shard fields. Public admission
     // rejects this control before entering the shared parser. Escaped member
     // names still receive semantic parsing rather than bypassing retention.
-    if (std.mem.indexOf(u8, body, "_native_cut") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+    if (std.mem.indexOf(u8, body, "_native_cut") != null or std.mem.indexOf(u8, body, "_response_live_read") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
         var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
         defer raw.deinit();
         if (raw.value == .object) if (raw.value.object.get("_native_cut")) |value| {
             owned.native_cut = try std.json.parseFromValue(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child, alloc, value, .{ .allocate = .alloc_always });
             try owned.native_cut.?.value.validate(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
             owned.req.native_query_cut = owned.native_cut.?.value;
+        };
+        if (raw.value == .object) if (raw.value.object.get("_response_live_read")) |value| {
+            if (value != .bool) return error.InvalidQueryRequest;
+            owned.req.response_live_read = value.bool;
         };
     }
     if (std.mem.indexOf(u8, body, "_document_authority") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
@@ -3012,7 +3054,25 @@ pub fn parseQueryRequestWithDeadline(
             owned.req.defer_stored_projection = control.value.defer_stored_projection;
         };
     }
+    if (std.mem.indexOf(u8, body, "_privacy_policy_version") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value == .object) if (raw.value.object.get("_privacy_policy_version")) |value| {
+            owned.req.privacy_policy_version = try parsePrivacyPolicyVersion(value);
+        };
+    }
     return owned;
+}
+
+pub fn parsePrivacyPolicyVersion(value: std.json.Value) ![64]u8 {
+    if (value != .string) return error.InvalidQueryRequest;
+    var version: [64]u8 = @splat(0);
+    if (!std.mem.eql(u8, value.string, "none")) {
+        if (value.string.len != 64) return error.InvalidQueryRequest;
+        for (value.string) |byte| if (!std.ascii.isHex(byte)) return error.InvalidQueryRequest;
+        @memcpy(&version, value.string);
+    }
+    return version;
 }
 
 fn parseQueryRequestWithDeadlineCore(
@@ -3124,6 +3184,22 @@ fn parseQueryRequestWithDeadlineCore(
     errdefer normalized_query.deinit(alloc);
     try ensureQueryDeadline(execution_deadline_ns);
 
+    // Navigation admits a bounded set of source rows, without a text-index
+    // retrieval relation. Lower logical field predicates into the existing
+    // stored-value matcher rather than leaving a text-filter carrier behind.
+    if (req.hierarchy_children != null) if (normalized_query.filter_text) |predicate| {
+        var encoded: std.ArrayListUnmanaged(u8) = .empty;
+        defer encoded.deinit(alloc);
+        try appendPatternFilterQueryValue(alloc, &encoded, predicate, true);
+        const value = try std.json.parseFromSlice(std.json.Value, alloc, encoded.items, .{});
+        defer value.deinit();
+        try db_mod.validateStructuredFilterValueAlloc(alloc, value.value);
+        const owned = try encoded.toOwnedSlice(alloc);
+        normalized_query.filter_query_json = try mergeInternalFilterJsonAlloc(alloc, normalized_query.filter_query_json, owned, .all);
+        freeTextQuery(alloc, predicate);
+        normalized_query.filter_text = null;
+    };
+
     if (req.reranker != null) {
         req.reranker_query_text = try buildRerankerQueryText(alloc, request);
     }
@@ -3137,10 +3213,10 @@ fn parseQueryRequestWithDeadlineCore(
         normalized_query.full_text = null;
     } else if (request.full_text_index != null) {
         return error.InvalidQueryRequest;
-    } else if (normalized_query.filter_text != null or
+    } else if (req.hierarchy_children == null and (normalized_query.filter_text != null or
         normalized_query.exclusion_text != null or
         normalized_query.filter_query_json.len > 0 or
-        normalized_query.exclusion_query_json.len > 0)
+        normalized_query.exclusion_query_json.len > 0))
     {
         req.full_text = .{ .match_all = {} };
     }
@@ -3227,6 +3303,60 @@ test "api query contract storage public consumers reject evaluation before execu
     }) |body| try std.testing.expectError(error.UnsupportedQueryRequest, validateStoragePublicQueryRequest(alloc, body));
     try validateStoragePublicQueryRequest(alloc, "{\"evaluate\":null}");
     try validateStoragePublicQueryRequest(alloc, "{\"full_text_search\":{\"match_all\":{}}}");
+}
+
+test "api query contract live read annotation is trusted and survives worker transport" {
+    const a = std.testing.allocator;
+    var parsed = try parsePublicQueryRequest(a, null, "docs", "{}");
+    defer parsed.deinit(a);
+    try std.testing.expect(!parsed.req.response_live_read);
+    parsed.req.response_live_read = true;
+    const wire = try @import("query_execution_contract.zig").encodeQueryRequest(a, parsed.req);
+    defer a.free(wire);
+    var worker = try parseQueryRequest(a, null, "docs", wire);
+    defer worker.deinit(a);
+    try std.testing.expect(worker.req.response_live_read);
+    for ([_][]const u8{ "{\"_response_live_read\":true}", "{\"_response_liv\\u0065_read\":true}" }) |body| {
+        try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(a, null, "docs", body));
+    }
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs", "{\"_response_live_read\":1}"));
+}
+
+fn liveReadEncodingScenario(a: std.mem.Allocator) !void {
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+    for ([_]bool{ false, true }) |live| {
+        const req: db_mod.types.SearchRequest = .{ .response_live_read = live };
+        var response = try encodeQueryResponses(a, "docs", req, .{}, result);
+        defer response.deinit(a);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.json, .{});
+        defer parsed.deinit();
+        const value = parsed.value.object.get("responses").?.array.items[0].object.get("live_read");
+        if (live) try std.testing.expect(value.?.bool) else try std.testing.expect(value == null);
+    }
+    const Sink = struct {
+        called: bool = false,
+        fn start(_: *anyopaque, _: usize) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn write(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn consume(raw: *anyopaque, view: @import("query_response.zig").ResultView) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(?bool, true), view.result.live_read);
+            self.called = true;
+        }
+    };
+    var sink: Sink = .{};
+    var delivered = try encodeQueryResponsesWithDelivery(a, "docs", .{ .response_live_read = true }, .{}, result, .{ .ptr = &sink, .start_fn = Sink.start, .write_fn = Sink.write, .typed_result = .{ .ptr = &sink, .consume = Sink.consume } });
+    defer delivered.deinit(a);
+    try std.testing.expect(sink.called);
+    try std.testing.expectEqual(@as(?usize, 0), delivered.delivered_bytes);
+}
+
+test "api query contract live read encoding owns failures and annotates typed delivery" {
+    try liveReadEncodingScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, liveReadEncodingScenario, .{});
 }
 
 test "api query contract hierarchy worker wire preserves explicit deferred projection" {
@@ -4473,6 +4603,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
+                .live_read = if (req.response_live_read) true else null,
             };
             if (graph_results == null and typed_delivery) if (delivery) |sink| if (sink.typed_result) |target| {
                 if (sink.hydrator != null) return error.InvalidArgument;
@@ -4512,6 +4643,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
+                .live_read = if (req.response_live_read) true else null,
             };
             break :blk if (hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try std.json.Stringify.valueAlloc(
                 alloc,
@@ -4805,7 +4937,12 @@ fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.Searc
     // Positions and revisions are traversal state, not durable unit fields.
     // Relevance grouping deliberately omits them so re-extraction cannot leak
     // a cursor from an older artifact generation.
-    if (req.hierarchy_children != null) try appendHierarchyNavigationMetadata(alloc, &obj, hit);
+    if (req.hierarchy_children) |children| {
+        if (children.artifact_name != null) {
+            if (hit.sort_values.len != 2 or hit.sort_values[0] != .string) return error.InvalidQueryRequest;
+            try putJsonString(alloc, &obj, "position", hit.sort_values[0].string);
+        } else try appendHierarchyNavigationMetadata(alloc, &obj, hit);
+    }
 
     if (hit.chunk_hits.len > 0) {
         var chunks = try std.json.Array.initCapacity(alloc, hit.chunk_hits.len);
@@ -4890,7 +5027,7 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
     if (hit.stored_data) |stored_data| {
         const match_projection_configured = !req.hierarchy_match_include_all_fields;
         const source = if (req.defer_stored_projection or match_projection_configured)
-            try projectPublicStoredSourceValue(alloc, stored_data, .{
+            try projectHierarchyMemberSource(alloc, stored_data, .{
                 .fields = if (match_projection_configured) req.hierarchy_match_fields else req.fields,
                 .include_all_fields = if (match_projection_configured) false else req.include_all_fields,
             })
@@ -4914,6 +5051,42 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
     }
 
     return .{ .object = obj };
+}
+
+// Copy/text assets retain raw UTF-8, whereas chunks and extraction units are
+// JSON objects. Apply the same explicit projection to a synthetic text field
+// instead of feeding raw bytes into the JSON-only document projector.
+fn projectHierarchyMemberSource(alloc: std.mem.Allocator, raw: []const u8, options: db_mod.types.LookupOptions) !std.json.Value {
+    var value = try parseStoredSourceValue(alloc, raw);
+    defer db_mod.types.deinitJsonValue(alloc, &value);
+    if (value != .object) {
+        var object = std.json.ObjectMap.empty;
+        var scalar_field: []const u8 = "$";
+        if (!options.include_all_fields) for (options.fields) |field| {
+            if (std.mem.eql(u8, field, "text")) scalar_field = "text";
+            if (std.mem.eql(u8, field, "$")) {
+                scalar_field = "$";
+                break;
+            }
+        };
+        try object.put(alloc, try alloc.dupe(u8, scalar_field), try db_mod.types.cloneJsonValue(alloc, value));
+        db_mod.types.deinitJsonValue(alloc, &value);
+        value = .{ .object = object };
+    }
+    return try document_query.projectLookupValue(alloc, value, options);
+}
+
+test "api query contract projects raw text asset evidence without exposing unrequested fields" {
+    const a = std.testing.allocator;
+    var projected = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"text"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &projected);
+    try std.testing.expectEqualStrings("launch at 04:12", projected.object.get("text").?.string);
+    var scalar = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"$"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &scalar);
+    try std.testing.expectEqualStrings("launch at 04:12", scalar.object.get("$").?.string);
+    var hidden = try projectHierarchyMemberSource(a, "launch at 04:12", .{ .fields = &.{"provenance"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &hidden);
+    try std.testing.expectEqual(@as(usize, 0), hidden.object.count());
 }
 
 fn hierarchyAncestorsJsonValue(
@@ -5077,6 +5250,8 @@ fn artifactRefJsonValue(alloc: std.mem.Allocator, artifact_ref: db_mod.types.Art
 
     try putJsonString(alloc, &obj, "name", artifact_ref.name);
     try putJsonString(alloc, &obj, "kind", artifactKindString(artifact_ref.kind));
+    if (artifact_ref.revision) |revision| try putJsonString(alloc, &obj, "revision", revision);
+    if (artifact_ref.derivation_revision) |revision| try putJsonString(alloc, &obj, "derivation_revision", revision);
     if (artifact_ref.chunk_id) |chunk_id| {
         try obj.put(alloc, try alloc.dupe(u8, "chunk_id"), .{ .integer = @intCast(chunk_id) });
     }
@@ -5327,6 +5502,9 @@ pub fn freeAggregationRequests(
         if (request.fields.len > 0) alloc.free(@constCast(request.fields));
         if (request.calendar_interval.len > 0) alloc.free(request.calendar_interval);
         if (request.fixed_interval.len > 0) alloc.free(request.fixed_interval);
+        if (request.bucket_origin.len > 0) alloc.free(request.bucket_origin);
+        if (request.date_bounds_start.len > 0) alloc.free(request.date_bounds_start);
+        if (request.date_bounds_end.len > 0) alloc.free(request.date_bounds_end);
         if (request.significance_algorithm.len > 0) alloc.free(request.significance_algorithm);
         if (request.bucket_path.len > 0) alloc.free(request.bucket_path);
         if (request.sort_order.len > 0) alloc.free(request.sort_order);
@@ -5384,6 +5562,9 @@ fn parseAggregationRequestsAlloc(
             if (request.fields.len > 0) alloc.free(@constCast(request.fields));
             if (request.calendar_interval.len > 0) alloc.free(request.calendar_interval);
             if (request.fixed_interval.len > 0) alloc.free(request.fixed_interval);
+            if (request.bucket_origin.len > 0) alloc.free(request.bucket_origin);
+            if (request.date_bounds_start.len > 0) alloc.free(request.date_bounds_start);
+            if (request.date_bounds_end.len > 0) alloc.free(request.date_bounds_end);
             if (request.significance_algorithm.len > 0) alloc.free(request.significance_algorithm);
             if (request.bucket_path.len > 0) alloc.free(request.bucket_path);
             if (request.sort_order.len > 0) alloc.free(request.sort_order);
@@ -5430,6 +5611,7 @@ fn parseAggregationRequestsAlloc(
         out[initialized] = try parseSingleAggregationRequestAlloc(alloc, name, aggregation);
         initialized += 1;
     }
+    aggregations_mod.validateTemporalRequests(out) catch return error.InvalidQueryRequest;
     return out;
 }
 
@@ -5537,6 +5719,24 @@ fn parseSingleAggregationRequestAlloc(
         center_lon = std.fmt.parseFloat(f64, std.mem.trim(u8, lon_text, &std.ascii.whitespace)) catch return error.InvalidQueryRequest;
     }
 
+    if (aggregation.type == .date_histogram) {
+        const calendar = if (aggregation.calendar_interval) |value| blk: {
+            if (value != .string) return error.InvalidQueryRequest;
+            break :blk value.string;
+        } else "";
+        _ = @import("../search/aggregation.zig").parseDateInterval(calendar, aggregation.fixed_interval orelse "", aggregation.bucket_origin orelse "") catch return error.InvalidQueryRequest;
+    } else if (aggregation.fixed_interval != null or aggregation.bucket_origin != null or aggregation.date_bounds != null) return error.InvalidQueryRequest;
+    if (aggregation.date_bounds) |bounds| {
+        if (bounds != .object or bounds.object.count() != 2 or (aggregation.min_doc_count orelse 0) != 0) return error.InvalidQueryRequest;
+        const start = bounds.object.get("start") orelse return error.InvalidQueryRequest;
+        const end = bounds.object.get("end") orelse return error.InvalidQueryRequest;
+        if (start != .string or end != .string) return error.InvalidQueryRequest;
+        const first = @import("../datetime.zig").parseRfc3339ToSignedNs(start.string) orelse return error.InvalidQueryRequest;
+        const last = @import("../datetime.zig").parseRfc3339ToSignedNs(end.string) orelse return error.InvalidQueryRequest;
+        if (first >= last) return error.InvalidQueryRequest;
+    }
+
+    if ((aggregation.exclude_null orelse false) and aggregation.type != .terms) return error.InvalidQueryRequest;
     const cardinality_mode = try parseCardinalityModeJson(alloc, aggregation.mode);
 
     return .{
@@ -5545,12 +5745,17 @@ fn parseSingleAggregationRequestAlloc(
         .field = try alloc.dupe(u8, primary_field),
         .cardinality_mode = cardinality_mode,
         .fields = fields,
+        .exclude_null = aggregation.exclude_null orelse false,
         .size = aggregation.size orelse 0,
         .interval = if (aggregation.interval) |value| value else 0,
         .calendar_interval = if (aggregation.calendar_interval) |value|
             try jsonValueToFlatStringAlloc(alloc, value)
         else
             "",
+        .date_bounds_start = if (aggregation.date_bounds) |bounds| try aggregationDateBoundAlloc(alloc, bounds, "start") else "",
+        .date_bounds_end = if (aggregation.date_bounds) |bounds| try aggregationDateBoundAlloc(alloc, bounds, "end") else "",
+        .fixed_interval = if (aggregation.fixed_interval) |value| try alloc.dupe(u8, value) else "",
+        .bucket_origin = if (aggregation.bucket_origin) |value| try alloc.dupe(u8, value) else "",
         .min_doc_count = aggregation.min_doc_count orelse 0,
         .significance_algorithm = if (aggregation.algorithm) |value|
             try jsonValueToFlatStringAlloc(alloc, value)
@@ -5576,6 +5781,13 @@ fn parseSingleAggregationRequestAlloc(
         .algebraic_join = algebraic_join,
         .aggregations = nested,
     };
+}
+
+fn aggregationDateBoundAlloc(alloc: std.mem.Allocator, value: std.json.Value, field: []const u8) ![]u8 {
+    if (value != .object) return error.InvalidQueryRequest;
+    const bound = value.object.get(field) orelse return error.InvalidQueryRequest;
+    if (bound != .string or @import("../datetime.zig").parseRfc3339ToSignedNs(bound.string) == null) return error.InvalidQueryRequest;
+    return alloc.dupe(u8, bound.string);
 }
 
 fn parseAlgebraicAggregationJoinAlloc(
@@ -5690,22 +5902,22 @@ fn toOpenApiAggregationResult(
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
         defer parsed.deinit();
         switch (parsed.value) {
-            .float => |value| out.value = @floatCast(value),
+            .float => |value| out.value = value,
             .integer => |value| out.value = @floatFromInt(value),
             .object => |object| {
-                if (object.get("value")) |value| out.value = try jsonValueToF32(value);
+                if (object.get("value")) |value| out.value = try jsonValueToF64(value);
                 if (object.get("approximate")) |value| {
                     if (value == .bool) out.approximate = value.bool;
                 }
-                if (object.get("relative_error")) |value| out.relative_error = try jsonValueToF32(value);
+                if (object.get("relative_error")) |value| out.relative_error = try jsonValueToF64(value);
                 if (object.get("count")) |value| out.count = try jsonValueToI64(value);
-                if (object.get("min")) |value| out.min = try jsonValueToF32(value);
-                if (object.get("max")) |value| out.max = try jsonValueToF32(value);
-                if (object.get("sum")) |value| out.sum = try jsonValueToF32(value);
-                if (object.get("sum_squares")) |value| out.sum_of_squares = try jsonValueToF32(value);
-                if (object.get("avg")) |value| out.avg = try jsonValueToF32(value);
-                if (object.get("variance")) |value| out.variance = try jsonValueToF32(value);
-                if (object.get("std_dev")) |value| out.std_deviation = try jsonValueToF32(value);
+                if (object.get("min")) |value| out.min = try jsonValueToF64(value);
+                if (object.get("max")) |value| out.max = try jsonValueToF64(value);
+                if (object.get("sum")) |value| out.sum = try jsonValueToF64(value);
+                if (object.get("sum_squares")) |value| out.sum_of_squares = try jsonValueToF64(value);
+                if (object.get("avg")) |value| out.avg = try jsonValueToF64(value);
+                if (object.get("variance")) |value| out.variance = try jsonValueToF64(value);
+                if (object.get("std_dev")) |value| out.std_deviation = try jsonValueToF64(value);
             },
             else => {},
         }
@@ -5795,6 +6007,15 @@ fn jsonValueToBucketKeyAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![
 }
 
 fn jsonValueToF32(value: std.json.Value) !?f32 {
+    return switch (value) {
+        .null => null,
+        .integer => @floatFromInt(value.integer),
+        .float => @floatCast(value.float),
+        else => error.InvalidQueryRequest,
+    };
+}
+
+fn jsonValueToF64(value: std.json.Value) !?f64 {
     return switch (value) {
         .null => null,
         .integer => @floatFromInt(value.integer),
@@ -7058,6 +7279,7 @@ fn buildProfileValue(
         try parsed.value.object.put(alloc, "sort", try buildSortProfileValue(alloc, req, sort_profile));
     }
     if (result.document_authority_version != 0) try parsed.value.object.put(alloc, "document_authority_version", .{ .integer = result.document_authority_version });
+    if (meta.aggregation_execution) |execution| try parsed.value.object.put(alloc, "aggregation_execution", .{ .string = execution });
     return parsed.value;
 }
 
@@ -8918,7 +9140,7 @@ fn normalizeGeneratedBleveQuery(alloc: std.mem.Allocator, query: std.json.Value)
 fn encodePatternFilterQuery(alloc: std.mem.Allocator, query: db_mod.types.TextQuery) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendPatternFilterQueryValue(alloc, &out, query);
+    try appendPatternFilterQueryValue(alloc, &out, query, false);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -8966,8 +9188,15 @@ fn appendPatternFilterQueryValue(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     query: db_mod.types.TextQuery,
+    allow_logical_values: bool,
 ) !void {
     switch (query) {
+        .value => |spec| {
+            if (!allow_logical_values) return error.UnsupportedQueryRequest;
+            const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .value = spec }, .{});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        },
         .match_all => try out.appendSlice(alloc, "{\"match_all\":{}}"),
         .match_none => try out.appendSlice(alloc, "{\"match_none\":{}}"),
         .term => |term| {
@@ -9103,7 +9332,7 @@ fn appendPatternFilterQueryValue(
                 try out.append(alloc, '[');
                 for (bool_query.must, 0..) |item, i| {
                     if (i > 0) try out.append(alloc, ',');
-                    try appendPatternFilterQueryValue(alloc, out, item);
+                    try appendPatternFilterQueryValue(alloc, out, item, allow_logical_values);
                 }
                 try out.append(alloc, ']');
             }
@@ -9112,7 +9341,7 @@ fn appendPatternFilterQueryValue(
                 try out.append(alloc, '[');
                 for (bool_query.should, 0..) |item, i| {
                     if (i > 0) try out.append(alloc, ',');
-                    try appendPatternFilterQueryValue(alloc, out, item);
+                    try appendPatternFilterQueryValue(alloc, out, item, allow_logical_values);
                 }
                 try out.append(alloc, ']');
             }
@@ -9121,7 +9350,7 @@ fn appendPatternFilterQueryValue(
                 try out.append(alloc, '[');
                 for (bool_query.must_not, 0..) |item, i| {
                     if (i > 0) try out.append(alloc, ',');
-                    try appendPatternFilterQueryValue(alloc, out, item);
+                    try appendPatternFilterQueryValue(alloc, out, item, allow_logical_values);
                 }
                 try out.append(alloc, ']');
             }
@@ -10486,9 +10715,7 @@ fn parseLegacyPatternSteps(
                 .edge_filter = edge_filter,
             } else .{ .types = edge_types },
         };
-        if (step.edge != null and (steps[i].edge.min_hops == 0 or
-            steps[i].edge.max_hops == 0 or
-            steps[i].edge.min_hops > steps[i].edge.max_hops or
+        if (step.edge != null and (steps[i].edge.min_hops > steps[i].edge.max_hops or
             steps[i].edge.max_hops > graph_pattern_mod.max_pattern_hops))
             return error.InvalidQueryRequest;
         initialized += 1;
@@ -10871,8 +11098,8 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
                 .types = types,
                 .edge_filter = edge_filter,
                 .direction = parseGraphDirection(edge.direction),
-                .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
-                .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
+                .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 0, graph_pattern_mod.max_pattern_hops),
+                .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 0, graph_pattern_mod.max_pattern_hops),
                 .min_weight = weight_bounds.min,
                 .max_weight = weight_bounds.max,
             },
@@ -11605,7 +11832,11 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     freeOwnedStringSlice(alloc, req.hierarchy_match_fields);
     freeOwnedStringSlice(alloc, req.hierarchy_source_fields);
     freeOwnedStringSlice(alloc, req.hierarchy_unit_fields);
-    if (req.hierarchy_children) |children| alloc.free(@constCast(children.parent_id));
+    if (req.hierarchy_children) |children| {
+        if (children.parent_id.len != 0) alloc.free(@constCast(children.parent_id));
+        freeOwnedStringSlice(alloc, children.parent_ids);
+        if (children.artifact_name) |name| alloc.free(@constCast(name));
+    }
     if (req.resolved_doc_filter_owned) {
         if (req.resolved_doc_filter) |ptr| db_mod.doc_filter_wire.destroyResolvedDocFilter(alloc, ptr);
     }
@@ -12570,10 +12801,13 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_response_live_read",
         "_document_authority",
+        "_privacy_policy_version",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
+        "_hierarchy_parent_admitted",
         "_defer_hierarchy_child_hydration",
         "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
@@ -12753,7 +12987,7 @@ fn applyPublicHierarchyControls(
                             return error.InvalidQueryRequest;
                         }
                     }
-                    if (!fields_set) return error.InvalidQueryRequest;
+                    if (!fields_set) return invalidQueryField("/hierarchy/group_by/matches/fields", "fields is required when hierarchy.group_by.matches is configured; use an explicit field array (which may be empty)");
                 } else {
                     return error.InvalidQueryRequest;
                 }
@@ -12764,18 +12998,40 @@ fn applyPublicHierarchyControls(
             if (value != .object or req.hierarchy_children != null) return error.InvalidQueryRequest;
             const parent = value.object.get("parent") orelse return error.InvalidQueryRequest;
             const level = value.object.get("level") orelse return error.InvalidQueryRequest;
-            if (value.object.count() != 2 or parent != .object or level != .string) return error.InvalidQueryRequest;
-            if (!std.mem.eql(u8, level.string, "unit")) return error.UnsupportedQueryRequest;
+            if (parent != .object or level != .string) return error.InvalidQueryRequest;
+            const member = std.mem.eql(u8, level.string, "member");
+            if (!member and !std.mem.eql(u8, level.string, "unit")) return error.UnsupportedQueryRequest;
+            const artifact = value.object.get("artifact");
+            if (member) {
+                if (value.object.count() != 3 or artifact == null or artifact.? != .string or artifact.?.string.len == 0) return error.InvalidQueryRequest;
+            } else if (value.object.count() != 2) return error.InvalidQueryRequest;
             const parent_level = parent.object.get("level") orelse return error.InvalidQueryRequest;
-            const parent_id = parent.object.get("id") orelse return error.InvalidQueryRequest;
-            if (parent.object.count() != 2 or parent_level != .string or parent_id != .string or parent_id.string.len == 0) {
-                return error.InvalidQueryRequest;
-            }
+            const parent_id = parent.object.get("id");
+            const parent_ids = parent.object.get("ids");
+            if (parent.object.count() != 2 or parent_level != .string or (parent_id == null) == (parent_ids == null)) return error.InvalidQueryRequest;
             if (!std.mem.eql(u8, parent_level.string, "source")) return error.UnsupportedQueryRequest;
-            req.hierarchy_children = .{
-                .parent_id = try alloc.dupe(u8, parent_id.string),
-                .parent_level = .source,
-                .level = .unit,
+            if (parent_id) |id| {
+                if (id != .string or id.string.len == 0) return error.InvalidQueryRequest;
+            }
+            if (parent_ids) |ids| {
+                if (!member or ids != .array or ids.array.items.len == 0 or ids.array.items.len > 100) return error.InvalidQueryRequest;
+                for (ids.array.items, 0..) |id, i| {
+                    if (id != .string or id.string.len == 0) return error.InvalidQueryRequest;
+                    for (ids.array.items[0..i]) |prior| if (std.mem.eql(u8, prior.string, id.string)) return error.InvalidQueryRequest;
+                }
+            }
+            req.hierarchy_children = blk: {
+                const owned_parent = if (parent_id) |id| try alloc.dupe(u8, id.string) else "";
+                errdefer if (owned_parent.len != 0) alloc.free(owned_parent);
+                const owned_ids = if (parent_ids) |ids| try parseStringArrayJsonAlloc(alloc, ids) else &.{};
+                errdefer freeOwnedStringSlice(alloc, owned_ids);
+                break :blk .{
+                    .parent_id = owned_parent,
+                    .parent_ids = owned_ids,
+                    .artifact_name = if (member) try alloc.dupe(u8, artifact.?.string) else null,
+                    .parent_level = .source,
+                    .level = .unit,
+                };
             };
         } else if (std.mem.eql(u8, key, "ancestors")) {
             if (value != .object or value.object.count() == 0) return error.InvalidQueryRequest;
@@ -12813,7 +13069,7 @@ fn applyPublicHierarchyControls(
     if (has_new_controls) {
         if (children_set) {
             if (group_by_set or hierarchy.object.get("ancestors") != null) return error.InvalidQueryRequest;
-            if (!objectHasNonNullField(parsed.value.object, "fields")) return error.InvalidQueryRequest;
+            if (!objectHasNonNullField(parsed.value.object, "fields") and req.hierarchy_children.?.artifact_name == null) return error.InvalidQueryRequest;
             var root_it = parsed.value.object.iterator();
             while (root_it.next()) |entry| {
                 if (entry.value_ptr.* == .null) continue;
@@ -12828,6 +13084,8 @@ fn applyPublicHierarchyControls(
                     // The retained cut is required to resume child traversal;
                     // it is capability metadata, not a relevance/filter knob.
                     !std.mem.eql(u8, root_key, "remote_snapshot") and
+                    // A member filter admits source parents before paging their artifacts.
+                    !(std.mem.eql(u8, root_key, "filter_query") and req.hierarchy_children.?.artifact_name != null) and
                     !isInternalShardFieldName(root_key))
                 {
                     // Sequential traversal has no relevance/filter execution
@@ -12844,7 +13102,7 @@ fn applyPublicHierarchyControls(
                 !std.mem.eql(u8, req.order_by[1].field, "_id") or
                 req.order_by[1].desc)
             {
-                return error.InvalidQueryRequest;
+                return invalidQueryField("/order_by", "hierarchy.children requires order_by with _hierarchy.position ascending followed by _id ascending");
             }
             if (req.search_after.len > 0 and
                 (req.search_after.len != 2 or req.search_after[0] != .string or req.search_after[1] != .string))
@@ -12852,7 +13110,7 @@ fn applyPublicHierarchyControls(
                 return error.InvalidQueryRequest;
             }
             if (req.search_before.len > 0) return error.InvalidQueryRequest;
-            req.return_mode = .unit;
+            req.return_mode = if (req.hierarchy_children.?.artifact_name != null) .member else .unit;
         } else if (group_by_set) {
             // Group hits hydrate source documents, which may contain large
             // stored child materializations. Require an explicit projection
@@ -12924,10 +13182,13 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_response_live_read",
         "_document_authority",
+        "_privacy_policy_version",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
+        "_hierarchy_parent_admitted",
         "_defer_hierarchy_child_hydration",
         "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
@@ -13368,6 +13629,10 @@ fn parseInternalDocIdConstraintsAlloc(
             return error.InvalidQueryRequest;
         }
         req.primary_text_index_name = try alloc.dupe(u8, value.string);
+    }
+    if (parsed.value.object.get("_hierarchy_parent_admitted")) |value| {
+        if (value != .bool or !value.bool or req.hierarchy_children == null or req.hierarchy_children.?.artifact_name == null) return error.InvalidQueryRequest;
+        req.hierarchy_parent_admitted = true;
     }
     if (parsed.value.object.get("_defer_hierarchy_child_hydration")) |value| {
         const is_unit_group = req.hierarchy_group_level == .unit and
@@ -20674,4 +20939,132 @@ test "api query contract source only column delivery keeps payload outside metad
     try std.testing.expect(counter.bytes > body.len);
     try std.testing.expectEqual(@as(?usize, counter.bytes), response.delivered_bytes);
     try std.testing.expect(hits[0].column_source == null);
+}
+
+test "hierarchy validation diagnostics name required fields and stay request scoped" {
+    const a = std.testing.allocator;
+    var outer: ValidationDiagnosticStorage = .{};
+    const outer_binding = bindValidationDiagnostic(&outer);
+    defer outer_binding.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs",
+        \\{"fields":[],"hierarchy":{"group_by":{"level":"source","matches":{}}}}
+    ));
+    var inner: ValidationDiagnosticStorage = .{};
+    const inner_binding = bindValidationDiagnostic(&inner);
+    try std.testing.expect(takeValidationDiagnostic() == null);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs",
+        \\{"fields":[],"hierarchy":{"children":{"parent":{"level":"source","id":"doc"},"level":"unit"}}}
+    ));
+    try std.testing.expectEqualStrings("/order_by", takeValidationDiagnostic().?.pointer);
+    try std.testing.expect(takeValidationDiagnostic() == null);
+    inner_binding.deinit();
+    try std.testing.expectEqualStrings("/hierarchy/group_by/matches/fields", takeValidationDiagnostic().?.pointer);
+    try std.testing.expect(takeValidationDiagnostic() == null);
+}
+
+test "native member traversal requires producer and private parent admission" {
+    const alloc = std.testing.allocator;
+    const body = "{\"hierarchy\":{\"children\":{\"parent\":{\"level\":\"source\",\"id\":\"doc:a\"},\"level\":\"member\",\"artifact\":\"summary\"}},\"order_by\":[{\"field\":\"_hierarchy.position\"}],\"limit\":1}";
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualStrings("summary", parsed.req.hierarchy_children.?.artifact_name.?);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, parsed.req.return_mode);
+    try std.testing.expect(!parsed.req.hierarchy_parent_admitted);
+    for ([_][]const u8{
+        "{\"equals\":\"selected\",\"field\":\"source_id\"}",
+        "{\"bool\":{\"must\":[{\"equals\":\"selected\",\"field\":\"source_id\"},{\"bool\":{\"should\":[{\"bool\":true,\"field\":\"permissions.public\"},{\"equals\":\"user:alice\",\"field\":\"permissions.readers\"}],\"minimum_should_match\":1}}]}}",
+        "{\"bool\":true,\"field\":\"permissions.public\"}",
+    }) |predicate| {
+        const filtered_body = try std.mem.concat(alloc, u8, &.{ "{\"filter_query\":", predicate, ",", body[1..] });
+        defer alloc.free(filtered_body);
+        var filtered = try parseQueryRequest(alloc, null, "docs", filtered_body);
+        defer filtered.deinit(alloc);
+        try std.testing.expect(filtered.req.filter_query_json.len != 0);
+        try std.testing.expect(filtered.req.full_text == null and filtered.req.filter_text == null);
+        try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(filtered.req));
+        const wire = try @import("query_execution_contract.zig").encodeQueryRequest(alloc, filtered.req);
+        defer alloc.free(wire);
+        var worker = try parseQueryRequest(alloc, null, "docs", wire);
+        defer worker.deinit(alloc);
+        try std.testing.expect(worker.req.filter_query_json.len != 0);
+        try std.testing.expect(worker.req.full_text == null and worker.req.filter_text == null);
+        try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(worker.req));
+    }
+    var json = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer json.deinit();
+    try json.value.object.put(json.arena.allocator(), "_hierarchy_parent_admitted", .{ .bool = true });
+    try std.testing.expect(objectHasInternalShardField(json.value.object));
+}
+
+test "time series public query preserves duration origin and bounded extent" {
+    const a = std.testing.allocator;
+    const requests = try parseAggregationRequestsJson(a,
+        \\{"points":{"type":"date_histogram","field":"ts","fixed_interval":"5m","bucket_origin":"1970-01-01T00:02:00Z","date_bounds":{"start":"2026-11-06T12:00:00Z","end":"2026-11-06T13:00:00Z"},"sub_aggregations":{"average":{"type":"avg","field":"value"}}}}
+    );
+    defer freeAggregationRequests(a, requests);
+    try std.testing.expectEqualStrings("5m", requests[0].fixed_interval);
+    try std.testing.expectEqualStrings("1970-01-01T00:02:00Z", requests[0].bucket_origin);
+    try std.testing.expectEqualStrings("2026-11-06T12:00:00Z", requests[0].date_bounds_start);
+    try std.testing.expectEqual(@as(usize, 1), requests[0].aggregations.len);
+}
+
+test "time series JSON aggregation keeps SQL float64 measurement precision" {
+    const a = std.testing.allocator;
+    const result = try toOpenApiAggregationResult(a, null, .{
+        .name = "average",
+        .field = "temperature",
+        .type = "avg",
+        .value_json = "{\"count\":1,\"sum\":23.123456789,\"avg\":23.123456789}",
+    });
+    try std.testing.expectEqual(@as(f64, 23.123456789), result.avg.?);
+    try std.testing.expectEqual(@as(f64, 23.123456789), result.sum.?);
+}
+
+test "time series range proof preserves the exact source predicate" {
+    const a = std.testing.allocator;
+    const execution = @import("query_execution_contract.zig");
+    var request = try parseQueryRequest(a, null, "readings",
+        \\{"limit":0,"timeout_ms":30000,"filter_query":{"conjuncts":[{"field":"ts","start":"2026-11-06T12:00:00Z","end":"2026-11-06T12:20:00Z","inclusive_start":true,"inclusive_end":false},{"field":"device_id","equals":"sensor"}]},"aggregations":{"series":{"type":"terms","fields":["device_id"],"size":20,"sub_aggregations":{"points":{"type":"date_histogram","field":"ts","fixed_interval":"5m","date_bounds":{"start":"2026-11-06T12:00:00Z","end":"2026-11-06T12:20:00Z"},"sub_aggregations":{"average":{"type":"avg","field":"v"}}}}}}}
+    );
+    defer request.deinit(a);
+    try std.testing.expect(execution.canConsiderAlgebraicAggregations(request.req));
+    const constraints = (try execution.algebraicConstraintsForRequestAlloc(a, request.req)) orelse return error.MissingTemporalRangeProof;
+    defer execution.freeAlgebraicConstraints(a, constraints);
+    try std.testing.expectEqual(@as(usize, 2), constraints.len);
+    var found = false;
+    for (constraints) |constraint| if (constraint.time_range != null) {
+        found = true;
+    };
+    try std.testing.expect(found);
+    var populated = request.req;
+    populated.aggregations_json = "{\"points\":{\"type\":\"date_histogram\",\"field\":\"ts\",\"fixed_interval\":\"300s\",\"min_doc_count\":1,\"sub_aggregations\":{\"average\":{\"type\":\"avg\",\"field\":\"v\"}}}}";
+    const populated_constraints = (try execution.algebraicConstraintsForRequestAlloc(a, populated)) orelse return error.MissingTemporalRangeProof;
+    defer execution.freeAlgebraicConstraints(a, populated_constraints);
+    try std.testing.expectEqual(constraints.len, populated_constraints.len);
+    var malformed = request.req;
+    malformed.filter_query_json = "{\"date_range\":{\"field\":\"ts\",\"start\":\"2026-11-06T12:00:00Z\",\"end\":\"2026-11-06T12:20:00Z\"},\"term\":{\"path\":\"tenant\",\"value\":\"restricted\"}}";
+    const rejected = try execution.algebraicConstraintsForRequestAlloc(a, malformed);
+    defer if (rejected) |items| execution.freeAlgebraicConstraints(a, items);
+    try std.testing.expect(rejected == null);
+}
+
+test "api query contract scalar evidence preserves JSON-shaped plaintext bytes" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "123", "true", "\"quoted\"", "{\"text\":\"launch\"}" }) |raw| {
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .@"$" = raw }, .{});
+        defer a.free(encoded);
+        var projected = try projectHierarchyMemberSource(a, encoded, .{ .fields = &.{"$"}, .include_all_fields = false });
+        defer db_mod.types.deinitJsonValue(a, &projected);
+        try std.testing.expectEqualStrings(raw, projected.object.get("$").?.string);
+    }
+}
+
+test "api query contract structured dollar projection never exposes internal fields" {
+    const a = std.testing.allocator;
+    var projected = try projectHierarchyMemberSource(a, "{\"text\":\"visible\",\"_artifact_unit_fingerprint\":\"private-proof\",\"_resolution_work\":{}}", .{ .fields = &.{"$"}, .include_all_fields = false });
+    defer db_mod.types.deinitJsonValue(a, &projected);
+    const wire = try std.json.Stringify.valueAlloc(a, projected, .{});
+    defer a.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "private-proof") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "_resolution_work") == null);
 }

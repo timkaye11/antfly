@@ -223,6 +223,11 @@ components:
         checksum:
           type: string
           description: Static checksum recorded as source version metadata.
+        checksum_algorithm:
+          type: string
+          enum: [sha256]
+          description: |-
+            Declares that `checksum` (or the row value named by `source.checksum_field`) is a digest of the original bytes, computed with this algorithm. When set and the row carries a well-formed digest, extraction identifies the row by that digest instead of by its location (URL, ETag, version, last-modified), so copying, re-hosting, or renaming a source does not force re-extraction as long as the bytes are unchanged. The downloaded bytes are verified against the declared digest; a mismatch fails extraction instead of keeping stale output alive. A present but malformed digest is also an error, never a silent fall back to location-based identity. Leaving this unset preserves prior behavior byte for byte, including for rows that only set `checksum_field`.
         version:
           type: string
           description: Static source version. Together with the other metadata it lets extraction skip unchanged sources.
@@ -237,6 +242,8 @@ components:
           x-go-type-skip-optional-pointer: false
           default: true
           description: Strip HTML markup from HTML sources before storing their text.
+        native_text:
+          $ref: '#/components/schemas/DocumentExtractionNativeTextConfig'
         ocr:
           $ref: '#/components/schemas/DocumentExtractionOcrConfig'
         transcription:
@@ -252,6 +259,18 @@ components:
           description: Routes evaluated in order before the preset. The first route whose match applies selects the extractor.
           items:
             $ref: '#/components/schemas/DocumentExtractionRoute'
+    DocumentExtractionNativeTextConfig:
+      type: object
+      description: Native document text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability.
+      properties:
+        policy:
+          type: string
+          enum: [source, page, visible]
+          default: page
+          description: |-
+            `source` retains decoded source text, including off-page runs, for auditing. `page` excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
+        quality:
+          $ref: '#/components/schemas/DocumentExtractionTextQualityConfig'
     DocumentExtractionSourceConfig:
       type: object
       description: Names of row fields that carry source metadata. Each overrides the matching static field.
@@ -267,7 +286,7 @@ components:
           description: Row field holding the source ETag.
         checksum_field:
           type: string
-          description: Row field holding the source checksum.
+          description: Row field holding the source checksum. May name a dotted path (e.g. `metadata.sha256`) to reach a value nested under another row field.
         version_field:
           type: string
           description: Row field holding the source version.
@@ -330,14 +349,14 @@ components:
           type: string
           enum: [auto, always]
           default: auto
-          description: "`auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page."
+          description: "`auto` reads PDF pages whose native text fails `native_text.quality`, and images. `always` reads every page."
         prompt:
           type: string
           description: Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts.
         render:
           $ref: '#/components/schemas/DocumentExtractionRenderConfig'
         quality:
-          $ref: '#/components/schemas/DocumentExtractionOcrQualityConfig'
+          $ref: '#/components/schemas/DocumentExtractionTextQualityConfig'
     DocumentExtractionReaderConfig:
       type: object
       required: [provider]
@@ -413,6 +432,17 @@ components:
       type: object
       description: How PDF pages are rasterized for OCR.
       properties:
+        sampling:
+          type: string
+          enum: [auto, pdf, smooth]
+          default: auto
+          description: |-
+            PDF image sampling, separate from model resizing and normalization.
+            `auto` smooths continuous-tone images while preserving one-bit scan
+            coverage during minification. `pdf` honors the PDF's interpolation
+            declarations. `smooth` uses bilinear sampling even for one-bit images
+            (except stencil masks), which can soften fine lines. Effective policy,
+            version, resolution, DPI and geometry are recorded in unit provenance.
         dpi:
           type: integer
           minimum: 72
@@ -437,16 +467,16 @@ components:
           maximum: 16384
           default: 4096
           description: Maximum width or height of a rendered page.
-    DocumentExtractionOcrQualityConfig:
+    DocumentExtractionTextQualityConfig:
       type: object
-      description: Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode.
+      description: Text-quality thresholds. `native_text.quality` assesses native document text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics.
       properties:
-        min_content_chars:
+        min_chars:
           type: integer
           x-go-type-skip-optional-pointer: false
           minimum: 0
           default: 50
-          description: Pages with fewer meaningful characters are read with OCR.
+          description: Minimum non-whitespace Unicode characters before text passes the length check.
         garbled_min_words:
           type: integer
           x-go-type-skip-optional-pointer: false
@@ -466,11 +496,11 @@ components:
           maximum: 1
           default: 0.4
           description: Maximum ratio of single-character words before text counts as garbled.
-        substantial_line_min_chars:
+        min_line_chars:
           type: integer
           minimum: 1
           default: 15
-          description: Minimum characters for a line to count in the corrupted-line check.
+          description: Minimum non-whitespace Unicode characters for a line to count in the corrupted-line check.
         max_corrupted_line_ratio:
           type: number
           x-go-type-skip-optional-pointer: false
@@ -479,15 +509,15 @@ components:
           maximum: 1
           default: 0.2
           description: Maximum ratio of corrupted lines.
-        font_corruption_score_threshold:
+        max_font_corruption:
           type: number
           x-go-type-skip-optional-pointer: false
           format: double
           minimum: 0
           maximum: 1
           default: 0.5
-          description: Font corruption score at which text is replaced by OCR.
-        max_replacement_char_ratio:
+          description: Font corruption score above which a substantial line counts as corrupted.
+        max_replacement_ratio:
           type: number
           x-go-type-skip-optional-pointer: false
           format: double
@@ -698,6 +728,9 @@ components:
         candidate_search:
           type: string
           enum: ["", exact_key, prefix, ann]
+        candidate_key_prefix:
+          type: string
+          description: Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching.
         candidate_ann_index: { type: string }
         candidate_limit: { type: integer, format: uint, minimum: 0 }
         name_embedding: { type: string }
@@ -761,7 +794,12 @@ components:
       properties:
         decider:
           $ref: "config.yaml#/components/schemas/DeciderConfig"
-          description: Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one.
+          description: >-
+            Frozen typed, generated or cascade decider configuration. Standalone generated
+            verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds
+            to probabilistic stages and require categorical zero-or-one terminal verdicts. A
+            cascade answer is validated against the stage that produced it, and the receipt
+            keeps the response's stage trace.
         template:
           type: string
           minLength: 1
@@ -1044,6 +1082,10 @@ components:
         template: { type: string }
         source_artifact_name: { type: string }
         expected_dims: { type: integer, minimum: 0 }
+        embedding_input:
+          type: string
+          enum: [text, pdf_page_images]
+          description: Effective embedding input mode; PDF pages are rasterized before embedding.
         vector_space:
           type: string
           minLength: 1
@@ -1059,6 +1101,10 @@ components:
         content_type: { type: string }
         neighbor_context: { $ref: "#/components/schemas/EnrichmentNeighborContextConfig" }
         execution: { $ref: "#/components/schemas/ExecutionPolicy" }
+    LakeBulkBuildAlgorithm:
+      type: string
+      enum: [lloyd, emeans]
+      description: Offline clustering algorithm for fresh native Parquet lake HBC indexes.
     CreatedEmbeddingsIndexConfig:
       type: object
       description: "Credential-free normalized embeddings configuration returned after creation. Single-source v0.2 fields are preserved alongside canonical sources for read compatibility."
@@ -1066,7 +1112,10 @@ components:
         publication_policy: { $ref: "#/components/schemas/IndexPublicationPolicy" }
         coverage_policy: { $ref: "#/components/schemas/DerivedCoveragePolicy" }
         external: { type: boolean, default: false }
+        external_vector_space: { type: string }
         sparse: { type: boolean, default: false }
+        lake_bulk_build: { $ref: "#/components/schemas/LakeBulkBuildAlgorithm" }
+        lake_bulk_build_max_input_bytes: { type: integer, format: int64, minimum: 1 }
         dimension: { type: integer, minimum: 1 }
         field: { type: string }
         sources:
@@ -1281,6 +1330,11 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor)."
+        embedding_input:
+          type: string
+          enum: [text, pdf_page_images]
+          default: text
+          description: pdf_page_images requires kind=embedding and a dense index. It consumes an original PDF URI selected by field or template and embeds its rendered pages. Upstream artifacts (source_artifact_name) and text chunking are not supported. Native field selectors address literal root keys; use a raw template for nested resource URIs.
         expected_dims:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -1667,6 +1721,12 @@ components:
           items:
             type: string
             minLength: 1
+        time:
+          type: string
+          description: Schema datetime column used for temporal grouping. Requires bucket.
+        bucket:
+          type: string
+          description: UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch.
         measure:
           type: string
           minLength: 1
@@ -2209,11 +2269,32 @@ components:
           type: boolean
           default: false
           description: "When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template."
+        external_vector_space:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: "Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model."
         sparse:
           x-go-type-skip-optional-pointer: true
           type: boolean
           default: false
           description: "When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index."
+        lake_bulk_build:
+          $ref: "#/components/schemas/LakeBulkBuildAlgorithm"
+          description: >-
+            Optional offline clustering algorithm for fresh native Parquet lake HBC indexes.
+            Both algorithms train on bounded samples and partition the corpus on disk.
+            E-means requires l2_squared distance. Existing generations continue to use
+            incremental updates.
+        lake_bulk_build_max_input_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >-
+            Total vector and identity bytes admitted for a fresh offline lake build,
+            with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder
+            allocations remain capped at 256 MiB. Generation output is capped at twice
+            this input allowance.
         dimension:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -3541,15 +3622,18 @@ components:
         vector_storage:
           x-go-type-skip-optional-pointer: true
           type: string
-          enum: [transient, persistent]
+          enum: [auto, transient, persistent]
           description: >-
             Whether document embeddings stay stored after the graph covers them.
-            "transient" (the default when possible) keeps only a small stub per
-            document and re-embeds a few candidates per query from the document's
-            field or template through the index's embedder, so the index stores
-            about 15% of the raw vectors' bytes. "persistent" keeps every
-            embedding, and is the only choice for external vectors, chunked
-            indexes, indexes fed by other enrichments, and the pq quantizer.
+            "auto" (the default when the index has its own embedder) keeps only
+            a small stub for each embedding computed from text (a field, a
+            text-only template, or a text chunk) and re-embeds a few such
+            candidates per query, while embeddings computed from media
+            (images, audio windows, model outputs) stay stored. "transient"
+            stubs every covered embedding, so it requires inputs that re-embed
+            from text: no media chunkers. "persistent" keeps every embedding,
+            and is the only choice for external vectors, indexes fed by other
+            enrichments, and the pq quantizer.
         search_ef:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -3571,7 +3655,29 @@ components:
           minimum: 0
           maximum: 1024
           default: 0
-          description: "Candidates recomputed per batch. 0 uses k."
+          description: "Candidates recomputed per batch. 0 uses k for bounded search and 128 for full-effort search."
+        reembed_budget_ms:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          maximum: 600000
+          default: 0
+          description: >-
+            Time a query may spend re-embedding candidates whose stored vectors
+            were dropped. If the budget is spent before scoring finishes,
+            the search returns an incomplete-coverage error; retry with a
+            larger budget. 0 means no limit.
+        media_vectors:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum: [full, int8]
+          default: full
+          description: >-
+            How vectors that cannot be re-embedded from text (images, audio
+            windows, model outputs) are kept once the graph covers them.
+            "full" keeps the stored float32 vector. "int8" replaces it with a
+            stub holding an int8 copy (about a quarter of the size), read back
+            instead of re-embedding. Requires "auto" or "transient" storage.
     DistanceMetric:
       x-go-type-skip-optional-pointer: true
       type: string
@@ -5390,9 +5496,11 @@ components:
         edges. A fixed
         single-hop relationship preserves physical self-loops and may bind two
         distinct aliases to the same node identity. Variable-length expansion
-        uses node-simple paths: a (table, key) identity is visited at most once
-        within one expanded edge path, except when closing onto an already bound
-        target alias for an explicit cycle. Exact distributed and serverless
+        uses Cypher relationship-simple trails: nodes may repeat, but the same
+        physical relationship cannot be reused anywhere within one MATCH group.
+        Each optional group has its own relationship scope. Parallel relationship
+        IDs remain distinct. A zero-hop path binds both endpoints to the same
+        node identity without reading an edge. Exact distributed and serverless
         execution rejects planner-required reverse variable expansion when the
         source tables of unnamed intermediate nodes cannot be proven. Express
         cross-table multi-hop patterns as explicit single-hop edges with a
@@ -5413,12 +5521,12 @@ components:
           description: Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
         min_hops:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 64
           default: 1
         max_hops:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 64
           default: 1
         edge_weight:

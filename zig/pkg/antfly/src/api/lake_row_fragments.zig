@@ -29,7 +29,7 @@ const Token = @import("antfly_cancellation").CancellationToken;
 const commitments = @import("lake_row_input_commitment.zig");
 const max_rows = 8192;
 const max_fragments = 16384;
-const Fragment = struct { prefix: [32]u8, bits: u16, name: []const u8, count: u64, digest: [32]u8, dirty: bool = false, membership_dirty: bool = true, incremental: bool = false, order_tag: ?[]const u8 = null };
+const Fragment = struct { prefix: [32]u8, bits: u16, name: []const u8, count: u64, digest: [32]u8, dirty: bool = false, membership_dirty: bool = true, order_tag: ?[]const u8 = null };
 
 pub const Build = struct {
     a: A,
@@ -859,7 +859,7 @@ fn readFragments(a: A, out: A, pages: *Pages, nav: navigation.Root) ![]Fragment 
         defer arena.deinit();
         const file = (try std.json.parseFromSliceLeaky(navigation.Record, arena.allocator(), record.value, .{})).file;
         const prefix = try parseName(file.file_id);
-        const version = if (std.mem.startsWith(u8, file.version_id, "iv1-") or std.mem.startsWith(u8, file.version_id, "iv2-") or std.mem.startsWith(u8, file.version_id, "iv3-") or std.mem.startsWith(u8, file.version_id, "iv4-") or std.mem.startsWith(u8, file.version_id, "iv5-")) file.version_id[4..] else file.version_id;
+        const version = if (std.mem.startsWith(u8, file.version_id, "iv4-") or std.mem.startsWith(u8, file.version_id, "iv5-")) file.version_id[4..] else file.version_id;
         if (version.len != 64) return error.InvalidLogicalRowIdentity;
         var digest: [32]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, version) catch return error.InvalidLogicalRowIdentity;
@@ -964,18 +964,18 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
             const space = prior.spaceForIndex(prior_name);
             if (space.navigation) |ref| {
                 old = try navigation.load(out, self.store, ref, self.token, null);
-                // Legacy global versions lack the input-specific domain marker.
+                // Global coordinate versions have no input-specific domain marker.
                 var records = try tree.Cursor.init(a, pages.store(), old.?.files, "", null);
                 defer records.deinit();
                 while (try records.next()) |record| {
                     var arena = std.heap.ArenaAllocator.init(a);
                     defer arena.deinit();
                     const file = (try std.json.parseFromSliceLeaky(navigation.Record, arena.allocator(), record.value, .{})).file;
-                    if (!std.mem.startsWith(u8, file.version_id, "iv1-") and !std.mem.startsWith(u8, file.version_id, "iv2-") and !std.mem.startsWith(u8, file.version_id, "iv3-") and !std.mem.startsWith(u8, file.version_id, "iv4-") and !std.mem.startsWith(u8, file.version_id, "iv5-")) continue;
+                    if (!std.mem.startsWith(u8, file.version_id, "iv4-") and !std.mem.startsWith(u8, file.version_id, "iv5-")) continue;
                     const prefix = try parseName(file.file_id);
                     var digest: [32]u8 = undefined;
                     _ = std.fmt.hexToBytes(&digest, file.version_id[4..]) catch return error.InvalidLogicalRowIdentity;
-                    try versions.put(a, try out.dupe(u8, file.file_id), .{ .prefix = prefix.prefix, .bits = prefix.bits, .name = "", .count = file.row_count, .digest = digest, .incremental = std.mem.startsWith(u8, file.version_id, "iv4-") or std.mem.startsWith(u8, file.version_id, "iv5-") });
+                    try versions.put(a, try out.dupe(u8, file.file_id), .{ .prefix = prefix.prefix, .bits = prefix.bits, .name = "", .count = file.row_count, .digest = digest });
                 }
             }
         };
@@ -992,9 +992,8 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
         const files = try out.dupe(local.serverless_external_source_types.FileEntry, self.source.inventory.files);
         for (self.fragments, files, dirty[i], 0..) |fragment, *file, changed, file_ordinal| {
             const cached = versions.get(fragment.name);
-            const reusable = cached != null and cached.?.incremental and prior_commitments != null and cached.?.count == fragment.count;
-            // XOR-era inputs cannot seed row mutations: rebuild their native
-            // fragment before trusting the new collision-resistant version.
+            const reusable = cached != null and prior_commitments != null and cached.?.count == fragment.count;
+            // New recipes or absent commitment state need a complete fragment.
             if (!reusable) row_changes[file_ordinal] = null;
             const digest = if (!changed and reusable) cached.?.digest else hash: {
                 const key = commitments.key(recipe.digest, fragment.prefix, fragment.bits);
@@ -1305,12 +1304,28 @@ const Spool = struct {
         var write_bytes: u64 = 0;
         var pages = self.owner.pageStore(&read_bytes, &write_bytes);
         pages.artifacts = store;
-        var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store(), .max_bytes = 2 * 1024 * 1024 };
-        defer cache.deinit();
-        var root = self.owner.root;
-        root.indexes = self.owner.space;
-        root.reused = &.{};
-        var resolver: identity.Reader = .{ .root = root, .pages = &pages, .cache = &cache };
+        pages.read_phase = store.io_phase;
+        // Join verified ID streams once. The private map has 16-byte physical
+        // keys and logical values, under this spool's existing memory/disk cap.
+        var translation: @import("../serverless/graph_segment/page_store.zig").PrivatePages = .{ .manager = &self.manager, .domain = self.owner.root.domain, .attempt = store.upload_scope.?.attempt, .phase = store.io_phase };
+        defer translation.deinit();
+        const translation_store = try @import("../serverless/graph_segment/page_store.zig").PrivatePages.beginRun(&translation);
+        const translation_root = try @import("lake_row_coordinate_join.zig").build(a, &self.manager, self.owner.root.current, self.owner.space, pages.store(), translation_store);
+        var physical_slots: std.StringHashMapUnmanaged(u32) = .empty;
+        defer physical_slots.deinit(a);
+        // Resolve each physical file dictionary proof once, rather than once
+        // per tile. Support legacy spaces whose reverse dictionary is absent.
+        var files = try tree.Cursor.init(a, pages.store(), self.owner.root.current.files, "", null);
+        defer files.deinit();
+        while (try files.next()) |file| {
+            if (file.key.len != 4 or file.value.len == 0 or file.value.len > 4096) return error.InvalidLogicalRowIdentity;
+            const slot = std.mem.readInt(u32, file.key[0..4], .big);
+            if (slot >= self.owner.root.current.file_count) return error.InvalidLogicalRowIdentity;
+            const name = try out.dupe(u8, file.value);
+            const entry = try physical_slots.getOrPut(a, name);
+            if (entry.found_existing) return error.InvalidLogicalRowIdentity;
+            entry.value_ptr.* = slot;
+        }
         var cluster = @import("lake_row_payloads.zig").Cluster.init(a, &self.manager, columns.len);
         defer cluster.deinit();
         var bound = false;
@@ -1333,20 +1348,27 @@ const Spool = struct {
                 var tile = std.heap.ArenaAllocator.init(a);
                 defer tile.deinit();
                 const ta = tile.allocator();
-                var translating = try store.beginIo(1);
-                defer translating.abort();
-                const references = try ta.alloc(rows.RowRef, end - begin);
-                for (references, begin..) |*ref, row| ref.* = batch.rowRef(row);
-                const logical = resolver.translateMany(ta, references, false) catch |err| return translating.failed(err);
-                try translating.finish();
+                const keys_ = try ta.alloc([16]u8, end - begin);
+                const pointers = try ta.alloc([]const u8, end - begin);
+                for (keys_, pointers, begin..) |*key, *pointer, row| {
+                    const ref = batch.rowRef(row);
+                    if (ref != .external or !std.mem.eql(u8, ref.external.source_id, self.owner.root.current.source) or !std.mem.eql(u8, ref.external.snapshot_id, self.owner.root.current.snapshot)) return error.ExternalLakeSnapshotMismatch;
+                    const slot = physical_slots.get(ref.external.file_id) orelse return error.InvalidLogicalRowIdentity;
+                    key.* = (identity.logical.Coordinate{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }).encode();
+                    pointer.* = key;
+                }
+                const logical = try tree.lookupMany(ta, translation_store, translation_root, pointers);
                 var selected: [256]usize = undefined;
                 var coordinates: [256]identity.logical.Coordinate = undefined;
                 var count: usize = 0;
-                for (logical, begin..) |row, physical| {
-                    const file = self.positions.get(row.coordinate.file) orelse return error.InvalidLogicalRowIdentity;
+                for (logical, begin..) |entry, physical| {
+                    const row = entry orelse return error.InvalidLogicalRowIdentity;
+                    if (row.value.len != 16) return error.InvalidLogicalRowIdentity;
+                    const coordinate = try identity.logical.Coordinate.decode(row.value);
+                    const file = self.positions.get(coordinate.file) orelse return error.InvalidLogicalRowIdentity;
                     if (!self.needed[file]) continue;
                     selected[count] = physical;
-                    coordinates[count] = row.coordinate;
+                    coordinates[count] = coordinate;
                     count += 1;
                 }
                 const keys = try ta.alloc([]const u8, count);
@@ -1364,6 +1386,11 @@ const Spool = struct {
         }
         try cluster.finish(&self.payloads, &edits);
         self.route_root = try edits.finish(null);
+        var expected: u64 = 0;
+        for (self.needed, self.owner.fragments) |needed, fragment| if (needed) {
+            expected += fragment.count;
+        };
+        if ((if (self.route_root) |ref| ref.records else 0) != expected) return error.InvalidLogicalRowIdentity;
         self.routes.phase = null;
     }
     /// Merge the verified ID stream with captured offsets; sort only final routes.
@@ -1579,12 +1606,10 @@ pub fn prepareCapturedSpool(self: *Build, provider: *Provider, store: *stores.Ar
     spool.routes = .{ .manager = &spool.manager, .domain = self.root.domain, .attempt = self.store.upload_scope.?.attempt };
     spool.payloads = try Spool.spill.JoinPayloads.init(&spool.manager);
     spool.initialized = true;
-    var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = scheduler, .bytes = 8 * 1024 * 1024, .checkpoint = .{ .ptr = self, .check = Build.check } };
-    defer execution.pause();
-    try execution.enter(self.context.io.?);
-    var io: stores.ExecutionIo = .{ .execution = &execution, .io = self.context.io.? };
     var backend = store.*;
-    backend.io_phase = io.capability();
+    var publication_io: stores.PublicationIo = .{};
+    publication_io.install(&backend.io_phase, self.context.io.?, scheduler, .{ .ptr = self, .check = Build.check });
+    defer publication_io.deinit();
     spool.routes.phase = backend.io_phase;
     const captured: anyerror!void = if (capture) |value| spool.adopt(value, &backend) else spool.scanCapture(provider, &backend);
     captured catch |err| {
@@ -2252,23 +2277,6 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
         try std.testing.expect(indexSpace(native, "unused").ordering_keys == null);
         var prior = root;
         prior.native_space = native.space;
-        // Recreate the released JSON cache as the predecessor, then verify
-        // unchanged entries and new binary entries coexist through refresh.
-        var legacy_edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
-        defer legacy_edits.deinit();
-        {
-            var prior_keys = try tree.Cursor.init(a, pages.store(), native.space.ordering_keys, "", null);
-            defer prior_keys.deinit();
-            while (try prior_keys.next()) |record| {
-                const codec = @import("lake_ordering_keys.zig");
-                const decoded = try codec.decodeIntoArena(selection_arena.allocator(), record.value);
-                const legacy = try selection_arena.allocator().alloc(@import("lake_index_sort_bounds.zig").Bound.Value, decoded.keys.len);
-                for (legacy, decoded.keys) |*key, value| key.* = try @import("lake_index_sort_bounds.zig").Bound.Value.from(selection_arena.allocator(), value);
-                const legacy_record = try std.json.Stringify.valueAlloc(selection_arena.allocator(), .{ .version = decoded.version, .keys = legacy }, .{});
-                try legacy_edits.addRecord(record.key, legacy_record);
-            }
-        }
-        prior.native_space.?.ordering_keys = try legacy_edits.finish(null);
         for (0..4) |step| {
             const active_recipes = try selection_arena.allocator().dupe(@import("lake_row_input_recipes.zig").Recipe, recipes);
             if (step >= 2) active_recipes[1].digest = @splat(10);
@@ -2438,12 +2446,9 @@ test "external lake borrowed fragment leases report complete retained ownership"
 }
 
 test "external lake Merkle fragment commitments reject algebraically cancelling row updates" {
-    try cancellingUpdatesScenario(false);
+    try cancellingUpdatesScenario();
 }
-test "external lake Merkle migration rebuilds legacy fragments before row deltas" {
-    try cancellingUpdatesScenario(true);
-}
-fn cancellingUpdatesScenario(legacy: bool) !void {
+fn cancellingUpdatesScenario() !void {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("logical-input-census");
     defer directory.cleanup();
@@ -2549,28 +2554,13 @@ fn cancellingUpdatesScenario(legacy: bool) !void {
             for (next.provider.fragment_views[0].changed_rows) |rows_| if (rows_) |values| {
                 detected_rows += values.len;
             };
-            try std.testing.expectEqual(if (legacy) @as(usize, 0) else changed, detected_rows);
-            try std.testing.expectEqual(if (legacy) next.fragments.len else @as(usize, 1), changed_fragments);
-            if (legacy) {
-                for (next.provider.fragment_views[0].changed_rows) |rows_| try std.testing.expect(rows_ == null);
-                try std.testing.expectEqual(@as(u64, ids.len), next.input_rows_hashed);
-            } else try std.testing.expect(next.input_rows_hashed <= changed * 2);
+            try std.testing.expectEqual(changed, detected_rows);
+            try std.testing.expectEqual(@as(usize, 1), changed_fragments);
+            try std.testing.expect(next.input_rows_hashed <= changed * 2);
         }
         root.native_space = next.space;
         const bindings = try metadata.allocator().alloc(identity.ReusedIndex, 1);
         bindings[0] = .{ .name = "text", .space = indexSpace(next, "text") };
-        if (legacy and step == 0) {
-            const old_files = try metadata.allocator().dupe(local.serverless_external_source_types.FileEntry, next.provider.fragment_views[0].files);
-            for (old_files) |*file| file.version_id = try std.fmt.allocPrint(metadata.allocator(), "iv2-{s}", .{file.version_id[4..]});
-            var old_source = next.source;
-            old_source.inventory.files = old_files;
-            var old_provider = next.provider;
-            old_provider.source = &old_source;
-            old_provider.native_delta = null;
-            const old_navigation = try navigation.build(a, metadata.allocator(), &store, &old_provider, null, .none);
-            bindings[0].space.navigation = old_navigation.ref;
-            root.native_space.?.input_commitments = null;
-        }
         root.reused = bindings;
         root.artifacts = @splat(7);
         try root.reseal(a);
@@ -2824,4 +2814,9 @@ test "external lake logical fragments capture reuses scratch and encodes identic
     try std.testing.expectEqual(hashes[0].final(), hashes[1].final());
     try std.testing.expect(capacity[1] * 100 < capacity[0]);
     std.debug.print("CAPTURE_TUPLES rows={d} prior_arena_bytes={d} reusable_arena_bytes={d} prior_ns={d} direct_ns={d} checksum={d}\n", .{ count, capacity[0], capacity[1], times[0], times[1], hashes[0].final() });
+}
+
+test "external lake execution broad fragment routing preserves random and ordered physical hydration" {
+    try broadSpoolScenario(false, false, true, false);
+    try broadSpoolScenario(false, false, false, true);
 }

@@ -10,7 +10,7 @@ export type EmbedRequest = components["schemas"]["InferenceEmbedRequest"];
 export type EmbedOptions = Pick<
   EmbedRequest,
   "task_type" | "dimensions" | "instruction" | "error_policy"
-> & { truncate?: boolean; signal?: AbortSignal };
+> & { truncate?: boolean } & RequestOptions;
 export type EmbedResponse = components["schemas"]["InferenceEmbedResponse"];
 
 export type ChunkRequest = components["schemas"]["InferenceChunkRequest"];
@@ -71,9 +71,6 @@ export type RewriteRequest = components["schemas"]["InferenceRewriteRequest"];
 export type RewriteResponse = components["schemas"]["InferenceRewriteResponse"];
 
 export type ModelsResponse = components["schemas"]["InferenceModelsResponse"];
-
-export type TranscribeRequest = components["schemas"]["InferenceTranscribeRequest"];
-export type TranscribeResponse = components["schemas"]["InferenceTranscribeResponse"];
 
 export type InferenceChatMessage = components["schemas"]["InferenceChatMessage"];
 export type GenerateRequest = components["schemas"]["InferenceGenerateRequest"];
@@ -137,4 +134,10 @@ export const logStyles: Style[] = ["terminal", "json", "logfmt", "noop"];
 export interface RequestOptions {
   /** AbortSignal to cancel the request */
   signal?: AbortSignal;
+  /** Per-call HTTP headers. Defined values override configured headers case-insensitively. */
+  headers?: Record<string, string | undefined>;
 }
+
+export type AudioReadOptions = components["schemas"]["InferenceAudioReadOptions"];
+export type AudioReadMetadata = components["schemas"]["InferenceAudioReadMetadata"];
+export type AudioReadSegment = components["schemas"]["InferenceAudioReadSegment"];

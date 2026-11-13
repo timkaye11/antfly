@@ -318,6 +318,7 @@ pub const SearchTextQueryExecutor = struct {
 };
 
 pub const SearchTextStatsExecutor = struct {
+    checkpoint: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     ctx: ?*anyopaque,
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
@@ -328,6 +329,9 @@ pub const SearchTextStatsExecutor = struct {
         alloc: Allocator,
         keys: []const []const u8,
     ) anyerror![]?[]u8 = null,
+    fn check(self: @This()) !void {
+        if (self.checkpoint) |control| try control.call(control.ptr);
+    }
 };
 
 pub const ExplicitTextStatRequest = control_contract.ExplicitTextStatRequest;
@@ -1801,6 +1805,11 @@ fn requestWithoutResolvedStoredFilters(req: types.SearchRequest, filter_query_js
 
 fn requestAfterNativeFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
     var next = requestWithoutResolvedStoredFilters(req, filter_query_json_resolved, exclusion_query_json_resolved);
+    // Keep candidate provenance separate from consumed constraints. Residual
+    // value predicates may verify these exact keys without permitting a scan.
+    if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0) {
+        next.value_search_candidate_keys = if (req.filter_doc_ids.len <= types.max_canonical_hierarchy_groups) req.filter_doc_ids else &.{};
+    }
     // Candidate collectors enforce these constraints against their pinned native
     // snapshot. Only residual predicates belong in post-processing: applying an
     // admitted document filter again to a page discards the upstream total and
@@ -2020,6 +2029,17 @@ pub fn resolveStructuredTextDocNumFilterForComposedAlloc(
 ) !?ResolvedTextDocNumFilter {
     if (req.resolved_doc_filter != null) return null;
     if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return null;
+
+    // Document numbers belong to one physical text index. Composed searches
+    // may use a primary-row index for predicates and artifact indexes for
+    // retrieval; only shared parent ordinals can cross that boundary.
+    const filter_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    const retrieval_entry = try executor.text_index_entry(executor.ctx, req.index_name) orelse return null;
+    if (filter_entry != retrieval_entry) return null;
+    for (req.full_text_queries) |named| {
+        const entry = try executor.text_index_entry(executor.ctx, named.index_name) orelse return null;
+        if (entry != filter_entry) return null;
+    }
 
     var active_executor = executor;
     if (active_executor.identity_read_generation == null) active_executor.identity_read_generation = req.identity_read_generation;
@@ -9456,7 +9476,7 @@ pub fn graphIndexedPredicateAlloc(a: Allocator, req: types.SearchRequest, execut
     defer snapshot.release();
     var deletion_hash = std.hash.Wyhash.init(0);
     for (snapshot.segments) |seg| {
-        const revision = seg.shared.deletion_revision.load(.acquire);
+        const revision = seg.shared.deletionRevision();
         deletion_hash.update(std.mem.asBytes(&revision));
     }
     const key = try std.fmt.allocPrint(a, "{d}:{d}:{d}:{d}:{s}", .{ entry.instance_id, entry.projection_revision, req.identity_read_generation orelse 0, deletion_hash.final(), json });
@@ -9814,7 +9834,7 @@ fn searchQueryCanUseSnapshot(
         .multi_phrase => |item| try snapshot.hasInvertedField(item.field),
         .term => |item| (allow_analyzed_terms or
             try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
-            try snapshot.hasInvertedField(item.field),
+            (snapshot.liveDocCount() == 0 or try snapshot.hasInvertedField(item.field)),
         .fuzzy => |item| try snapshot.hasInvertedField(item.field),
         .numeric_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .numeric),
         .date_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .datetime),
@@ -9822,9 +9842,9 @@ fn searchQueryCanUseSnapshot(
         .geo_distance => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .geo_bbox => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .term_range => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
-            try snapshot.hasInvertedField(item.field),
+            (snapshot.liveDocCount() == 0 or try snapshot.hasInvertedField(item.field)),
         .ip_range => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
-            try snapshot.hasInvertedField(item.field),
+            (snapshot.liveDocCount() == 0 or try snapshot.hasInvertedField(item.field)),
         .geo_shape => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .prefix => |item| try snapshot.hasInvertedField(item.field),
         .wildcard => |item| try snapshot.hasInvertedField(item.field),
@@ -13563,10 +13583,27 @@ pub fn searchTextQuery(
     try convertNativeDocIdsToTextDocNumsAlloc(alloc, effective_req, snapshot, &native_constraints);
     try normalizeNativeDocNumConstraintsAlloc(alloc, &native_constraints);
     const convert_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - convert_start_ns else 0;
+    const CandidatePredicate = struct {
+        snapshot: @TypeOf(snapshot),
+        predicate: types.NativeKeyPredicate,
+        fn allows(ptr: *anyopaque, doc: u32) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const key = (try self.snapshot.storedIdScoped(scratch.allocator(), doc)) orelse return false;
+            return self.predicate.allows(self.predicate.ptr, key);
+        }
+    };
+    var candidate_predicate: CandidatePredicate = .{ .snapshot = snapshot, .predicate = effective_req.native_key_predicate orelse undefined };
+    const doc_predicate: ?search_mod.DocNumPredicate = if (effective_req.native_key_predicate != null) .{ .ptr = &candidate_predicate, .allows = CandidatePredicate.allows } else null;
     const unresolved_stored_filters =
         (effective_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (effective_req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
-    try rejectSortedQueryWithUnresolvedStoredFilters(
+    // Artifact-member predicates run against their source parent. They cannot
+    // be translated to the member index's document numbers. The exact bounded
+    // collector below exhausts its admitted candidate population, applies the
+    // parent predicates, and only then sorts/pages; excess work is rejected.
+    if (!(chunk_backed and member_mode_for_filter)) try rejectSortedQueryWithUnresolvedStoredFilters(
         effective_req,
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
@@ -13628,13 +13665,13 @@ pub fn searchTextQuery(
     const load_stored_in_search_engine = false;
     var field_sort_plan = SortExecutionPlan{ .kind = .none };
     if (requires_field_sort) field_sort_plan = try planTextNativeSortFields(effective_req, snapshot, text_source.runtime_schema);
-    if (requires_field_sort and executor.project_key != null and field_sort_plan.sorted_segment_executor_available) {
+    if (doc_predicate == null and requires_field_sort and executor.project_key != null and field_sort_plan.sorted_segment_executor_available) {
         field_sort_plan = docValuesCollectorPlanForSelectiveFilter(field_sort_plan);
         // Public-ID projection requires the exact tie-aware collector. Its
         // native primary stream remains available; this is not selectivity.
         field_sort_plan.selective_filter_doc_values_preferred = false;
     }
-    if (requires_field_sort and executor.project_key == null and
+    if (doc_predicate == null and requires_field_sort and executor.project_key == null and
         field_sort_plan.sorted_segment_executor_available and
         !chunk_backed and
         !group_chunk_parents and
@@ -13718,7 +13755,7 @@ pub fn searchTextQuery(
             return out;
         }
     }
-    if (requires_field_sort and (executor.project_key == null or executor.native_count_visibility_exact) and
+    if (doc_predicate == null and requires_field_sort and (executor.project_key == null or executor.native_count_visibility_exact) and
         (field_sort_plan.kind == .native_doc_values_top_n or
             (field_sort_plan.kind == .id_only and executor.native_count_visibility_exact and executor.open_ordered_candidates != null)) and
         !requestHasScoreSort(effective_req) and
@@ -13833,6 +13870,7 @@ pub fn searchTextQuery(
             try search_mod.executeCountCandidatesWithControl(alloc, snapshot, search_query, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns })
         else
             try search_mod.execute(alloc, snapshot, .{
+                .doc_num_predicate = doc_predicate,
                 .query = search_query,
                 .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership },
                 .k = if (collect_window_candidates) candidate_limit else paging.limit,
@@ -13996,7 +14034,7 @@ pub fn searchTextQuery(
             out.total_hits = visible_candidate_count;
             out.total_hits_relation = .gte;
         }
-        if (requires_field_sort and !candidates_exhausted) {
+        if (doc_predicate == null and requires_field_sort and !candidates_exhausted) {
             logExactSortBudgetRejection(
                 "text",
                 .text_field_sort_candidate_window,
@@ -14442,6 +14480,7 @@ pub fn collectSearchRequestTextStats(
             .index_name = entry.value_ptr.index_name,
             .field = entry.value_ptr.field,
             .terms = terms,
+            .resolved_doc_filter = if (req.resolved_doc_filter) |raw| @ptrCast(@alignCast(raw)) else null,
         };
         request_index += 1;
     }
@@ -14527,10 +14566,12 @@ fn collectFilteredExplicitTextStats(
         var segment_lease = try snapshot.leaseSegment(segment_index);
         defer segment_lease.deinit();
         const seg = segment_lease.entry;
+        try executor.check();
         {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
             for (0..seg.reader.doc_count) |local_doc_usize| {
+                if (local_doc_usize % 256 == 0) try executor.check();
                 const local_doc: u32 = @intCast(local_doc_usize);
                 if (seg.shared.deleted) |deleted| {
                     if (deleted.contains(local_doc)) continue;
@@ -14587,6 +14628,7 @@ fn collectFilteredExplicitTextStats(
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
                 for (0..seg.reader.doc_count) |local_doc_usize| {
+                    if (local_doc_usize % 256 == 0) try executor.check();
                     const local_doc: u32 = @intCast(local_doc_usize);
                     if (seg.shared.deleted) |deleted| {
                         if (deleted.contains(local_doc)) continue;
@@ -14600,18 +14642,22 @@ fn collectFilteredExplicitTextStats(
             if (try seg.reader.invertedIndexScoped(alloc, request.field)) |opened| {
                 var inv_reader = opened;
                 defer inv_reader.deinit();
-                var terms = try inv_reader.termIterator();
-                defer terms.deinit();
-                while (try terms.next()) |entry| {
-                    var postings = try entry.result.iterator(alloc);
+                for (0..seg.reader.doc_count) |local_doc_usize| {
+                    if (local_doc_usize % 256 == 0) try executor.check();
+                    const local_doc: u32 = @intCast(local_doc_usize);
+                    if (allowed_local_docs.contains(local_doc)) global_total_field_len +|= try inv_reader.docLength(local_doc);
+                }
+                for (term_doc_freqs) |*item| {
+                    try executor.check();
+                    const found = (try inv_reader.lookup(item.term)) orelse continue;
+                    var postings = try found.iterator(alloc);
                     defer postings.deinit();
                     postings.decode_positions = false;
+                    var visited: usize = 0;
                     while (try postings.next()) |hit| {
-                        if (!allowed_local_docs.contains(hit.doc_id)) continue;
-                        global_total_field_len +|= hit.freq;
-                        for (term_doc_freqs) |*item| {
-                            if (std.mem.eql(u8, item.term, entry.term)) item.doc_freq +|= 1;
-                        }
+                        visited += 1;
+                        if (visited % 256 == 0) try executor.check();
+                        if (allowed_local_docs.contains(hit.doc_id)) item.doc_freq +|= 1;
                     }
                 }
             }
@@ -15329,6 +15375,7 @@ fn searchDenseInternal(
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
             .exclude_ids = effective_exclude_ids,
+            .deadline_ns = req.execution_deadline_ns,
             .cancellation = if (req.cancellation) |token|
                 vectorindex_mod.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
@@ -15336,7 +15383,9 @@ fn searchDenseInternal(
         };
 
         const hbc_search_start = platform_time.monotonicNs();
-        const route_costs = entry.index.denseRouteCostSnapshot();
+        var route_costs = entry.index.denseRouteCostSnapshot();
+        const exact_has_residual = hbc_req.key_predicate != null or hbc_req.filter_prefix.len != 0;
+        if (!exact_has_residual) route_costs.exact_residual_ns_per_candidate = 0;
         const hbc_cache_pressured = if (entry.index.resource_manager) |manager|
             manager.sliceStats(.hbc_node_metadata_cache).pressure != .normal
         else
@@ -15347,7 +15396,11 @@ fn searchDenseInternal(
             if (target == 0) break :blk 1000;
             break :blk @min(@as(u64, 1000), cache_slice.used_bytes *| 1000 / target);
         } else 1000;
-        const route = denseSearchRouteWithCosts(
+        const route = if (entry.leann_transient) DenseSearchRoute{
+            .exact_native_filter = false,
+            .name = "leann",
+            .reason = "leann_owns_transient_verification",
+        } else denseSearchRouteWithCosts(
             native_constraints.positive_filter,
             effective_native_filter_candidate_count,
             index_stats.active_count,
@@ -15361,8 +15414,8 @@ fn searchDenseInternal(
             hbc_cache_pressured,
             hbc_cache_residency_permille,
         );
-        entry.index.noteDenseRouteChoice(if (route.exact_native_filter) .exact else .hbc);
-        profile.search_route = route.name;
+        if (entry.index.leann == null) entry.index.noteDenseRouteChoice(if (route.exact_native_filter) .exact else .hbc);
+        profile.search_route = if (entry.index.leann != null and !route.exact_native_filter) "leann" else route.name;
         profile.route_reason = route.reason;
         profile.route_estimated_exact_storage_bytes = route.estimated_exact_storage_bytes;
         profile.route_estimated_hbc_storage_bytes = route.estimated_hbc_storage_bytes;
@@ -15397,6 +15450,10 @@ fn searchDenseInternal(
             entry.index.observeExactDenseRouteCost(.{
                 .candidates = exact.profile.candidate_count,
                 .metadata_ns = exact.profile.metadata_lookup_ns,
+                .native_lookup_ns = exact.profile.native_lookup_ns,
+                .native_reads = exact.profile.raw_scalar_reads,
+                .residual_filter_ns = exact.profile.residual_filter_ns,
+                .vectors_scored = exact.vectors_scored,
                 .artifact_read_decode_ns = exact.profile.artifact_read_ns +| exact.profile.artifact_decode_ns,
                 .distance_ns = exact.profile.distance_ns,
                 .artifact_cache_hits = exact.profile.artifact_cache_hits,
@@ -15568,7 +15625,7 @@ fn searchDenseInternal(
             hbc_effective_k,
             bounded_full_candidate_count,
             raw_hits.len,
-            route.exact_native_filter,
+            route.exact_native_filter or entry.index.leann != null,
         );
         const candidate_ceiling_reached = candidate_window >= candidate_ceiling;
         if (!candidate_window_incomplete and exhaustive_broad_live_window) {
@@ -15872,6 +15929,8 @@ fn denseSearchRouteWithCosts(
     // overhead. The built-in scorer reads the HBC-resident f32 payload.
     const exact_lookup_overhead: u64 = if (external_vector_storage) 64 else 8;
     const exact_bytes_per_candidate = dimensions *| @sizeOf(f32) +| exact_lookup_overhead;
+    // Residual predicates can vary between requests. Budget every candidate
+    // until this request supplies an exact native selection.
     const exact_storage_bytes = candidate_count *| exact_bytes_per_candidate;
 
     // Estimate how many approximate candidates HBC must inspect to obtain k
@@ -15903,8 +15962,12 @@ fn denseSearchRouteWithCosts(
         const resolved_cost = resolveDenseRouteCosts(cost, vector_dims, external_vector_storage);
         const filter_ns = resolved_cost.filter_scan_ns_per_candidate;
         const artifact_ns = resolved_cost.artifact_miss_read_decode_ns_per_vector;
+        const exact_lookup_ns = if (external_vector_storage)
+            artifact_ns
+        else
+            denseRouteCostOrPrior(cost.exact_native_lookup_ns_per_read, artifact_ns);
         const exact_work_ns = candidate_count *|
-            (filter_ns +| artifact_ns +| resolved_cost.exact_distance_ns_per_vector);
+            (filter_ns +| cost.exact_residual_ns_per_candidate +| exact_lookup_ns +| resolved_cost.exact_distance_ns_per_vector);
         var hbc_work_ns = hbc_candidates *|
             (filter_ns +| resolved_cost.quantized_score_ns_per_candidate) +|
             rerank_candidates *| (artifact_ns +| resolved_cost.exact_distance_ns_per_vector);
@@ -16023,6 +16086,21 @@ test "dense search route reports exact native filter budget decisions" {
     try std.testing.expectEqual(@as(usize, 1), selectiveExactCandidateWorkBudget(std.math.maxInt(usize)));
 }
 
+test "native exact lookup costs affect the exact route without pricing HBC rerank" {
+    var costs: hbc_mod.HBCIndex.DenseRouteCostSnapshot = .{};
+    const prior = denseSearchRouteWithCosts(true, 100, 10_000, 768, 10, 128, 128, false, false, costs, false, 1000);
+    costs.exact_native_lookup_ns_per_read = 100_000;
+    const measured = denseSearchRouteWithCosts(true, 100, 10_000, 768, 10, 128, 128, false, false, costs, false, 1000);
+    try std.testing.expect(prior.exact_native_filter);
+    try std.testing.expect(!measured.exact_native_filter);
+    try std.testing.expectEqual(prior.estimated_hbc_work_ns, measured.estimated_hbc_work_ns);
+    costs.exact_residual_ns_per_candidate = 800;
+    const residual = denseSearchRouteWithCosts(true, 100, 10_000, 768, 10, 128, 128, false, false, costs, false, 1000);
+    try std.testing.expectEqual(measured.estimated_exact_storage_bytes, residual.estimated_exact_storage_bytes);
+    try std.testing.expectEqual(measured.estimated_exact_work_ns + 80_000, residual.estimated_exact_work_ns);
+    try std.testing.expectEqual(measured.estimated_hbc_work_ns, residual.estimated_hbc_work_ns);
+}
+
 test "dense search route uses measured per-index costs pressure and hysteresis" {
     const cold_50k = denseSearchRouteWithCosts(true, 500, 50_000, 768, 100, 8, 128, true, true, .{}, false, 1000);
     try std.testing.expect(cold_50k.exact_native_filter);
@@ -16130,10 +16208,10 @@ fn denseCandidateWindowIncomplete(
     candidate_window: u32,
     bounded_full_candidate_count: u32,
     raw_hit_count: usize,
-    exact_native_filter: bool,
+    coverage_counts_all_matches: bool,
 ) bool {
     return switch (coverage) {
-        .exhausted => !exact_native_filter and scoreOrderWindowTotalHitsRelation(candidate_window, bounded_full_candidate_count, raw_hit_count) == .gte,
+        .exhausted => !coverage_counts_all_matches and scoreOrderWindowTotalHitsRelation(candidate_window, bounded_full_candidate_count, raw_hit_count) == .gte,
         .more => true,
         .unknown => candidateWindowIncomplete(candidate_window, bounded_full_candidate_count),
     };
@@ -16499,7 +16577,7 @@ fn exactScoreNativeDenseFilter(
 
     const candidate_metadata = try alloc.alloc(
         ?[]const u8,
-        if (req.filter_prefix.len > 0) unique_candidate_ids.len else 0,
+        if (req.filter_prefix.len > 0 or req.key_predicate != null) unique_candidate_ids.len else 0,
     );
     defer alloc.free(candidate_metadata);
     if (candidate_metadata.len > 0) {
@@ -16520,6 +16598,12 @@ fn exactScoreNativeDenseFilter(
         exact_profile.metadata_lookup_ns = platform_time.monotonicNs() - metadata_start_ns;
     }
 
+    if (candidate_metadata.len > 0) {
+        const residual_start = platform_time.monotonicNs();
+        try dense_exact.filterMetadata(req, candidate_metadata);
+        exact_profile.residual_filter_ns = platform_time.monotonicNs() - residual_start;
+    }
+
     const vector_scratch = try alloc.alloc(f32, entry.dims);
     defer alloc.free(vector_scratch);
     const query_measure = vector_mod.norm(req.query);
@@ -16528,15 +16612,19 @@ fn exactScoreNativeDenseFilter(
 
     for (unique_candidate_ids, 0..) |vector_id, i| {
         if (i % exact_native_filter_cancellation_stride == 0) try checkVectorSearchCancelled(req);
-        if (req.filter_prefix.len > 0) {
-            const metadata = candidate_metadata[i] orelse continue;
-            if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
-        }
-        const vector = (if (vector_cursor) |*cursor|
+        if (candidate_metadata.len > 0 and candidate_metadata[i] == null) continue;
+        const lookup_start = platform_time.monotonicNs();
+        exact_profile.raw_scalar_reads += 1;
+        const loaded_vector = if (vector_cursor) |*cursor|
             entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
         else
-            entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch)) catch |err| switch (err) {
-            error.NotFound => continue,
+            entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch);
+        exact_profile.native_lookup_ns += platform_time.monotonicNs() - lookup_start;
+        const vector = loaded_vector catch |err| switch (err) {
+            error.NotFound => {
+                exact_profile.missing_vectors += 1;
+                continue;
+            },
             else => return err,
         };
         if (vector.len != req.query.len) return error.DimensionMismatch;
@@ -16642,6 +16730,61 @@ test "built-in exact dense scorer filters metadata before vector reads" {
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqual(@as(u64, 1), hits[0].vector_id);
     try std.testing.expectEqual(@as(u64, 2), hits[1].vector_id);
+
+    var residual = try exactScoreNativeDenseFilter(alloc, &entry, .{
+        .query = &.{ 0.0, 0.0 },
+        .k = 4,
+        .filter_ids = &.{ 4, 2, 3, 1 },
+        .key_predicate = .{
+            .ptr = &counter,
+            .allows = struct {
+                fn allows(_: *anyopaque, metadata: []const u8) !bool {
+                    return std.mem.eql(u8, metadata, "doc:keep:b");
+                }
+            }.allows,
+        },
+    });
+    defer residual.results.deinit();
+    try std.testing.expectEqual(@as(usize, 3), counter.count);
+    try std.testing.expectEqual(@as(usize, 1), residual.results.getHits().len);
+    try std.testing.expectEqual(@as(u64, 2), residual.results.getHits()[0].vector_id);
+
+    const BatchPredicate = struct {
+        calls: usize = 0,
+        cancel: bool = false,
+        cancelled: std.atomic.Value(bool) = .init(false),
+
+        fn one(_: *anyopaque, _: []const u8) !bool {
+            return error.UnexpectedScalarPredicate;
+        }
+        fn many(raw: *anyopaque, keys: []const []const u8, allowed: []bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            for (keys, allowed) |key, *keep| {
+                try std.testing.expect(std.mem.startsWith(u8, key, "doc:keep:"));
+                keep.* = std.mem.eql(u8, key, "doc:keep:b");
+            }
+            if (self.cancel) self.cancelled.store(true, .release);
+        }
+    };
+    var predicate = BatchPredicate{};
+    const batch_req: vectorindex_mod.SearchRequest = .{
+        .query = &.{ 0.0, 0.0 },
+        .k = 4,
+        .filter_ids = &.{ 4, 2, 3, 1 },
+        .filter_prefix = "doc:keep:",
+        .key_predicate = .{ .ptr = &predicate, .allows = BatchPredicate.one, .allows_many = BatchPredicate.many },
+        .cancellation = vectorindex_mod.search_types.CancellationToken.fromAtomic(&predicate.cancelled),
+    };
+    var batched = try exactScoreNativeDenseFilter(alloc, &entry, batch_req);
+    defer batched.results.deinit();
+    try std.testing.expectEqual(@as(usize, 1), predicate.calls);
+    try std.testing.expectEqual(@as(usize, 4), counter.count);
+    try std.testing.expectEqual(residual.results.getHits()[0].vector_id, batched.results.getHits()[0].vector_id);
+    predicate.cancel = true;
+    try std.testing.expectError(error.Cancelled, exactScoreNativeDenseFilter(alloc, &entry, batch_req));
+    try std.testing.expectEqual(@as(usize, 4), counter.count);
 }
 
 test "one percent filtered route preserves exact recall with candidate-linear IO" {
@@ -16821,6 +16964,7 @@ test "one percent native filter routes through integrated dense search exactly" 
         entry: *index_manager_mod.IndexManager.DenseIndex,
         include_ids: []const u64 = &.{},
         exclude_ids: []const u64 = &.{},
+        exact_calls: usize = 0,
         fn selectDense(raw: *anyopaque, a: Allocator) !?types.DenseIdSelection {
             const state: *@This() = @ptrCast(@alignCast(raw));
             const include = try a.dupe(u64, state.include_ids);
@@ -16854,6 +16998,10 @@ test "one percent native filter routes through integrated dense search exactly" 
         }
         fn unexpectedHbcProfiled(_: ?*anyopaque, _: *index_manager_mod.IndexManager.DenseIndex, _: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.ProfiledSearchResults {
             return error.UnexpectedHbcRoute;
+        }
+        fn exact(ctx: ?*anyopaque, dense_entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest) anyerror!dense_exact.SearchOutcome {
+            self(ctx).exact_calls += 1;
+            return exactScoreNativeDenseFilter(dense_entry.index.alloc, dense_entry, req);
         }
         fn postprocess(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, raw: types.SearchResult, _: bool) anyerror!types.SearchResult {
             return raw;
@@ -16918,6 +17066,55 @@ test "one percent native filter routes through integrated dense search exactly" 
     }, .{ .vector = &query, .k = result_count }, executor);
     defer empty.result.deinit();
     try std.testing.expectEqual(@as(usize, 0), empty.result.hits.len);
+
+    var paging_executor = executor;
+    paging_executor.exact_dense_search = Harness.exact;
+    paging_executor.filter_candidate_presence = true;
+    var page = try searchDenseProfiled(alloc, .{
+        .index_name = "dense",
+        .limit = result_count,
+        .include_stored = false,
+        .filter_ids = filter_ids,
+        .distance_under = 0.5,
+    }, .{ .vector = &query, .k = result_count }, paging_executor);
+    defer page.result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), harness.exact_calls);
+    try std.testing.expectEqual(@as(usize, 1), page.result.hits.len);
+    try std.testing.expectEqual(.exact, page.result.total_hits_relation);
+
+    const Residual = struct {
+        fn allows(raw: *anyopaque, _: []const u8) !bool {
+            const broad: *const bool = @ptrCast(@alignCast(raw));
+            return broad.*;
+        }
+    };
+    var broad = false;
+    const residual: types.NativeKeyPredicate = .{ .ptr = &broad, .allows = Residual.allows };
+    const rounds: usize = if (getenv("ANTFLY_BENCH_MIXED_RESIDUAL") != null) 1_000 else 1;
+    var elapsed: [2]u64 = @splat(0);
+    for (0..rounds) |_| {
+        for ([_]bool{ false, true }, &elapsed) |accept, *time| {
+            broad = accept;
+            const start = platform_time.monotonicNs();
+            var mixed = try searchDenseProfiled(alloc, .{
+                .index_name = "dense",
+                .limit = result_count,
+                .include_stored = false,
+                .profile = true,
+                .filter_ids = filter_ids,
+                .native_key_predicate = residual.receiver(),
+            }, .{ .vector = &query, .k = result_count }, executor);
+            time.* += platform_time.monotonicNs() - start;
+            defer mixed.result.deinit();
+            try std.testing.expectEqualStrings("exact_native_filter", mixed.profile.search_route);
+            try std.testing.expectEqual(@as(u64, if (accept) candidate_count else 0), mixed.profile.hbc_exact_vectors_scored);
+            try std.testing.expectEqual(profiled.profile.route_estimated_exact_storage_bytes, mixed.profile.route_estimated_exact_storage_bytes);
+            try std.testing.expectEqual(if (accept) result_count else 0, mixed.result.hits.len);
+        }
+    }
+    if (rounds > 1) std.debug.print("mixed residual native exact: {d} queries per arm, reject-all {d} ns/query, accept-all {d} ns/query\n", .{
+        rounds, elapsed[0] / rounds, elapsed[1] / rounds,
+    });
 }
 
 fn countActiveDenseVectorIdsAlloc(
@@ -19421,6 +19618,8 @@ pub fn searchMatchAll(
     });
     defer native_constraints.deinit(alloc);
 
+    if (exec_req.native_key_predicate != null and planned_sort.kind == .sorted_segment_seek)
+        planned_sort = docValuesCollectorPlanForSelectiveFilter(planned_sort);
     const exact_sort_budget = lateVisibilityExactCandidateBudget();
     const unresolved_stored_filters =
         (exec_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
@@ -20223,6 +20422,10 @@ const MatchAllCandidateCollectState = struct {
             self.alloc.free(raw_key);
             return;
         }
+        if (self.req.native_key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, raw_key)) {
+            self.alloc.free(raw_key);
+            return;
+        };
 
         const ordinal = if (self.collector.lookup_doc_ordinal) |lookup|
             try lookup(self.collector.ctx, self.alloc, raw_key, self.req.identity_read_generation)
@@ -38280,4 +38483,41 @@ test "graph legacy ordinal batches bound resolver calls and preserve membership"
     try std.testing.expectEqual(@as(usize, 6), fake.calls);
     try batch.flush(&rows, executor, 42, .{});
     try std.testing.expectEqual(@as(usize, 7), fake.calls);
+}
+
+test "native member verification preserves candidate provenance after native filtering" {
+    const req: types.SearchRequest = .{ .filter_doc_ids = &.{ "a", "b" }, .filter_doc_ids_positive = true };
+    const residual = requestAfterNativeFilters(req, false, false);
+    try std.testing.expect(!residual.filter_doc_ids_positive and residual.filter_doc_ids.len == 0);
+    try std.testing.expectEqual(@as(usize, 2), residual.value_search_candidate_keys.len);
+    try std.testing.expectEqualStrings("a", residual.value_search_candidate_keys[0]);
+    try std.testing.expect(!residual.value_search_execution.allow_scan);
+    const unbounded = requestAfterNativeFilters(.{}, false, false);
+    try std.testing.expectEqual(@as(usize, 0), unbounded.value_search_candidate_keys.len);
+}
+
+test "time series exact keyword filters admit empty shards without accepting missing live coverage" {
+    const a = std.testing.allocator;
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    const schema: runtime_schema_mod.TableSchema = .{ .full_text_documents = &.{.{
+        .name = "reading",
+        .fields = &.{.{ .path = "device_id", .emitted_name = "device_id", .analyzer = "keyword" }},
+    }} };
+    const query: search_mod.SearchQuery = .{ .term = .{ .field = "device_id", .term = "sensor" } };
+    try std.testing.expect(try searchQueryCanUseSnapshot(writer.snapshot(), query, .{}, schema, false));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const filter = try search_mod.searchQueryToFilterArena(arena.allocator(), query);
+    const matches = try writer.snapshot().executeFilter(a, filter);
+    defer a.free(matches);
+    try std.testing.expectEqual(@as(usize, 0), matches.len);
+
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    try segment.addStoredDoc("doc:a", "{}");
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    try std.testing.expect(!try searchQueryCanUseSnapshot(writer.snapshot(), query, .{}, schema, false));
 }

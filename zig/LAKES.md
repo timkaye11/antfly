@@ -1099,9 +1099,18 @@ implementation and qualification log is summarized in
 - Garbage collection marks everything reachable from live publication, reader and
   builder leases, including checkpoints. Incomplete traversals never authorize a
   sweep.
-- Readiness warms planning navigation once per publication: at most four
-  publications concurrently, four I/O lanes of 4 MiB, 64 pages, two interior
-  levels and a two-second deadline. It never warms postings or source rows.
+- Required serving-cut recovery runs before optional navigation warming, with
+  four process-wide recovery lanes, per-table/incarnation coalescing, caller
+  cancellation, shutdown cancellation and a 60-second maximum deadline. Ownership
+  becomes active only when a complete first cut is durably admitted. Failed first
+  captures retain strict reads; active sources report ready only when their cut
+  can cover the configured cursor horizon.
+- Optional warming admits four publications and four I/O lanes of 4 MiB, up to
+  64 navigation pages, three child levels, and 16 segments/16 MiB of working
+  blocks within two seconds. Four bounded continuation plans resume completed
+  waves after timeout; immutable references carry no request credentials or
+  leases. Eviction permits rewarming after a five-second cooldown. Compressed
+  metadata bundles replace individual-piece fetches during warming.
   Counters: `antfly_lake_navigation_warming_{attempts,failures,pages,nanoseconds}_total`.
 - Cloud generation maps, retained-closure certificates and cloud GC are described
   in [Cloud generations and retention evidence](REMOTE_TABLE_SERVING.md#cloud-generations-and-retention-evidence).
@@ -1694,3 +1703,19 @@ The HN native comparison runner uses identical source checksums and separate
 empty-cache/readiness cases rather than attributing aggregate improvements to
 BM25. See `examples/hackernews/native_search_comparison.py` and the qualification
 instructions in the ingestion/publication plan.
+
+## Offline dense Parquet construction
+
+Authored floating-point Parquet lists feed borrowed float32 batches through the
+lake reader and binary producer replay. Fresh offline dense builds publish
+bounded immutable exact-vector runs and train hierarchical routers from
+reservoirs collected while writing partitions. Native posting publication and
+later full consolidation stream centroid blocks under the builder's allocator.
+Input, identity, and output admission scale with the configured corpus allowance.
+Paged artifact directories support generations beyond the former 16 GiB limit.
+
+Configuration, operation benchmarks, and the current construction lifecycle are
+specified in [the bulk builder design](../docs/design/vector-store/bulk-builder.md).
+Source-backed reranking, compact ordinal partitions, direct posting assembly,
+and durable phase manifests have their contracts in
+[bulk source storage](../docs/design/vector-store/bulk-source-storage.md).

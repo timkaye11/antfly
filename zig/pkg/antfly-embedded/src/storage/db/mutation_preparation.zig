@@ -52,6 +52,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const Allocator = execution_resources.Allocator;
         const ChunkCacheEntry = execution_resources.ChunkCacheEntry;
         const ChunkEmbeddingSource = execution_resources.ChunkEmbeddingSource;
+        const EmbeddingArtifactOrigin = execution_resources.EmbeddingArtifactOrigin;
         const GeneratedBatchWritePlan = execution_resources.GeneratedBatchWritePlan;
         const GeneratedDenseMemoJob = execution_resources.GeneratedDenseMemoJob;
         const GeneratedEmbeddingMemo = execution_resources.GeneratedEmbeddingMemo;
@@ -113,37 +114,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const storedOrPendingEmbeddingSourceHash = S.storedOrPendingEmbeddingSourceHash;
         const validateDocumentExtractionInlineSourcesSnapshotParsed = S.validateDocumentExtractionInlineSourcesSnapshotParsed;
         pub fn CoalescedKeyValueRequest(comptime T: type) type {
-            return struct {
-                pub const Entry = struct {
-                    json_null_fields: []const []const u8 = &.{},
-                    key: []const u8,
-                    value: ?[]const u8 = null,
-                    kind: enum { write, delete },
-                    owned_key: bool = false,
-                    owned_value: bool = false,
-                };
-
-                entries: []Entry = &.{},
-                writes: []T = &.{},
-                deletes: [][]const u8 = &.{},
-                graph_writes: std.ArrayListUnmanaged(types.GraphEdgeWrite) = .empty,
-                graph_deletes: std.ArrayListUnmanaged(types.GraphEdgeDelete) = .empty,
-
-                pub fn deinit(self: *@This(), alloc: Allocator) void {
-                    for (self.entries) |entry| {
-                        if (entry.owned_key) alloc.free(@constCast(entry.key));
-                        if (entry.owned_value) alloc.free(@constCast(entry.value.?));
-                    }
-                    if (self.entries.len > 0) alloc.free(self.entries);
-                    if (self.writes.len > 0) alloc.free(self.writes);
-                    if (self.deletes.len > 0) alloc.free(self.deletes);
-                    for (self.graph_writes.items) |*write| deinitOwnedGraphEdgeWrite(alloc, write);
-                    self.graph_writes.deinit(alloc);
-                    for (self.graph_deletes.items) |*delete| deinitOwnedGraphEdgeDelete(alloc, delete);
-                    self.graph_deletes.deinit(alloc);
-                    self.* = .{};
-                }
-            };
+            if (T != types.BatchWrite) @compileError("mutation writes must use the canonical write type");
+            return @import("mutation_plan.zig").PreparedMutation;
         }
 
         pub const GeneratedWriteReadSnapshot = struct {
@@ -166,28 +138,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         };
 
-        pub const TransformReadSnapshot = struct {
-            pub const Entry = struct {
-                key: []const u8,
-                value: ?[]u8,
-                expected_version: u64,
-            };
-
-            entries: []Entry = &.{},
-            positions: std.StringHashMapUnmanaged(usize) = .empty,
-
-            pub fn deinit(self: *@This(), alloc: Allocator) void {
-                for (self.entries) |entry| if (entry.value) |value| alloc.free(value);
-                if (self.entries.len > 0) alloc.free(self.entries);
-                self.positions.deinit(alloc);
-                self.* = .{};
-            }
-
-            pub fn valueFor(self: *const @This(), key: []const u8) ?[]const u8 {
-                const index = self.positions.get(key) orelse return null;
-                return self.entries[index].value;
-            }
-        };
+        pub const TransformReadSnapshot = @import("mutation_plan.zig").ReadSnapshot;
 
         pub fn captureGeneratedWriteReadSnapshot(self: anytype, alloc: Allocator, writes: []const types.BatchWrite) !GeneratedWriteReadSnapshot {
             const revisions = GeneratedWriteReadSnapshot.revisions;
@@ -210,26 +161,34 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             deletes: []const []const u8,
             transforms: []const types.DocumentTransform,
         ) !TransformReadSnapshot {
-            var result = TransformReadSnapshot{};
-            errdefer result.deinit(alloc);
-            if (transforms.len == 0) return result;
+            if (transforms.len == 0) return .{};
 
             // Only transforms whose first base comes from storage need a read-set
             // predicate. Writes/deletes and an earlier transform establish an
             // entirely request-local base.
-            var request_keys = std.StringHashMapUnmanaged(void).empty;
-            defer request_keys.deinit(alloc);
-            for (writes) |write| try request_keys.put(alloc, write.key, {});
-            for (deletes) |key| try request_keys.put(alloc, key, {});
+            var plan: @import("transform_read_plan.zig").Plan = .{};
+            defer plan.deinit(alloc);
+            for (writes) |write| try plan.establish(alloc, write.key);
+            for (deletes) |key| try plan.establish(alloc, key);
+            for (transforms) |transform| try plan.transform(alloc, transform.key);
+            if (plan.durable_bases.items.len == 0) return .{};
 
-            var keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer keys.deinit(alloc);
-            for (transforms) |transform| {
-                if (request_keys.contains(transform.key)) continue;
-                try request_keys.put(alloc, transform.key, {});
-                try keys.append(alloc, transform.key);
-            }
-            if (keys.items.len == 0) return result;
+            // Only request-key collection depends on the write/receiver type.
+            // Share MVCC reads and row reconstruction across DB, recovery and
+            // prepared receivers, just as the commit path shares its owner.
+            if (@TypeOf(self) == *S.PreparedBatchOwner)
+                return captureTransformReadSnapshotForKeys(self, alloc, plan.durable_bases.items);
+            var owner = S.PreparedBatchOwner.from(self);
+            return captureTransformReadSnapshotForKeys(&owner, alloc, plan.durable_bases.items);
+        }
+
+        noinline fn captureTransformReadSnapshotForKeys(
+            self: *S.PreparedBatchOwner,
+            alloc: Allocator,
+            keys: []const []const u8,
+        ) !TransformReadSnapshot {
+            var result = TransformReadSnapshot{};
+            errdefer result.deinit(alloc);
 
             // Read values and version timestamps from the same MVCC snapshot. This
             // replaces two point transactions per transform and allows transform
@@ -238,15 +197,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer read_txn.abort();
             var schema_view = S.ownerField(self, "core").*.acquireSchemaView();
             defer if (schema_view) |*view| view.release();
-            const entries = try alloc.alloc(TransformReadSnapshot.Entry, keys.items.len);
+            const entries = try alloc.alloc(TransformReadSnapshot.Entry, keys.len);
             var initialized: usize = 0;
             errdefer {
                 for (entries[0..initialized]) |entry| if (entry.value) |value| alloc.free(value);
                 alloc.free(entries);
             }
-            try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.items.len) orelse
+            try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.len) orelse
                 return error.InvalidBatchRequest);
-            for (keys.items, 0..) |key, index| {
+            for (keys, 0..) |key, index| {
                 const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
                 defer alloc.free(store_key);
                 const raw = read_txn.get(store_key) catch |err| switch (err) {
@@ -325,214 +284,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             transforms: []const types.DocumentTransform,
             transform_snapshot: ?*const TransformReadSnapshot,
         ) !CoalescedKeyValueRequest(T) {
-            // SQL mutations lower to complete replacements. A document transform
-            // cannot retain the provenance of JSON null after reconstructing JSON.
-            if (transforms.len != 0) for (writes) |write| if (write.json_null_fields.len != 0) return error.UnsupportedTransformOperation;
-            var result = CoalescedKeyValueRequest(T){};
-            var order = std.ArrayListUnmanaged(CoalescedKeyValueRequest(T).Entry).empty;
-            defer order.deinit(alloc);
-            errdefer {
-                // Before toOwnedSlice, the list still owns its full capacity.
-                // Release fields here and let order.deinit free that exact backing
-                // allocation; never pass the shorter items slice to alloc.free.
-                for (order.items) |entry| {
-                    if (entry.owned_key) alloc.free(@constCast(entry.key));
-                    if (entry.owned_value) alloc.free(@constCast(entry.value.?));
-                }
-                result.deinit(alloc);
+            const planner = @import("mutation_plan.zig");
+            if (transform_snapshot) |snapshot| return planner.prepare(alloc, writes, deletes, transforms, snapshot);
+            if (transforms.len == 0) return planner.prepare(alloc, writes, deletes, transforms, &.{});
+            for (writes) |write| if (write.json_null_fields.len != 0) return error.UnsupportedTransformOperation;
+            // Recovery has no foreground lookup capability. A request-local
+            // base is sufficient; every durable base still requires a pin.
+            if (S.isRecoveryExecution(self)) {
+                var reads: @import("transform_read_plan.zig").Plan = .{};
+                defer reads.deinit(alloc);
+                for (writes) |write| try reads.establish(alloc, write.key);
+                for (deletes) |key| try reads.establish(alloc, key);
+                for (transforms) |transform| try reads.transform(alloc, transform.key);
+                if (reads.durable_bases.items.len != 0) return error.PreparedReadSetChanged;
+                return planner.prepare(alloc, writes, deletes, transforms, &.{});
             }
-
-            var positions = std.StringHashMapUnmanaged(usize){};
-            defer positions.deinit(alloc);
-
-            for (writes) |write| {
-                const gop = try positions.getOrPut(alloc, write.key);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = order.items.len;
-                    try order.append(alloc, .{
-                        .key = write.key,
-                        .value = write.value,
-                        .json_null_fields = write.json_null_fields,
-                        .kind = .write,
-                    });
-                    continue;
-                }
-                const entry = &order.items[gop.value_ptr.*];
-                if (entry.owned_value) alloc.free(@constCast(entry.value.?));
-                if (entry.owned_key) alloc.free(@constCast(entry.key));
-                setCoalescedEntryToBorrowedWrite(T, entry, write);
-            }
-
-            for (deletes) |key| {
-                const gop = try positions.getOrPut(alloc, key);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = order.items.len;
-                    try order.append(alloc, .{
-                        .key = key,
-                        .kind = .delete,
-                    });
-                    continue;
-                }
-                const entry = &order.items[gop.value_ptr.*];
-                if (entry.owned_value) alloc.free(@constCast(entry.value.?));
-                entry.owned_value = false;
-                resetCoalescedEntryToDelete(T, entry);
-            }
-
-            for (transforms) |transform| {
-                const maybe_index = positions.get(transform.key);
-                const base_json = blk: {
-                    if (maybe_index) |entry_index| {
-                        const entry = order.items[entry_index];
-                        break :blk if (entry.kind == .write) entry.value.? else null;
-                    }
-                    if (transform_snapshot) |read_snapshot| break :blk read_snapshot.valueFor(transform.key);
-                    // Borrowed mutation execution always supplies a pinned read
-                    // set; it has no foreground lookup capability to fall back to.
-                    if (S.isRecoveryExecution(self)) return error.PreparedReadSetChanged;
-                    break :blk try self.get(alloc, transform.key);
-                };
-                defer if (maybe_index == null and transform_snapshot == null) {
-                    if (base_json) |body| alloc.free(body);
-                };
-
-                var document_operations = std.ArrayListUnmanaged(types.TransformOp).empty;
-                defer document_operations.deinit(alloc);
-                var graph_operations = std.ArrayListUnmanaged(struct {
-                    op: types.TransformOpType,
-                    path: transform_mod.GraphProjectionPath,
-                    value_json: []const u8,
-                }).empty;
-                defer graph_operations.deinit(alloc);
-                for (transform.operations) |operation| {
-                    const graph_path = try transform_mod.graphProjectionPath(operation.path);
-                    if (graph_path) |path| {
-                        switch (operation.op) {
-                            .push, .pull, .add_to_set => {},
-                            else => return error.UnsupportedTransformOperation,
-                        }
-                        try graph_operations.append(alloc, .{
-                            .op = operation.op,
-                            .path = path,
-                            .value_json = operation.value_json orelse return error.InvalidArgument,
-                        });
-                    } else {
-                        try document_operations.append(alloc, operation);
-                    }
-                }
-
-                const graph_writes_start = result.graph_writes.items.len;
-                const graph_deletes_start = result.graph_deletes.items.len;
-                for (graph_operations.items) |operation| {
-                    switch (operation.op) {
-                        .push, .add_to_set => try appendGraphTransformWrite(
-                            alloc,
-                            &result.graph_writes,
-                            &result.graph_deletes,
-                            transform.key,
-                            operation.path,
-                            operation.value_json,
-                        ),
-                        .pull => try appendGraphTransformDelete(
-                            alloc,
-                            &result.graph_writes,
-                            &result.graph_deletes,
-                            transform.key,
-                            operation.path,
-                            operation.value_json,
-                        ),
-                        else => unreachable,
-                    }
-                }
-
-                const document_transform: types.DocumentTransform = .{
-                    .key = transform.key,
-                    .operations = document_operations.items,
-                    .upsert = transform.upsert,
-                };
-
-                // A non-upsert transform against an absent (or same-batch deleted)
-                // document is a no-op, but malformed document operations remain
-                // errors independent of state. Graph operands were validated while
-                // constructing their pending deltas above.
-                if (base_json == null and !transform.upsert) {
-                    try transform_mod.validateDocumentTransform(alloc, document_transform);
-                    for (result.graph_writes.items[graph_writes_start..]) |*write| {
-                        deinitOwnedGraphEdgeWrite(alloc, write);
-                    }
-                    result.graph_writes.shrinkRetainingCapacity(graph_writes_start);
-                    for (result.graph_deletes.items[graph_deletes_start..]) |*delete| {
-                        deinitOwnedGraphEdgeDelete(alloc, delete);
-                    }
-                    result.graph_deletes.shrinkRetainingCapacity(graph_deletes_start);
-                    continue;
-                }
-
-                // Even a graph-only transform remains a logical document write:
-                // preserve source version/timestamp and change-journal semantics
-                // while applying the projected edge as a delta. The mapper sees
-                // the unchanged stripped document and therefore does not clear
-                // the graph generation.
-                const resolved = try transform_mod.resolveDocumentTransform(alloc, base_json, document_transform);
-
-                const resolved_document = resolved orelse continue;
-                var resolved_document_owned = true;
-                defer if (resolved_document_owned) alloc.free(resolved_document);
-
-                const gop = try positions.getOrPut(alloc, transform.key);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = order.items.len;
-                    const owned_key = try alloc.dupe(u8, transform.key);
-                    errdefer alloc.free(owned_key);
-                    try order.append(alloc, .{
-                        .key = owned_key,
-                        .value = resolved_document,
-                        .kind = .write,
-                        .owned_key = true,
-                        .owned_value = true,
-                    });
-                    resolved_document_owned = false;
-                    continue;
-                }
-
-                const entry = &order.items[gop.value_ptr.*];
-                try setCoalescedEntryToOwnedWrite(T, alloc, entry, transform.key, resolved_document);
-                resolved_document_owned = false;
-            }
-
-            var write_count: usize = 0;
-            var delete_count: usize = 0;
-            for (order.items) |entry| {
-                switch (entry.kind) {
-                    .write => write_count += 1,
-                    .delete => delete_count += 1,
-                }
-            }
-
-            const final_entries = try order.toOwnedSlice(alloc);
-            result.entries = final_entries;
-            if (write_count > 0) result.writes = try alloc.alloc(T, write_count);
-            if (delete_count > 0) result.deletes = try alloc.alloc([]const u8, delete_count);
-
-            var write_index: usize = 0;
-            var delete_index: usize = 0;
-            for (final_entries) |entry| {
-                switch (entry.kind) {
-                    .write => {
-                        result.writes[write_index] = .{
-                            .key = entry.key,
-                            .value = entry.value.?,
-                            .json_null_fields = entry.json_null_fields,
-                        };
-                        write_index += 1;
-                    },
-                    .delete => {
-                        result.deletes[delete_index] = entry.key;
-                        delete_index += 1;
-                    },
-                }
-            }
-            return result;
+            var snapshot = try self.captureTransformReadSnapshot(alloc, T, writes, deletes, transforms);
+            defer snapshot.deinit(alloc);
+            return planner.prepare(alloc, writes, deletes, transforms, &snapshot);
         }
 
         pub fn generatedPrecomputeModeForSyncLevel(sync_level: types.SyncLevel) GeneratedPrecomputeMode {
@@ -657,41 +426,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // conservative preflight; the backend still performs the exact guard
             // immediately before WAL append.
             return (payload_bytes *| 2) +| (operations *| 512);
-        }
-
-        pub fn resetCoalescedEntryToDelete(comptime T: type, entry: *CoalescedKeyValueRequest(T).Entry) void {
-            if (entry.owned_value) {
-                // Caller frees previous owned value before switching the entry.
-                entry.owned_value = false;
-            }
-            entry.value = null;
-            entry.kind = .delete;
-        }
-
-        pub fn setCoalescedEntryToBorrowedWrite(comptime T: type, entry: *CoalescedKeyValueRequest(T).Entry, write: T) void {
-            entry.key = write.key;
-            entry.value = write.value;
-            entry.json_null_fields = write.json_null_fields;
-            entry.kind = .write;
-            entry.owned_key = false;
-            entry.owned_value = false;
-        }
-
-        pub fn setCoalescedEntryToOwnedWrite(
-            comptime T: type,
-            alloc: Allocator,
-            entry: *CoalescedKeyValueRequest(T).Entry,
-            key: []const u8,
-            value: []u8,
-        ) !void {
-            if (!entry.owned_key) {
-                entry.key = try alloc.dupe(u8, key);
-                entry.owned_key = true;
-            }
-            if (entry.owned_value) alloc.free(@constCast(entry.value.?));
-            entry.value = value;
-            entry.kind = .write;
-            entry.owned_value = true;
         }
 
         pub fn storedDocumentValuesEqual(alloc: Allocator, lhs: []const u8, rhs: []const u8) bool {
@@ -864,12 +598,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (chunk_texts.items.len == 0) return;
 
-            const vectors = try enrichment_runtime_mod.embedDenseBatchTracked(runtime, consumer_indexes, alloc, dense_embedder, embedding_name, chunk_texts.items, request.expected_dims);
+            const generation = try dense_embedder.captureTextGeneration(alloc, embedding_name);
+            const vectors = try enrichment_runtime_mod.embedDenseBatchTracked(runtime, consumer_indexes, alloc, dense_embedder.withTextGeneration(generation), embedding_name, chunk_texts.items, request.expected_dims);
             defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+            try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
             if (vectors.len != source_indexes.items.len) return error.InvalidEmbeddingResponse;
 
             for (source_indexes.items, vectors) |source_index, vector| {
                 const source = sources[source_index];
+                const source_hash = if (!source.has_metadata)
+                    enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
+                else
+                    enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                 const artifact_key = try appendEmbeddingArtifactWrite(
                     alloc,
                     artifact_writes,
@@ -878,7 +618,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     embedding_name,
                     request.source_field,
                     source.key,
-                    .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) },
+                    // Inline text chunks re-embed by re-chunking the parent;
+                    // stored chunk inputs cannot.
+                    if (request.input_kind == .inline_chunks and !source.has_metadata and source.locally_replayable)
+                        EmbeddingArtifactOrigin{ .generated_text = source_hash }
+                    else
+                        EmbeddingArtifactOrigin{ .generated = source_hash },
                     vector,
                 );
                 defer alloc.free(artifact_key);
@@ -907,13 +652,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (sources.items.len == 0) return;
             defer clearChunkEmbeddingSourceList(alloc, sources);
 
+            const generation = try dense_embedder.captureTextGeneration(alloc, embedding_name);
+            const pinned_embedder = dense_embedder.withTextGeneration(generation);
             var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
             defer chunk_texts.deinit(alloc);
             var source_indexes = std.ArrayListUnmanaged(usize).empty;
             defer source_indexes.deinit(alloc);
 
             for (sources.items, 0..) |source, i| {
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
+                const source_hash = if (!source.has_metadata)
+                    enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
+                else
+                    enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                 const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                 defer alloc.free(artifact_key);
                 if (skip_unchanged_artifacts) {
@@ -928,7 +678,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try source_indexes.append(alloc, i);
             }
 
-            try flushGeneratedDenseChunkBatch(alloc, runtime, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+            try flushGeneratedDenseChunkBatch(alloc, runtime, pinned_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+            try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
         }
 
         pub fn flushGeneratedDenseMemoJobs(
@@ -948,12 +699,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 runtime,
                 first.consumer_indexes,
                 memo.alloc,
-                embedder,
+                embedder.withTextGeneration(jobs.items[0].generation),
                 requestEmbeddingName(first),
                 texts,
                 first.expected_dims,
             );
             defer embedder_mod.freeDenseEmbeddingBatch(memo.alloc, vectors);
+            try embedder.requireTextGeneration(memo.alloc, requestEmbeddingName(first), jobs.items[0].generation);
             for (jobs.items, vectors) |job, vector| try memo.putDenseCopy(job.key, vector);
         }
 
@@ -964,6 +716,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             embedding_name: []const u8,
             semantic_producer: []const u8,
             reprocess_generation: u64,
+            revision: ?[32]u8,
             artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
             sources: []const ChunkEmbeddingSource,
@@ -973,8 +726,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (chunk_texts.items.len == 0) return;
 
+            try sparse_embedder.requireRevision(alloc, embedding_name, revision);
             const sparse_batch = try enrichment_runtime_mod.embedSparseBatchTracked(runtime, consumer_indexes, alloc, sparse_embedder, embedding_name, chunk_texts.items);
             defer embedder_mod.freeSparseEmbeddingBatch(alloc, sparse_batch);
+            try sparse_embedder.requireRevision(alloc, embedding_name, revision);
             if (sparse_batch.len != source_indexes.items.len) return error.InvalidEmbeddingResponse;
 
             for (source_indexes.items, sparse_batch) |source_index, sparse| {
@@ -984,7 +739,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     artifact_writes,
                     source.key,
                     embedding_name,
-                    .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, semantic_producer, reprocess_generation) },
+                    .{ .generated = enrichment_runtime_mod.hashEmbeddingSourceAtRevision(source.text, semantic_producer, reprocess_generation, revision) },
                     sparse.indices,
                     sparse.values,
                 );
@@ -1004,6 +759,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             embedding_name: []const u8,
             semantic_producer: []const u8,
             reprocess_generation: u64,
+            revision: ?[32]u8,
             artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
             sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
@@ -1020,11 +776,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer source_indexes.deinit(alloc);
 
             for (sources.items, 0..) |source, i| {
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, semantic_producer, reprocess_generation);
+                const source_hash = enrichment_runtime_mod.hashEmbeddingSourceAtRevision(source.text, semantic_producer, reprocess_generation, revision);
                 const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                 defer alloc.free(artifact_key);
                 if (reuse_unchanged) if (try storedOrPendingEmbeddingSourceHash(db, pending_lookup, artifact_key)) |existing_hash| {
                     if (existing_hash == source_hash) {
+                        try sparse_embedder.requireRevision(alloc, embedding_name, revision);
                         try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, &.{}, &.{}, consumer_indexes);
                         continue;
                     }
@@ -1033,7 +790,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try source_indexes.append(alloc, i);
             }
 
-            try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, semantic_producer, reprocess_generation, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
+            try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, semantic_producer, reprocess_generation, revision, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
         }
 
         pub fn flushGeneratedSparseMemoJobs(
@@ -1049,6 +806,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer memo.alloc.free(texts);
             for (jobs.items, texts) |job, *text| text.* = job.text;
             const first = jobs.items[0].request;
+            try embedder.requireRevision(memo.alloc, requestEmbeddingName(first), jobs.items[0].revision);
             const vectors = try enrichment_runtime_mod.embedSparseBatchTracked(
                 runtime,
                 first.consumer_indexes,
@@ -1058,6 +816,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 texts,
             );
             defer embedder_mod.freeSparseEmbeddingBatch(memo.alloc, vectors);
+            try embedder.requireRevision(memo.alloc, requestEmbeddingName(first), jobs.items[0].revision);
             for (jobs.items, vectors) |job, vector| try memo.putSparseCopy(job.key, vector);
         }
 
@@ -1127,6 +886,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return plan;
         }
 
+        fn embeddingTargetGeneration(self: anytype, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, force: []const []const u8) !u64 {
+            const intent = @import("artifact_reprocess_intent.zig");
+            const key = try intent.embeddingKeyAlloc(alloc, request.doc_key, requestEmbeddingName(request));
+            defer alloc.free(key);
+            const raw = self.core.*.store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (raw) |bytes| alloc.free(bytes);
+            const current = if (raw) |bytes| try intent.generation(bytes) else 0;
+            return if (containsName(force, requestEmbeddingName(request))) std.math.add(u64, current, 1) catch error.ResourceLimitExceeded else current;
+        }
+
         pub fn prepareGeneratedEnrichments(
             self: anytype,
             alloc: Allocator,
@@ -1144,9 +916,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 null;
             defer if (fallback_write_plan) |*view| view.release();
+            // Bind every prewarmed result to the target resolved before any
+            // provider call. The same memo survives optimistic retries, while
+            // epochs may advance during the preceding attempt.
+            if (preplanned) |plan| for (plan.rows) |row| {
+                for (row.requests) |*request| {
+                    if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
+                    request.reprocess_generation = try embeddingTargetGeneration(self, alloc, request.*, force_generated_artifact_names);
+                }
+            };
+            var fallback_memo = GeneratedEmbeddingMemo.init(alloc);
+            defer fallback_memo.deinit();
+            const preparation_memo = generated_memo orelse &fallback_memo;
             if (preplanned) |plan| if (generated_memo) |memo| {
-                try prewarmGeneratedDenseMemo(self, req, extracted, precompute_mode, plan, memo);
-                try prewarmGeneratedSparseMemo(self, req, extracted, precompute_mode, plan, memo);
+                try prewarmGeneratedDenseMemo(self, req, extracted, precompute_mode, plan, memo, force_generated_artifact_names);
+                try prewarmGeneratedSparseMemo(self, req, extracted, precompute_mode, plan, memo, force_generated_artifact_names);
             };
 
             var artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
@@ -1223,6 +1007,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break :blk owned_row_plan.?.rows[0].requests;
                 };
                 if (generated_templates.len == 0) continue;
+                const privacy_protected = for (generated_templates) |template| {
+                    if (@import("../../privacy/document.zig").isProtectedArtifactName(template.artifact_name)) break true;
+                } else false;
+                if (privacy_protected and (extracted[i].dense_embeddings.len != 0 or extracted[i].sparse_embeddings.len != 0)) return error.PrivacyExternalVectorsUnsupported;
                 const generated = try alloc.dupe(enrichment_types.GeneratedEnrichmentRequest, generated_templates);
                 defer alloc.free(generated);
                 for (generated) |*request| {
@@ -1230,14 +1018,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const intent = @import("artifact_reprocess_intent.zig");
                     const key = try intent.embeddingKeyAlloc(alloc, request.doc_key, requestEmbeddingName(request.*));
                     defer alloc.free(key);
-                    const old = self.core.*.store.get(alloc, key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
-                    defer if (old) |raw| alloc.free(raw);
-                    request.reprocess_generation = if (old) |raw| try intent.generationForConfig(raw, request.producer_json) else 0;
+                    if (preplanned == null) request.reprocess_generation = try embeddingTargetGeneration(self, alloc, request.*, force_generated_artifact_names);
                     if (containsName(force_generated_artifact_names, requestEmbeddingName(request.*))) {
-                        request.reprocess_generation = std.math.add(u64, request.reprocess_generation, 1) catch return error.ResourceLimitExceeded;
                         const encoded = intent.encode(request.producer_json, request.reprocess_generation);
                         const owned_key = try alloc.dupe(u8, key);
                         errdefer alloc.free(owned_key);
@@ -1327,6 +1109,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 containsName(force_generated_artifact_names, requestArtifactName(request)),
                                 document_execution,
                                 &coverage_outcomes,
+                                preparation_memo,
                             );
                             const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
                             defer alloc.free(asset_key);
@@ -1368,7 +1151,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try indexPendingArtifactWrites(alloc, &pending_writes, artifact_writes.items, &indexed_write_count);
                             const before = dense_embeddings.items.len;
                             const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
-                            computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &dense_embeddings, &chunk_cache, generated_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
+                            computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &dense_embeddings, &chunk_cache, preparation_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingDenseEmbedder => {
                                     try appendGeneratedEnrichmentRef(alloc, &planned, request);
                                     continue;
@@ -1388,7 +1171,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try indexPendingArtifactWrites(alloc, &pending_writes, artifact_writes.items, &indexed_write_count);
                             const before = sparse_embeddings.items.len;
                             const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
-                            computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, generated_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
+                            computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, preparation_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingSparseEmbedder => {
                                     try appendGeneratedEnrichmentRef(alloc, &planned, request);
                                     continue;
@@ -1434,6 +1217,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     candidate.produced,
                 )) try appendGeneratedEnrichmentRef(alloc, &planned, candidate.request);
             }
+
+            if (S.ownerField(self, "enrichment_runtime").*) |runtime|
+                try preparation_memo.validateRevisions(runtime.config.dense_embedder, runtime.config.sparse_embedder);
 
             var result = PrecomputedGeneratedBatch{};
             errdefer result.deinit(alloc);
@@ -1518,6 +1304,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             precompute_mode: GeneratedPrecomputeMode,
             plan: *const GeneratedBatchWritePlan,
             memo: *GeneratedEmbeddingMemo,
+            force_names: []const []const u8,
         ) !void {
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
             const embedder = runtime.config.dense_embedder orelse return;
@@ -1552,20 +1339,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     var text_owned = true;
                     errdefer if (text_owned) memo.alloc.free(text);
-                    const key_value = GeneratedEmbeddingMemo.key(
-                        .dense_embedding,
-                        requestEmbeddingName(request),
-                        request.producer_json,
-                        request.execution_json,
-                        request.expected_dims,
-                        text,
-                    );
+                    const generation = try memo.generation(embedder, requestEmbeddingName(request));
+                    const forced = containsName(force_names, requestArtifactName(request)) or containsName(force_names, requestEmbeddingName(request));
+                    const key_value = GeneratedEmbeddingMemo.keyAtRevision(try GeneratedEmbeddingMemo.keyForRequest(memo.alloc, self.core.*.store, request, text, forced), generation.revision);
                     if (memo.dense.contains(key_value) or pending.contains(key_value)) {
                         memo.alloc.free(text);
                         text_owned = false;
                         continue;
                     }
-                    if (try prewarmGeneratedMemoFromArtifact(self, memo, request, text, key_value)) {
+                    if (try prewarmGeneratedMemoFromArtifact(self, memo, request, text, key_value, !forced)) {
                         memo.alloc.free(text);
                         text_owned = false;
                         continue;
@@ -1586,7 +1368,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         batch_bytes = 0;
                     }
                     try pending.put(memo.alloc, key_value, {});
-                    try jobs.append(memo.alloc, .{ .key = key_value, .text = text, .request = request });
+                    try jobs.append(memo.alloc, .{ .key = key_value, .text = text, .request = request, .generation = generation });
                     text_owned = false;
                     batch_bytes += text.len;
                     if (jobs.items.len >= max_items or batch_bytes >= max_bytes) {
@@ -1605,8 +1387,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             request: enrichment_types.GeneratedEnrichmentRequest,
             text: []const u8,
             key_value: GeneratedEmbeddingMemo.Key,
+            reuse_unchanged: bool,
         ) !bool {
-            if (!memo.reuse_stored_artifacts) return false;
+            if (!memo.reuse_stored_artifacts and !reuse_unchanged) return false;
             const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(memo.alloc, request.doc_key, requestEmbeddingName(request));
             defer memo.alloc.free(artifact_key);
             const raw = S.ownerField(self, "core").*.store.get(memo.alloc, artifact_key) catch |err| switch (err) {
@@ -1615,7 +1398,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             defer memo.alloc.free(raw);
             const source_hash = enrichment_artifact_codec.sourceHash(raw) catch return false;
-            if (source_hash == null or source_hash.? != enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation)) return false;
+            const expected_hash = if (request.kind == .dense_embedding) dense: {
+                const revision = if (S.ownerField(self, "enrichment_runtime").*) |runtime|
+                    if (runtime.config.dense_embedder) |provider| (try memo.generation(provider, requestEmbeddingName(request))).revision else null
+                else
+                    null;
+                break :dense enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, text, revision);
+            } else sparse: {
+                const runtime = S.ownerField(self, "enrichment_runtime").* orelse return false;
+                const provider = runtime.config.sparse_embedder orelse return false;
+                break :sparse enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, text, try memo.sparseRevision(provider, requestEmbeddingName(request)));
+            };
+            if (source_hash == null or source_hash.? != expected_hash) return false;
             switch (request.kind) {
                 .dense_embedding => {
                     const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch return false;
@@ -1653,8 +1447,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             precompute_mode: GeneratedPrecomputeMode,
             plan: *const GeneratedBatchWritePlan,
             memo: *GeneratedEmbeddingMemo,
+            force_names: []const []const u8,
         ) !void {
-            if (S.ownerField(self, "enrichment_runtime").* == null or S.ownerField(self, "enrichment_runtime").*.?.config.sparse_embedder == null) return;
+            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
+            const embedder = runtime.config.sparse_embedder orelse return;
             var jobs = std.ArrayListUnmanaged(GeneratedSparseMemoJob).empty;
             defer {
                 clearGeneratedSparseMemoJobs(memo.alloc, &jobs);
@@ -1685,20 +1481,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     var text_owned = true;
                     errdefer if (text_owned) memo.alloc.free(text);
-                    const key_value = GeneratedEmbeddingMemo.key(
-                        .sparse_embedding,
-                        requestEmbeddingName(request),
-                        request.producer_json,
-                        request.execution_json,
-                        0,
-                        text,
-                    );
+                    const revision = try memo.sparseRevision(embedder, requestEmbeddingName(request));
+                    const forced = containsName(force_names, requestArtifactName(request)) or containsName(force_names, requestEmbeddingName(request));
+                    const key_value = GeneratedEmbeddingMemo.keyAtRevision(try GeneratedEmbeddingMemo.keyForRequest(memo.alloc, self.core.*.store, request, text, forced), revision);
                     if (memo.sparse.contains(key_value) or pending.contains(key_value)) {
                         memo.alloc.free(text);
                         text_owned = false;
                         continue;
                     }
-                    if (try prewarmGeneratedMemoFromArtifact(self, memo, request, text, key_value)) {
+                    if (try prewarmGeneratedMemoFromArtifact(self, memo, request, text, key_value, !forced)) {
                         memo.alloc.free(text);
                         text_owned = false;
                         continue;
@@ -1718,7 +1509,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         batch_bytes = 0;
                     }
                     try pending.put(memo.alloc, key_value, {});
-                    try jobs.append(memo.alloc, .{ .key = key_value, .text = text, .request = request });
+                    try jobs.append(memo.alloc, .{ .key = key_value, .text = text, .request = request, .revision = revision });
                     text_owned = false;
                     batch_bytes += text.len;
                     if (jobs.items.len >= max_items or batch_bytes >= max_bytes) {
@@ -1747,6 +1538,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (schema.ttl_duration_ns != 0) try prepared.requireLogicalField(schema.ttl_field);
             if (plan) |snapshot| {
+                if (snapshot.external_vector_spaces.count() != 0) try prepared.requireLogicalField("metadata");
                 if (snapshot.group_sources) |group_plan| for (group_plan.entries) |entry| {
                     if (entry.source.filter != .null) {
                         try prepared.requireLogicalRoot();
@@ -1780,7 +1572,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             schema: schema_mod.TableSchema,
             fallback_timestamp_ns: u64,
             value: std.json.Value,
-        ) !u64 {
+        ) !i128 {
             if (schema.ttl_duration_ns == 0) return fallback_timestamp_ns;
             const root = switch (value) {
                 .object => |object| object,
@@ -1791,15 +1583,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try ttlTimestampNsFromJsonValue(ttl_value);
         }
 
-        pub fn resolveWriteTimestampFromValue(self: anytype, fallback_timestamp_ns: u64, value: std.json.Value) !u64 {
+        pub fn resolveWriteTimestampFromValue(self: anytype, fallback_timestamp_ns: u64, value: std.json.Value) !i128 {
             const schema = S.ownerField(self, "core").*.schema orelse return fallback_timestamp_ns;
             return try resolveWriteTimestampForSchemaValue(schema, fallback_timestamp_ns, value);
         }
 
-        pub fn resolveWriteTimestampNs(self: anytype, fallback_timestamp_ns: u64, value_json: []const u8) !u64 {
+        pub fn resolveWriteTimestampNs(self: anytype, fallback_timestamp_ns: u64, value_json: []const u8) !i128 {
             const schema = S.ownerField(self, "core").*.schema orelse return fallback_timestamp_ns;
             if (schema.ttl_duration_ns == 0) return fallback_timestamp_ns;
-            return (try ttlTimestampNsFromDocumentValue(S.ownerField(self, "alloc").*, schema, value_json)) orelse fallback_timestamp_ns;
+            return (try ttlTimestampNsFromDocumentValue(S.ownerField(self, "alloc").*, schema, value_json)) orelse @as(i128, fallback_timestamp_ns);
         }
 
         pub fn retainPreparedTextRoots(sync_level: types.SyncLevel, has_text_consumers: bool, split_shadow: bool) bool {
@@ -1812,11 +1604,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             request: enrichment_types.GeneratedEnrichmentRequest,
         ) !bool {
             _ = self;
+            // Managed privacy work publishes through the ordered producer lane.
+            // Synchronous source commits cannot substitute a local skip-state
+            // digest for the receiver-owned producer witness used by serving.
+            for ([_][]const u8{ request.artifact_name, request.embedding_name, request.upstream_artifact_name }) |name| {
+                if (std.mem.startsWith(u8, name, "_privacy_")) return false;
+            }
             // Neighbor context depends on committed adjacency, including graph effects
             // in this batch. The precommit producer path has neither that snapshot nor
             // the composed neighbor input/skip hash. Retain this request for postcommit
             // replay; synchronous levels still wait for its generated coverage there.
             if (request.requires_committed_graph or request.neighbor_context_json.len != 0) return false;
+            // An upstream asset's field is not a field of the primary row.
+            // Chunk/vector descendants must consume accepted producer bytes
+            // after commit, with the upstream causal witness. Precomputing them
+            // here could publish empty chunks and incorrectly settle coverage.
+            if (request.kind != .asset and request.upstream_artifact_name.len != 0) return false;
             // PDF page embeddings require their renderer, page-stage namespace
             // and capability lease. The ordinary text precompute path must not
             // embed the source URL as if it were document text.
@@ -1848,8 +1651,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             alloc: Allocator,
             schema: schema_mod.TableSchema,
             value_json: []const u8,
-        ) !?u64 {
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+        ) !?i128 {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
             defer parsed.deinit();
             const root = switch (parsed.value) {
                 .object => |object| object,
@@ -1860,24 +1663,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try ttlTimestampNsFromJsonValue(ttl_value);
         }
 
-        pub fn ttlTimestampNsFromJsonValue(value: std.json.Value) !u64 {
-            return switch (value) {
-                .integer => |integer| blk: {
-                    if (integer < 0) return error.InvalidArgument;
-                    break :blk std.math.cast(u64, integer) orelse return error.InvalidArgument;
-                },
-                .number_string => |text| std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch return error.InvalidArgument,
-                .string => |text| ttlTimestampNsFromString(text),
-                else => error.InvalidArgument,
-            };
+        pub fn ttlTimestampNsFromJsonValue(value: std.json.Value) !i128 {
+            return @import("../ttl.zig").parseSourceTimestamp(value) catch return error.InvalidArgument;
         }
 
-        pub fn ttlTimestampNsFromString(text: []const u8) !u64 {
-            const trimmed = std.mem.trim(u8, text, " \t\r\n");
-            if (trimmed.len == 0) return error.InvalidArgument;
-            if (std.fmt.parseInt(u64, trimmed, 10)) |ts| return ts else |_| {}
-            if (try parsePatternRfc3339ToNs(trimmed)) |ts| return ts;
-            return error.InvalidArgument;
+        pub fn ttlTimestampNsFromString(text: []const u8) !i128 {
+            return ttlTimestampNsFromJsonValue(.{ .string = text });
+        }
+
+        pub fn encodeDocumentTimestampValue(alloc: Allocator, fallback_version: u64, source: i128, restored_version: ?u64) ![]u8 {
+            // Event time is immutable across corrections; it cannot fence a
+            // mutation. Only replay restores a version from the source owner.
+            const version = restored_version orelse fallback_version;
+            return @import("../ttl.zig").encodeTimestampAlloc(alloc, version, source);
         }
 
         pub fn prepareRelationalRows(
@@ -2066,6 +1864,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 return;
                             };
                         }
+                        if (ctx.write_plan) |pinned_write_plan| {
+                            pinned_write_plan.validateExternalVectorSpacesParsed(scratch_arena.allocator(), prepared.extracted.dense_embeddings, prepared.parsedValue()) catch |err| {
+                                prepared.deinit(owner_alloc);
+                                ctx.fail(err);
+                                return;
+                            };
+                        }
                         if (prepared.extracted.hasDocument()) {
                             if (ctx.db) |owner_db| if (ctx.write_plan) |pinned_write_plan|
                                 owner_db.validateInlineSources(
@@ -2089,7 +1894,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     ctx.fail(err);
                                     return;
                                 });
-                                prepared.finalizeMetadata(write_timestamp_ns) catch |err| {
+                                const write_version = std.math.cast(u64, write_timestamp_ns) orelse {
+                                    prepared.deinit(owner_alloc);
+                                    ctx.fail(error.InvalidArgument);
+                                    return;
+                                };
+                                prepared.finalizeMetadata(write_version) catch |err| {
                                     prepared.deinit(owner_alloc);
                                     ctx.fail(err);
                                     return;
@@ -2113,6 +1923,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 return;
                             };
                         };
+                        if (ctx.write_plan) |*pinned_write_plan| {
+                            index_manager_mod.IndexManager.validateExternalVectorSpacesInPlan(scratch_arena.allocator(), pinned_write_plan, prepared.extracted.dense_embeddings, prepared.parsedValue()) catch |err| {
+                                prepared.deinit(owner_alloc);
+                                ctx.fail(err);
+                                return;
+                            };
+                        }
                         prepared.releaseParsed();
                         ctx.rows[index] = prepared;
                         _ = scratch_arena.reset(.retain_capacity);

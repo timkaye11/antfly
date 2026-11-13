@@ -53,6 +53,7 @@ ARCHIVES = {
             "serverless",
             "inference",
             "api_kernel",
+            "local_query",
         )
     ),
 }
@@ -141,14 +142,19 @@ def control_catalog_contents() -> str:
     names = set()
     for line in (local / "source_catalog.zig").read_text().splitlines(keepends=True):
         declaration = re.fullmatch(
-            r'pub const (?P<name>\w+) = @import\("(?P<path>[^"\n]+\.zig)"\);\n?', line
+            r"pub const (?P<name>\w+) = (?P<expression>[^\n]+);\n?", line
         )
         if declaration:
             name = declaration["name"]
             if name in names:
                 raise ValueError(f"duplicate source catalog entry: {name}")
             names.add(name)
-        if declaration and requires_physical((local / declaration["path"]).resolve()):
+        if declaration and any(
+            requires_physical((local / relative).resolve())
+            for token in IMPORT_TOKENS.finditer(declaration["expression"])
+            if (relative := token.group("path")) is not None
+            and relative.endswith(".zig")
+        ):
             continue
         output.append(line)
     output.insert(
@@ -619,6 +625,7 @@ def partition_cases(cases):
         "physical local query": 411,
         "consumer test root": 78,
         "owner integration test": 51,
+        "opaque query dispatcher": 30,
     }
     groups = [[], []]
     loads = [0, 0]
@@ -683,9 +690,9 @@ def main() -> None:
             (
                 "read coordination",
                 "api/table_reads.zig",
-                # A retained multi-range cut leases its DB generations inside
-                # the physical owner and reuses the canonical read merger.
-                # Both owners must therefore invalidate this shared source.
+                # The physical kernel owns retained-read execution; distributed
+                # coordination imports this source too. The opaque query
+                # dispatcher must remain independent of both implementations.
                 {"antfly-runtime-distributed", "antfly-storage-kernel"},
                 (ARCHIVES - {"antfly-runtime-distributed", "antfly-storage-kernel"})
                 | {"storage-owner-tests", "storage-owner-enrichment-tests"},
@@ -722,6 +729,18 @@ def main() -> None:
                 | CONSUMERS,
             ),
             (
+                "opaque query dispatcher",
+                "storage/local_query_dispatch.zig",
+                {"antfly-runtime-local_query"},
+                (ARCHIVES - {"antfly-runtime-local_query"})
+                | CONSUMERS
+                | {
+                    "storage-owner-tests",
+                    "storage-owner-source-tests",
+                    "storage-owner-enrichment-tests",
+                },
+            ),
+            (
                 "owner integration test",
                 "storage/kernel_owner_test.zig",
                 {"storage-owner-tests"},
@@ -743,6 +762,7 @@ def main() -> None:
                 },
                 {
                     "antfly-runtime-cli",
+                    "antfly-runtime-local_query",
                     "antfly-runtime-enrichment_compute",
                     "antfly-runtime-inference",
                     "storage-owner-enrichment-tests",

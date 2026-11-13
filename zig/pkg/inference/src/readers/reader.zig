@@ -320,6 +320,23 @@ pub const LoadedReader = union(enum) {
         model_manager: *model_manager_mod.ModelManager,
         control: ?InferenceExecutionControl,
     ) !LoadedReader {
+        const io = if (control) |active| active.io orelse session_manager.io orelse std.Options.debug_io else session_manager.io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, io, model_path);
+        defer publication_lease.deinit(io);
+        if (control) |active| try active.verifyModelSelection(allocator, io, model_path);
+        var result = try loadSelectedReader(allocator, model_path, session_manager, model_manager, control);
+        errdefer result.deinit();
+        if (control) |active| try active.verifyModelSelection(allocator, io, model_path);
+        return result;
+    }
+
+    fn loadSelectedReader(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        session_manager: *backends.SessionManager,
+        model_manager: *model_manager_mod.ModelManager,
+        control: ?InferenceExecutionControl,
+    ) !LoadedReader {
         if (try multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
             return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDirWithControl(
                 allocator,
@@ -365,9 +382,10 @@ pub const LoadedReader = union(enum) {
     pub fn acquireExecutionFence(
         model_path: []const u8,
         model_manager: *model_manager_mod.ModelManager,
+        control: InferenceExecutionControl,
     ) !?ExecutionFence {
-        var handle = model_manager.acquireFromDir(model_path) catch |err| switch (err) {
-            error.OutOfMemory => return err,
+        var handle = model_manager.acquireFromDirWithControl(model_path, control) catch |err| switch (err) {
+            error.OutOfMemory, error.ModelArtifactsChanging, error.IncompleteManagedDownload, error.ModelInventoryChanged, error.Canceled, error.Cancelled, error.Timeout => return err,
             // The direct typed loader remains responsible for reporting model
             // layout and publication failures. Broker eligibility is optional.
             else => return null,
@@ -620,7 +638,7 @@ pub fn probeManifest(
     man: manifest_mod.ModelManifest,
 ) !ReaderSupport {
     const multistage = multistage_metadata.isMultiStageModelDir(allocator, model_path) catch |err| switch (err) {
-        error.InvalidMetadata, error.FileTooLarge, error.IsDir, error.SymLinkLoop => return .{ .unsupported = .invalid_metadata },
+        error.InvalidMetadata, error.FileTooLarge, error.IsDir, error.SymLinkLoop, error.ChecksumMismatch => return .{ .unsupported = .invalid_metadata },
         else => return err,
     };
     if (multistage) return .{ .supported = .multistage };
@@ -1209,18 +1227,20 @@ test "reader capability probe distinguishes unsupported metadata and preserves a
 test "Moondream readers route natively only with native checkpoint artifacts" {
     const allocator = std.testing.allocator;
     const man = manifest_mod.ModelManifest{ .allocator = allocator };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const missing_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "missing-moondream2" });
+    defer allocator.free(missing_dir);
     // Missing or ONNX-only Moondream directories stay unsupported and fail
     // closed without loading anything.
-    const support = try probeManifest(allocator, "models/readers/vikhyatk/moondream2", man);
+    const support = try probeManifest(allocator, missing_dir, man);
     try std.testing.expectEqual(UnsupportedReason.unsupported_moondream_artifacts, support.unsupported);
     var session_manager = backends.SessionManager.init(allocator);
     try std.testing.expectError(
         error.UnsupportedMoondreamArtifacts,
-        LoadedReader.loadFromDirWithControl(allocator, "models/readers/vikhyatk/moondream2", &session_manager, undefined, null),
+        LoadedReader.loadFromDirWithControl(allocator, missing_dir, &session_manager, undefined, null),
     );
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "moondream2");
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "moondream2" });
     defer allocator.free(model_dir);

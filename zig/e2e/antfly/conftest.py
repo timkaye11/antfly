@@ -1257,7 +1257,13 @@ def _data_command(
 
 class StatefulAntflyServer:
     def __init__(
-        self, binary: str, host: str, port: int, *, auth_enabled: bool = False
+        self,
+        binary: str,
+        host: str,
+        port: int,
+        *,
+        auth_enabled: bool = False,
+        data_config: dict | None = None,
     ):
         self.binary = binary
         self.host = host
@@ -1277,6 +1283,12 @@ class StatefulAntflyServer:
             )
             setup.callback(self.tempdir.cleanup)
             self.root = Path(self.tempdir.name)
+            self.data_config_path = None
+            if data_config is not None:
+                self.data_config_path = self.root / "data-config.json"
+                self.data_config_path.write_text(
+                    json.dumps(data_config), encoding="utf-8"
+                )
             self.replica_root = self.root / "data-replicas"
             self.metadata_log_path = self.root / "metadata.log"
             self.data_log_path = self.root / "data.log"
@@ -1343,6 +1355,8 @@ class StatefulAntflyServer:
             root=self.root,
             auth_enabled=self.auth_enabled,
         )
+        if self.data_config_path is not None:
+            data_command.extend(["--config", str(self.data_config_path)])
         self.data_proc = self.port_reservations.handoff_to(
             (self.port, self.data_raft_port),
             lambda: subprocess.Popen(
@@ -1583,14 +1597,18 @@ class StandaloneAntflyServer:
         self.log_file.flush()
         return _read_log_tail(self.log_path)
 
-    def _stop_process(self) -> None:
+    def _stop_process(self, *, crash: bool = False) -> None:
         if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGTERM)
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
+            if crash:
                 self.proc.kill()
                 self.proc.wait()
+            else:
+                self.proc.send_signal(signal.SIGTERM)
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait()
         self.proc = None
 
     def restart(self) -> None:
@@ -1599,8 +1617,12 @@ class StandaloneAntflyServer:
         self.log_file = self.log_path.open("a")
         self._start_process(truncate_logs=False)
 
-    def pause(self) -> None:
-        self._stop_process()
+    def pause(self, *, crash: bool = False) -> None:
+        """Stop and reserve endpoints; crash skips graceful worker draining."""
+        if crash:
+            self._stop_process(crash=True)
+        else:
+            self._stop_process()
         self.port_reservations.ensure_reserved(self.port)
         if self.pgwire_port is not None:
             self.port_reservations.ensure_reserved(self.pgwire_port)
@@ -2641,11 +2663,22 @@ class InferenceEmbeddingServer:
         with self._transient_embedding_lock:
             return self._transient_embedding_requests
 
+    @property
+    def embedding_delay_blocked(self) -> bool:
+        """The explicit gate still owns an admitted corpus request."""
+        return (
+            self.response_delay_s is None
+            and self._delay_enabled.is_set()
+            and self._embedding_request_active.is_set()
+            and not self._delay_released.is_set()
+        )
+
     def release_delay(self) -> None:
         self._delay_enabled.clear()
         self._delay_released.set()
 
     def stop(self) -> None:
+        self.release_delay()
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5)

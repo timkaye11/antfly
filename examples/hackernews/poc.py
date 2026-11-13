@@ -66,6 +66,19 @@ class RequestFailure(RuntimeError):
             "resource_exhausted",
             "too_many_requests",
             "temporarily_unavailable",
+            "metadata_leader_unavailable",
+            # Stable QueryTemporarilyUnavailableReason values from the public
+            # query contract. Preserve the reason, never the provider message.
+            "decision_provider_unavailable",
+            "doc_identity_unavailable",
+            "read_requires_primary",
+            "standby_read_unavailable",
+            "distributed_query_unavailable",
+            "storage_read_temporarily_unavailable",
+            "metric_not_ready",
+            "metric_stale",
+            "query_embedding_temporarily_unavailable",
+            "reranker_temporarily_unavailable",
             "invalid_request",
             "unsupported_exact_sort",
             "unsupported_query",
@@ -87,7 +100,9 @@ class RequestFailure(RuntimeError):
         return cls(record)
 
     @classmethod
-    def transport(cls, method, path, error, elapsed_ms):
+    def transport(
+        cls, method, path, error, elapsed_ms, *, phase=None, response_status=None
+    ):
         reason = error.reason if isinstance(error, urllib.error.URLError) else error
         record = {
             "method": method,
@@ -98,6 +113,12 @@ class RequestFailure(RuntimeError):
         }
         if type(getattr(reason, "errno", None)) is int:
             record["errno"] = reason.errno
+        if phase in {"connect_or_headers", "response_body"}:
+            record["transport_phase"] = phase
+        # Separate from http_status: a broken body is still a transport failure,
+        # even after 200 headers, and must retain the existing resume policy.
+        if type(response_status) is int and 100 <= response_status <= 599:
+            record["response_status"] = response_status
         return cls(record)
 
 
@@ -118,6 +139,7 @@ def gcs_bearer(project, minimum_seconds=1800):
             check=True,
             capture_output=True,
             text=True,
+            timeout=60,
         )
         credential = json.loads(result.stdout)["credential"]
         expiry = datetime.datetime.fromisoformat(credential["token_expiry"])
@@ -201,6 +223,25 @@ def lake_metric_deltas(before, after):
         key: value - before.get(key, 0)
         for key, value in after.items()
         if key.split("{", 1)[0].endswith("_total")
+    }
+
+
+def publication_profile(before, after, elapsed_seconds, fresh_registration):
+    """Keep construction counters separate from retained inventories and queries."""
+    keys = {
+        key
+        for key in before.keys() & after.keys()
+        if key.startswith("antfly_objectstore_") and key.endswith("_total")
+    }
+    valid = bool(keys) and all(after[key] >= before[key] for key in keys)
+    return {
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "fresh_registration": fresh_registration,
+        "counters_available": valid,
+        "object_operations": {key: after[key] - before[key] for key in sorted(keys)}
+        if valid
+        else None,
+        "scope": "Linked API-runtime logical object operations from before registration through all index readiness checks; includes background/nested calls, excludes later SQL/search queries and separately compiled native owners. Not provider billing or a retained-object inventory.",
     }
 
 
@@ -1024,7 +1065,10 @@ def main():
     try:
         start()
         existing = call("GET", "/tables")
+        publication_metrics_before = lake_metrics()
+        publication_started = time.monotonic()
         registration_seconds = 0
+        fresh_registration = False
         if "hn_archive_poc" not in json.dumps(existing):
             registration_started = time.monotonic()
             call(
@@ -1058,6 +1102,7 @@ def main():
                 },
             )
             registration_seconds = round(time.monotonic() - registration_started, 2)
+            fresh_registration = True
         phase = "index_build"
         started = time.monotonic()
         build_before = resource_counters()
@@ -1099,6 +1144,12 @@ def main():
                 metadata_status[column]
             )
         phase = "row_count"
+        publication_io = publication_profile(
+            publication_metrics_before,
+            lake_metrics(),
+            time.monotonic() - publication_started,
+            fresh_registration,
+        )
         count = call(
             "POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn_archive_poc"}
         )
@@ -1110,6 +1161,7 @@ def main():
                         "rows": args.expected_rows,
                         "ready_seconds": ready_seconds,
                         "registration_seconds": registration_seconds,
+                        "publication_io": publication_io,
                         "metadata_indexes_queryable": list(metadata_status),
                         "query_measurements_performed": False,
                     },
@@ -1184,6 +1236,9 @@ def main():
             ]
             warm_samples.append(elapsed)
         warm_ms = round(statistics.median(warm_samples), 2)
+        # Capture request-local slow gauges once outside the uninterrupted burst.
+        # A later restart must not erase the evidence for an archive outlier.
+        archive_warm_metrics = lake_metrics()
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             concurrent_samples = list(
                 pool.map(
@@ -1613,6 +1668,7 @@ def main():
             "composed_benchmarks": composed_benchmarks,
             "cache_files_before_search": cache_files_before_search,
             "warm_samples_ms": warm_samples,
+            "archive_warm_metrics": archive_warm_metrics,
             "concurrent_search_ms": [elapsed for _, elapsed in concurrent_samples],
             "concurrency": args.concurrency,
             "cursor_retention_ms": args.cursor_retention_ms,
@@ -1642,6 +1698,7 @@ def main():
             ),
             "registration_seconds": registration_seconds,
             "build_profile": build_profile,
+            "publication_io": publication_io,
             "build_peak_rss_bytes": peak_rss_bytes,
             "first_search_ms": first_ms,
             "warm_search_ms": warm_ms,
@@ -1708,12 +1765,14 @@ def main():
         for name, target in (
             ("first_ms", "first_search_ms"),
             ("warm_samples", "warm_samples_ms"),
+            ("archive_warm_metrics", "archive_warm_metrics"),
             ("workload_results", "workloads"),
             ("cursor_depth", "cursor_depth"),
             ("restart_ms", "after_restart_ms"),
             ("io_profiles", "io_profiles"),
             ("ready_seconds", "ready_seconds"),
             ("build_profile", "build_profile"),
+            ("publication_io", "publication_io"),
             ("filter_results", "metadata_filters"),
             ("count", "sql_count"),
             ("composed_benchmarks", "composed_benchmarks"),

@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.document_extraction_config_checksum_algorithm import DocumentExtractionConfigChecksumAlgorithm
 from ..models.document_extraction_config_route_preset import DocumentExtractionConfigRoutePreset
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.document_extraction_native_text_config import DocumentExtractionNativeTextConfig
     from ..models.document_extraction_ocr_config import DocumentExtractionOcrConfig
     from ..models.document_extraction_route import DocumentExtractionRoute
     from ..models.document_extraction_source_config import DocumentExtractionSourceConfig
@@ -45,11 +47,22 @@ class DocumentExtractionConfig:
             content_type (str | Unset): Static content type. Overrides the downloaded response's content type.
             etag (str | Unset): Static ETag recorded as source version metadata.
             checksum (str | Unset): Static checksum recorded as source version metadata.
+            checksum_algorithm (DocumentExtractionConfigChecksumAlgorithm | Unset): Declares that `checksum` (or the row
+                value named by `source.checksum_field`) is a digest of the original bytes, computed with this algorithm. When
+                set and the row carries a well-formed digest, extraction identifies the row by that digest instead of by its
+                location (URL, ETag, version, last-modified), so copying, re-hosting, or renaming a source does not force re-
+                extraction as long as the bytes are unchanged. The downloaded bytes are verified against the declared digest; a
+                mismatch fails extraction instead of keeping stale output alive. A present but malformed digest is also an
+                error, never a silent fall back to location-based identity. Leaving this unset preserves prior behavior byte for
+                byte, including for rows that only set `checksum_field`.
             version (str | Unset): Static source version. Together with the other metadata it lets extraction skip unchanged
                 sources.
             last_modified (str | Unset): Static last-modified timestamp recorded as source version metadata.
             credentials (str | Unset): Credential reference used to download the source URL.
             html_strip_tags (bool | Unset): Strip HTML markup from HTML sources before storing their text. Default: True.
+            native_text (DocumentExtractionNativeTextConfig | Unset): Native document text policy and quality assessment. No
+                OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR
+                availability.
             ocr (DocumentExtractionOcrConfig | Unset): Reads scanned pages and images. Name exactly one of `reader` or
                 `generator`. Readers run their own OCR task; generators receive a transcription instruction.
             transcription (DocumentExtractionTranscriptionConfig | Unset): Transcribes audio units.
@@ -67,10 +80,12 @@ class DocumentExtractionConfig:
     content_type: str | Unset = UNSET
     etag: str | Unset = UNSET
     checksum: str | Unset = UNSET
+    checksum_algorithm: DocumentExtractionConfigChecksumAlgorithm | Unset = UNSET
     version: str | Unset = UNSET
     last_modified: str | Unset = UNSET
     credentials: str | Unset = UNSET
     html_strip_tags: bool | Unset = True
+    native_text: DocumentExtractionNativeTextConfig | Unset = UNSET
     ocr: DocumentExtractionOcrConfig | Unset = UNSET
     transcription: DocumentExtractionTranscriptionConfig | Unset = UNSET
     route_preset: DocumentExtractionConfigRoutePreset | Unset = DocumentExtractionConfigRoutePreset.MIXED_FILES
@@ -90,6 +105,10 @@ class DocumentExtractionConfig:
 
         checksum = self.checksum
 
+        checksum_algorithm: str | Unset = UNSET
+        if not isinstance(self.checksum_algorithm, Unset):
+            checksum_algorithm = self.checksum_algorithm.value
+
         version = self.version
 
         last_modified = self.last_modified
@@ -97,6 +116,10 @@ class DocumentExtractionConfig:
         credentials = self.credentials
 
         html_strip_tags = self.html_strip_tags
+
+        native_text: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.native_text, Unset):
+            native_text = self.native_text.to_dict()
 
         ocr: dict[str, Any] | Unset = UNSET
         if not isinstance(self.ocr, Unset):
@@ -130,6 +153,8 @@ class DocumentExtractionConfig:
             field_dict["etag"] = etag
         if checksum is not UNSET:
             field_dict["checksum"] = checksum
+        if checksum_algorithm is not UNSET:
+            field_dict["checksum_algorithm"] = checksum_algorithm
         if version is not UNSET:
             field_dict["version"] = version
         if last_modified is not UNSET:
@@ -138,6 +163,8 @@ class DocumentExtractionConfig:
             field_dict["credentials"] = credentials
         if html_strip_tags is not UNSET:
             field_dict["html_strip_tags"] = html_strip_tags
+        if native_text is not UNSET:
+            field_dict["native_text"] = native_text
         if ocr is not UNSET:
             field_dict["ocr"] = ocr
         if transcription is not UNSET:
@@ -151,6 +178,7 @@ class DocumentExtractionConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.document_extraction_native_text_config import DocumentExtractionNativeTextConfig
         from ..models.document_extraction_ocr_config import DocumentExtractionOcrConfig
         from ..models.document_extraction_route import DocumentExtractionRoute
         from ..models.document_extraction_source_config import DocumentExtractionSourceConfig
@@ -172,6 +200,13 @@ class DocumentExtractionConfig:
 
         checksum = d.pop("checksum", UNSET)
 
+        _checksum_algorithm = d.pop("checksum_algorithm", UNSET)
+        checksum_algorithm: DocumentExtractionConfigChecksumAlgorithm | Unset
+        if isinstance(_checksum_algorithm, Unset):
+            checksum_algorithm = UNSET
+        else:
+            checksum_algorithm = DocumentExtractionConfigChecksumAlgorithm(_checksum_algorithm)
+
         version = d.pop("version", UNSET)
 
         last_modified = d.pop("last_modified", UNSET)
@@ -179,6 +214,13 @@ class DocumentExtractionConfig:
         credentials = d.pop("credentials", UNSET)
 
         html_strip_tags = d.pop("html_strip_tags", UNSET)
+
+        _native_text = d.pop("native_text", UNSET)
+        native_text: DocumentExtractionNativeTextConfig | Unset
+        if isinstance(_native_text, Unset):
+            native_text = UNSET
+        else:
+            native_text = DocumentExtractionNativeTextConfig.from_dict(_native_text)
 
         _ocr = d.pop("ocr", UNSET)
         ocr: DocumentExtractionOcrConfig | Unset
@@ -216,10 +258,12 @@ class DocumentExtractionConfig:
             content_type=content_type,
             etag=etag,
             checksum=checksum,
+            checksum_algorithm=checksum_algorithm,
             version=version,
             last_modified=last_modified,
             credentials=credentials,
             html_strip_tags=html_strip_tags,
+            native_text=native_text,
             ocr=ocr,
             transcription=transcription,
             route_preset=route_preset,

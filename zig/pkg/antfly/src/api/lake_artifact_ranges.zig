@@ -108,13 +108,12 @@ const Job = struct {
     }
     fn read(self: *Job, alloc: A) ![]u8 {
         const token: Token = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = check };
-        const bytes = self.store.getRangeAllocWithCancellationUsingAllocator(alloc, self.id, self.begin, self.length, token) catch |err| {
+        const bytes = artifacts.readPhysicalRange(alloc, self.store, self.id, self.begin, self.length, token, self.cached) catch |err| {
             try check(self);
             return err;
         };
         errdefer alloc.free(bytes);
         if (bytes.len != self.length) return error.ArtifactIntegrityMismatch;
-        if (self.cached) |cache| cache.cache.recordPhysicalRead(bytes.len);
         // Shared physical flights publish only ranges whose requested pages
         // have been authenticated. Each waiter also validates its own units.
         for (self.units) |ref| {
@@ -303,7 +302,7 @@ fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: Outpu
         var jobs: [max_batch]Job = undefined;
         for (wave, jobs[0..wave.len]) |run, *job| job.* = .{ .store = store, .a = allocations.allocator(), .id = ordered[run.first].object.artifact_id, .units = ordered[run.first..run.end], .begin = run.offset, .length = run.length, .token = token, .cached = cached };
         defer for (jobs[0..wave.len]) |*job| job.deinit();
-        var ready: std.Io.Event = .unset;
+        var ready: local.sql_parallel_scheduler.Completion = .{};
         var tasks: [max_batch]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
         defer if (io) |active| for (&tasks) |*task| if (task.*) |*held| {
             held.cancel(active) catch {};

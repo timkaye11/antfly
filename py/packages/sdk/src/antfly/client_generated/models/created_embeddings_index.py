@@ -11,6 +11,7 @@ from ..models.dense_index_algorithm import DenseIndexAlgorithm
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
 from ..models.index_publication_policy import IndexPublicationPolicy
+from ..models.lake_bulk_build_algorithm import LakeBulkBuildAlgorithm
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -42,7 +43,11 @@ class CreatedEmbeddingsIndex:
         coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
             completeness.
         external (bool | Unset):  Default: False.
+        external_vector_space (str | Unset):
         sparse (bool | Unset):  Default: False.
+        lake_bulk_build (LakeBulkBuildAlgorithm | Unset): Offline clustering algorithm for fresh native Parquet lake HBC
+            indexes.
+        lake_bulk_build_max_input_bytes (int | Unset):
         dimension (int | Unset):
         field (str | Unset):
         sources (list[ArtifactIndexSource] | Unset): Embedding artifact streams indexed together as independent vector
@@ -81,7 +86,10 @@ class CreatedEmbeddingsIndex:
     publication_policy: IndexPublicationPolicy | Unset = UNSET
     coverage_policy: DerivedCoveragePolicy | Unset = UNSET
     external: bool | Unset = False
+    external_vector_space: str | Unset = UNSET
     sparse: bool | Unset = False
+    lake_bulk_build: LakeBulkBuildAlgorithm | Unset = UNSET
+    lake_bulk_build_max_input_bytes: int | Unset = UNSET
     dimension: int | Unset = UNSET
     field: str | Unset = UNSET
     sources: list[ArtifactIndexSource] | Unset = UNSET
@@ -126,7 +134,15 @@ class CreatedEmbeddingsIndex:
 
         external = self.external
 
+        external_vector_space = self.external_vector_space
+
         sparse = self.sparse
+
+        lake_bulk_build: str | Unset = UNSET
+        if not isinstance(self.lake_bulk_build, Unset):
+            lake_bulk_build = self.lake_bulk_build.value
+
+        lake_bulk_build_max_input_bytes = self.lake_bulk_build_max_input_bytes
 
         dimension = self.dimension
 
@@ -197,8 +213,14 @@ class CreatedEmbeddingsIndex:
             field_dict["coverage_policy"] = coverage_policy
         if external is not UNSET:
             field_dict["external"] = external
+        if external_vector_space is not UNSET:
+            field_dict["external_vector_space"] = external_vector_space
         if sparse is not UNSET:
             field_dict["sparse"] = sparse
+        if lake_bulk_build is not UNSET:
+            field_dict["lake_bulk_build"] = lake_bulk_build
+        if lake_bulk_build_max_input_bytes is not UNSET:
+            field_dict["lake_bulk_build_max_input_bytes"] = lake_bulk_build_max_input_bytes
         if dimension is not UNSET:
             field_dict["dimension"] = dimension
         if field is not UNSET:
@@ -277,7 +299,18 @@ class CreatedEmbeddingsIndex:
 
         external = d.pop("external", UNSET)
 
+        external_vector_space = d.pop("external_vector_space", UNSET)
+
         sparse = d.pop("sparse", UNSET)
+
+        _lake_bulk_build = d.pop("lake_bulk_build", UNSET)
+        lake_bulk_build: LakeBulkBuildAlgorithm | Unset
+        if isinstance(_lake_bulk_build, Unset):
+            lake_bulk_build = UNSET
+        else:
+            lake_bulk_build = LakeBulkBuildAlgorithm(_lake_bulk_build)
+
+        lake_bulk_build_max_input_bytes = d.pop("lake_bulk_build_max_input_bytes", UNSET)
 
         dimension = d.pop("dimension", UNSET)
 
@@ -357,7 +390,10 @@ class CreatedEmbeddingsIndex:
             publication_policy=publication_policy,
             coverage_policy=coverage_policy,
             external=external,
+            external_vector_space=external_vector_space,
             sparse=sparse,
+            lake_bulk_build=lake_bulk_build,
+            lake_bulk_build_max_input_bytes=lake_bulk_build_max_input_bytes,
             dimension=dimension,
             field=field,
             sources=sources,

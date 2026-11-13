@@ -1100,14 +1100,14 @@ pub const ChunkOutputs = struct {
 
 pub const ChunkSourceReference = struct {
     type: []const u8,
-    /// HTTP(S) or S3 object URI resolved through configured content security and credentials.
+    /// HTTP(S), S3, or absolute file:// URI resolved through configured content security and credentials. Local files require an explicit remote_content.security.allowed_paths allowlist.
     uri: []const u8,
     mime_type: []const u8,
-    /// Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read.
+    /// Quoted strong HTTP/S3 ETag, immutable S3 version ID, or lowercase SHA-256 hex digest for file_sha256. Local files are verified in a bounded streaming scan; unchanged files reuse a bounded process-local verification cache across continuation pages. Size, inode, mtime and ctime are checked around every range read.
     version: []const u8,
-    /// Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+    /// Defaults to strong_etag. S3 version IDs require S3 sources; file_sha256 requires a local file URI.
     version_kind: ?[]const u8 = null,
-    /// Exact immutable object length, verified against Content-Range.
+    /// Exact immutable object length, verified against Content-Range or local file metadata.
     length: i64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -1540,6 +1540,8 @@ pub const TextChunkOptions = struct {
     target_tokens: ?i64 = null,
     /// Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
     overlap_tokens: ?i64 = null,
+    /// Minimum non-whitespace Unicode scalar values in a fixed text chunk. Shorter chunks are omitted before storage and embedding; original source offsets are preserved. Zero disables filtering (default). Does not filter model-aware media windows or image/audio chunks.
+    min_chars: ?i64 = null,
     /// Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers.
     separator: ?[]const u8 = null,
 
@@ -1547,6 +1549,7 @@ pub const TextChunkOptions = struct {
     pub const openApiFieldMetadata = .{
         .{ "target_tokens", "target_tokens", true },
         .{ "overlap_tokens", "overlap_tokens", true },
+        .{ "min_chars", "min_chars", true },
         .{ "separator", "separator", true },
     };
 
@@ -1566,6 +1569,10 @@ pub const TextChunkOptions = struct {
         }
         if (self.overlap_tokens) |value| {
             try jw.objectField("overlap_tokens");
+            try jw.write(value);
+        }
+        if (self.min_chars) |value| {
+            try jw.objectField("min_chars");
             try jw.write(value);
         }
         if (self.separator) |value| {

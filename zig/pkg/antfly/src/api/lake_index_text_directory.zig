@@ -33,9 +33,9 @@ pub const Roots = struct {
     segments: ?tree.Ref = null,
     routing: ?tree.Ref = null,
     ordered: ?tree.Ref = null,
-    ordered_format: u8 = 0,
+    ordered_format: u8 = 2,
     pub fn validate(self: @This()) !void {
-        if (self.ordered_format > 2) return error.InvalidNativeLakeTextCorpus;
+        if (self.ordered_format != 2) return error.InvalidNativeLakeTextCorpus;
         if (self.files) |ref| try ref.validate();
         if (self.segments) |ref| try ref.validate();
         if (self.routing) |ref| try ref.validate();
@@ -43,6 +43,9 @@ pub const Roots = struct {
     }
 };
 pub const RouteFilter = struct { ptr: *anyopaque, keep: *const fn (*anyopaque, corpus.SegmentRouting) anyerror!bool };
+/// Synchronous observer of validated routing. Record storage is borrowed only
+/// for the call; observers cannot retain pointers into the cursor scratch arena.
+pub const RouteObserver = struct { ptr: *anyopaque, record: *const fn (*anyopaque, *const SegmentRecord) anyerror!void };
 pub const Interval = struct { lower: u32, count: u32 };
 pub const FileRecord = struct { file: state.File, manifest: Chunk };
 pub const SegmentRecord = struct {
@@ -163,18 +166,12 @@ const Reader = struct {
     publication: bool = false,
     pages: pages_mod.PageStore = undefined,
     fn init(self: *@This(), domain: Id) void {
-        self.pages = .{ .domain = domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = self.external_budget orelse &self.reads, .remaining_write_bytes = &self.writes, .read_cache = if (self.cached != null) .{ .ptr = self, .read = readPage } else null };
+        self.pages = .{ .domain = domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = self.external_budget orelse &self.reads, .remaining_write_bytes = &self.writes, .read_cache = if (self.cached) |*cached| @import("lake_index_navigation_pages.zig").cacheBinding(cached) else null };
         if (self.publication) self.pages.admitPublication();
     }
     fn check(self: *@This()) !void {
         try self.token.check();
         if (self.cached) |cached| try cached.context.ensureActive();
-    }
-    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: Id, token: Cancellation, budget: *u64) ![]u8 {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        try self.check();
-        try stores.chargeReadBudget(budget, length);
-        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.cached);
     }
 };
 fn key(id: Id, offset: usize) [36]u8 {
@@ -270,27 +267,8 @@ pub const Publisher = struct {
         const files = try self.files.finish(old.files);
         const segments = try self.segments.finish(old.segments);
         const routing = try self.routing.finish(old.routing);
-        const ordered = if (old.ordered_format != 2 and old.segments != null) rebuild: {
-            // One metadata-only migration preserves native payload generations.
-            var fresh = Mutations.init(self.metadata.group_arena.child_allocator, &self.manager, self.segments.destination);
-            defer fresh.deinit();
-            fresh.reduction = @import("lake_index_sort_directory.zig").reduce;
-            var cursor = try tree.Cursor.init(self.metadata.group_arena.child_allocator, self.segments.destination, segments, "", null);
-            defer cursor.deinit();
-            var region = std.heap.ArenaAllocator.init(self.metadata.group_arena.child_allocator);
-            defer region.deinit();
-            while (try cursor.next()) |entry| {
-                try self.token.check();
-                _ = region.reset(.retain_capacity);
-                const a = region.allocator();
-                if (entry.key.len != 36) return error.InvalidNativeLakeTextCorpus;
-                if (std.mem.readInt(u32, entry.key[32..36], .big) != 0) continue;
-                const value = try get(a, self.segments.destination, segments, entry.key[0..32].*);
-                const record = try parseSegment(a, value, .{ .allocate = .alloc_always });
-                try @import("lake_index_sort_directory.zig").mutate(a, &fresh, record.route, segmentPlanningBytes(record), false);
-            }
-            break :rebuild try fresh.finish(null);
-        } else try self.ordered.finish(old.ordered);
+        if (old.ordered_format != 2) return error.InvalidNativeLakeTextCorpus;
+        const ordered = try self.ordered.finish(old.ordered);
         return .{ .files = files, .segments = segments, .routing = routing, .ordered = ordered, .ordered_format = 2 };
     }
     pub fn deinit(self: *Publisher) void {
@@ -832,16 +810,30 @@ test "external lake exact segment admission skips missing unrelated descriptors 
         summary.* = null;
     }
     var group: corpus.FileGroup = .{ .file = .{ .id = "one-large-file", .digest = @splat(1) }, .segments = segments, .admissions = admissions, .summaries = summaries, .rows = &.{.{ .group = 0, .high = 0, .base = 0, .lower = 10, .count = 9 }} };
+    // Scoring admission must not fetch paged physical routes. The winner path
+    // still rejects a missing source proof rather than trusting the subset.
+    {
+        var paged = group;
+        paged.source_pages = &.{segments[0]}; // A real artifact, but not a source page.
+        paged.source_count = 1;
+        const descriptor = try put(ca, &store, paged, .none);
+        const descriptor_ref: @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .artifact_id = descriptor.artifact_id, .checksum = descriptor.checksum, .byte_len = descriptor.byte_len };
+        const admitted = try corpus.loadCachedAdmissions(ca, store, descriptor_ref, .none, null);
+        try std.testing.expectEqual(segments.len, admitted.segments.len);
+        try std.testing.expectEqual(admissions[0].doc_count, admitted.admissions[0].doc_count);
+        if (corpus.loadCachedFile(ca, store, descriptor_ref, .none, null)) |_| return error.InvalidSourceProofAccepted else |_| {}
+        var invalid = paged;
+        invalid.admissions = admissions[0..1];
+        const bad = try put(ca, &store, invalid, .none);
+        try std.testing.expectError(error.InvalidNativeLakeTextCorpus, corpus.loadCachedAdmissions(ca, store, .{ .kind = .text_segment, .artifact_id = bad.artifact_id, .checksum = bad.checksum, .byte_len = bad.byte_len }, .none, null));
+    }
     try prepare(ca, &store, &group, .none);
     const manifest = try put(ca, &store, group, .none);
     const roots = try publish(a, &store, &.{group}, &.{manifest}, &.{}, &.{}, .{}, .none, std.testing.io);
     const streamed = try publishManifests(a, &store, &.{manifest}, &.{}, .{}, store.upload_scope.?.domain, .none, std.testing.io);
     var historical = roots;
     historical.ordered_format = 0;
-    const migrated = try publishManifests(a, &store, &.{}, &.{}, historical, store.upload_scope.?.domain, .none, std.testing.io);
-    try std.testing.expectEqual(@as(u8, 2), migrated.ordered_format);
-    try std.testing.expect(migrated.segments.?.eql(roots.segments.?));
-    try std.testing.expectEqual(@as(u64, 18), migrated.ordered.?.records);
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, publishManifests(a, &store, &.{}, &.{}, historical, store.upload_scope.?.domain, .none, std.testing.io));
 
     try std.testing.expect(streamed.files.?.eql(roots.files.?));
     try std.testing.expect(streamed.segments.?.eql(roots.segments.?));
@@ -861,6 +853,10 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     const navigation = @import("lake_index_navigation_warming.zig");
     const warmed = try navigation.warmRoots(store, cached, &.{.{ .domain = root.domain, .ref = roots.routing.? }}, .none);
     try std.testing.expect(warmed > 0 and warmed <= navigation.max_pages);
+    const shared_pages: @import("lake_index_navigation_pages.zig").Reader = .{ .store = store, .domain = root.domain, .cached = cached, .token = .none };
+    var warmed_page = (try shared_pages.lookup(roots.routing.?)) orelse return error.WarmingDidNotRetainDecodedNavigation;
+    warmed_page.deinit(a);
+
     try std.testing.expectError(error.DeadlineExceeded, navigation.warmRoots(store, expired, &.{.{ .domain = root.domain, .ref = roots.routing.? }}, .none));
     var windows = try RoutingCursor.create(a, window_root, store, cached, .none);
     defer windows.deinit();
@@ -1125,6 +1121,7 @@ pub const RoutingCursor = struct {
     last_segment_docs: u32 = 0,
     pending: ?struct { identity: Id, bytes: u64, documents: u32 } = null,
     filter: ?RouteFilter = null,
+    observer: ?RouteObserver = null,
     included: bool = true,
     pruned: u32 = 0,
     pub const Window = struct { identities: []const Id, doc_offset: u64 };
@@ -1170,6 +1167,7 @@ pub const RoutingCursor = struct {
         self.emitted = std.math.add(u32, self.emitted, 1) catch return error.InvalidNativeLakeTextCorpus;
         self.documents = std.math.add(u64, self.documents, record.route.doc_count) catch return error.InvalidNativeLakeTextCorpus;
         if (self.emitted > self.root.segment_count) return error.InvalidNativeLakeTextCorpus;
+        if (self.observer) |observer| try observer.record(observer.ptr, &record);
         self.included = if (self.filter) |filter| try filter.keep(filter.ptr, record.route) else true;
         if (!self.included) self.pruned += 1;
         return corpus.term_directory.identity(record.route.ref.artifact_id);
@@ -1368,10 +1366,11 @@ test "external lake private metadata streams one bounded reduction under a live 
 
 /// A bounded fan-in over complete physical-layout cohorts. Incompatible runs
 /// are consumed exactly; compatible cohorts keep independent monotone cutoffs.
-const CohortCursor = struct {
+/// Complete ordered endpoint cover with bounded per-layout cohort streams.
+pub const SortCursor = struct {
     const directory = @import("lake_index_sort_directory.zig");
     const Stream = struct {
-        owner: *CohortCursor,
+        owner: *SortCursor,
         fields_arena: std.heap.ArenaAllocator,
         fields: []const local.segment.SegmentIndexSortField = &.{},
         lower: [33]u8 = undefined,
@@ -1393,14 +1392,14 @@ const CohortCursor = struct {
     pruned: bool = false,
     cursor_pruned: u64 = 0,
     cursor_pruned_subtrees: u64 = 0,
-    fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation, order: local.storage_db_query_search_exec.SearchHitOrder, selected: ?[]const Id) !?*CohortCursor {
+    pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation, order: local.storage_db_query_search_exec.SearchHitOrder, selected: ?[]const Id) !?*SortCursor {
         const ref = root.directories.ordered orelse return null;
         if (ref.records != @as(u64, root.segment_count) * 2) return null;
         if (selected) |ids| {
             if (ids.len * 4 < root.segment_count) return null;
             for (ids, 0..) |id, i| if (i != 0 and std.mem.order(u8, &ids[i - 1], &id) != .lt) return null;
         }
-        const self = try a.create(CohortCursor);
+        const self = try a.create(SortCursor);
         self.* = .{ .a = a, .budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = 8 * 1024 * 1024 }, .reader = .{ .store = store, .cached = cached, .token = token }, .order = order, .selected = selected, .scratch = .init(a) };
         const admitted = self.admit(root, ref) catch |err| {
             const optional = err == error.OutOfMemory and self.budget.isLocallyExhausted();
@@ -1414,7 +1413,7 @@ const CohortCursor = struct {
         }
         return self;
     }
-    fn admit(self: *CohortCursor, root: corpus.Root, ref: tree.Ref) !bool {
+    fn admit(self: *SortCursor, root: corpus.Root, ref: tree.Ref) !bool {
         self.reader.init(root.domain);
         const alloc = self.budget.allocator();
         // Discover cohort prefixes with tree seeks; no aggregate grows with
@@ -1494,7 +1493,7 @@ const CohortCursor = struct {
         }
         return keep;
     }
-    fn pull(self: *CohortCursor, stream: *Stream) !void {
+    fn pull(self: *SortCursor, stream: *Stream) !void {
         stream.head = null;
         if (stream.done) return;
         try self.reader.check();
@@ -1521,7 +1520,7 @@ const CohortCursor = struct {
             return;
         }
     }
-    fn best(self: *CohortCursor) !?usize {
+    fn best(self: *SortCursor) !?usize {
         var result: ?usize = null;
         for (self.streams[0..self.count], 0..) |stream, i| if (stream.head) |head| {
             // Unknown layouts cannot be stopped by a cohort endpoint proof.
@@ -1535,7 +1534,7 @@ const CohortCursor = struct {
         };
         return result;
     }
-    fn selectedId(self: *CohortCursor, id: Id) bool {
+    fn selectedId(self: *SortCursor, id: Id) bool {
         const ids = self.selected orelse return true;
         var low: usize = 0;
         var high = ids.len;
@@ -1545,7 +1544,7 @@ const CohortCursor = struct {
         }
         return low < ids.len and std.mem.eql(u8, &ids[low], &id);
     }
-    fn next(self: *CohortCursor, output: []Id, max_bytes: u64, boundary: []const std.json.Value) !?RoutingCursor.Window {
+    pub fn next(self: *SortCursor, output: []Id, max_bytes: u64, boundary: []const std.json.Value) !?RoutingCursor.Window {
         if (output.len == 0 or max_bytes == 0) return error.InvalidNativeLakeTextCorpus;
         var count: usize = 0;
         var bytes: u64 = 0;
@@ -1574,7 +1573,7 @@ const CohortCursor = struct {
         }
         return if (count == 0) null else .{ .identities = output[0..count], .doc_offset = 0 };
     }
-    fn deinit(self: *CohortCursor) void {
+    pub fn deinit(self: *SortCursor) void {
         for (self.streams[0..self.count]) |*stream| {
             if (stream.cursor) |*cursor| cursor.deinit();
             stream.arena.deinit();
@@ -1582,118 +1581,6 @@ const CohortCursor = struct {
         }
         self.scratch.deinit();
         self.a.destroy(self);
-    }
-};
-
-/// Complete ordered endpoint cover. The page-tree order itself permits stopping
-/// without fetching later routing records, descriptors or lineage pages.
-pub const SortCursor = struct {
-    a: A,
-    reader: Reader,
-    scratch: std.heap.ArenaAllocator,
-    root: corpus.Root,
-    order: local.storage_db_query_search_exec.SearchHitOrder,
-    cursor: ?tree.Cursor = null,
-    selected: ?[]const Id,
-    lower: [1]u8 = .{0},
-    upper: [1]u8 = .{1},
-    pending: ?struct { id: Id, bytes: u64 } = null,
-    done: bool = false,
-    pruned: bool = false,
-    cohorts: ?*CohortCursor = null,
-    pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation, order: local.storage_db_query_search_exec.SearchHitOrder, selected: ?[]const Id) !?*SortCursor {
-        if (root.directories.ordered_format != 0) {
-            const groups = (try CohortCursor.create(a, root, store, cached, token, order, selected)) orelse return null;
-            errdefer groups.deinit();
-            const self = try a.create(SortCursor);
-            self.* = .{ .a = a, .reader = .{ .store = store, .cached = cached, .token = token }, .scratch = .init(a), .root = root, .order = order, .selected = selected, .cohorts = groups };
-            return self;
-        }
-        const ref = root.directories.ordered orelse return null;
-        if (ref.records != @as(u64, root.segment_count) * 2) return null;
-        // A sparse selection should seek its own routing facts, not walk an
-        // unrelated global prefix. Broad selections can reuse ordered pages.
-        if (selected) |ids| {
-            if (ids.len * 4 < root.segment_count) return null;
-            for (ids, 0..) |id, i| if (i != 0 and std.mem.order(u8, &ids[i - 1], &id) != .lt) return null;
-        }
-        const self = try a.create(SortCursor);
-        self.* = .{ .a = a, .reader = .{ .store = store, .cached = cached, .token = token }, .scratch = .init(a), .root = root, .order = order, .selected = selected };
-        var owned = true;
-        defer if (owned) self.deinit();
-        self.reader.init(root.domain);
-        var page = try tree.readNavigationPage(a, self.reader.pages.store(), ref);
-        defer page.deinit(a);
-        if (page.aggregate.len != 32 or std.mem.allEqual(u8, page.aggregate, 0)) return null;
-        var first = try tree.Cursor.init(a, self.reader.pages.store(), ref, "", null);
-        defer first.deinit();
-        const sample = (try first.next()) orelse return error.InvalidNativeLakeTextCorpus;
-        const record = try @import("lake_index_sort_directory.zig").decodeLegacy(self.scratch.allocator(), sample.value);
-        const bound = record.bound orelse return null;
-        const reversal = (try bound.reversal(self.scratch.allocator(), order)) orelse return null;
-        const reverse = reversal != (order.effective.req.search_before.len != 0);
-        self.lower[0] = @intFromBool(reverse);
-        self.upper[0] = self.lower[0] + 1;
-        self.cursor = if (reverse) try tree.Cursor.initReverse(a, self.reader.pages.store(), ref, &self.lower, &self.upper) else try tree.Cursor.init(a, self.reader.pages.store(), ref, &self.lower, &self.upper);
-        owned = false;
-        return self;
-    }
-    pub fn deinit(self: *SortCursor) void {
-        if (self.cohorts) |value| value.deinit();
-        if (self.cursor) |*cursor| cursor.deinit();
-        self.scratch.deinit();
-        self.a.destroy(self);
-    }
-    pub fn next(self: *SortCursor, output: []Id, max_bytes: u64, boundary: []const std.json.Value) !?RoutingCursor.Window {
-        if (self.cohorts) |value| {
-            defer self.pruned = value.pruned;
-            return value.next(output, max_bytes, boundary);
-        }
-        if (self.done and self.pending == null) return null;
-        if (output.len == 0 or max_bytes == 0) return error.InvalidNativeLakeTextCorpus;
-        var count: usize = 0;
-        var bytes: u64 = 0;
-        if (self.pending) |held| {
-            output[0] = held.id;
-            count = 1;
-            bytes = held.bytes;
-            self.pending = null;
-        }
-        while (!self.done and count < output.len and bytes < max_bytes) {
-            const entry = (try self.cursor.?.next()) orelse {
-                self.done = true;
-                break;
-            };
-            try self.reader.check();
-            _ = self.scratch.reset(.retain_capacity);
-            const a = self.scratch.allocator();
-            const record = try @import("lake_index_sort_directory.zig").decodeLegacy(a, entry.value);
-            if (entry.key.len < 33 or !std.mem.eql(u8, entry.key[entry.key.len - 32 ..], &record.id)) return error.InvalidNativeLakeTextCorpus;
-            const bound = record.bound orelse return error.InvalidNativeLakeTextCorpus;
-            if (!try bound.mayCompete(a, self.order, boundary)) {
-                self.pruned = true;
-                self.done = true;
-                break;
-            }
-            if (self.selected) |ids| {
-                var lower: usize = 0;
-                var upper = ids.len;
-                while (lower < upper) {
-                    const middle = lower + (upper - lower) / 2;
-                    if (std.mem.order(u8, &ids[middle], &record.id) == .lt) lower = middle + 1 else upper = middle;
-                }
-                if (lower == ids.len or !std.mem.eql(u8, &ids[lower], &record.id)) continue;
-            }
-            if (record.planning_bytes == 0) return error.InvalidNativeLakeTextCorpus;
-            if (count != 0 and record.planning_bytes > max_bytes -| bytes) {
-                self.pending = .{ .id = record.id, .bytes = record.planning_bytes };
-                break;
-            }
-            output[count] = record.id;
-            count += 1;
-            bytes +|= record.planning_bytes;
-        }
-        return if (count == 0) null else .{ .identities = output[0..count], .doc_offset = 0 };
     }
 };
 
@@ -1734,7 +1621,7 @@ test "external lake global frontier sort directory visits best ranges and stops 
         try @import("lake_index_sort_directory.zig").mutate(out, &changes, .{ .ref = ref, .summary = null, .bytes = 1, .doc_count = 1, .fields = &.{}, .sort_bound = bound }, 1, false);
     }
     const ref = (try changes.finish(null)).?;
-    var root: corpus.Root = .{ .domain = pages.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "cut", .schema_fingerprint = "schema", .index_config_hash = "text", .column_bindings = &.{} }, .config_json = "{}", .segment_count = ids.len, .directories = .{ .ordered = ref, .ordered_format = 1 } };
+    var root: corpus.Root = .{ .domain = pages.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "cut", .schema_fingerprint = "schema", .index_config_hash = "text", .column_bindings = &.{} }, .config_json = "{}", .segment_count = ids.len, .directories = .{ .ordered = ref, .ordered_format = 2 } };
     var parsed = try local.schema_mod.parseValidatedTableSchema(out,
         \\{"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"rank":{"type":"integer","x-antfly-field":{"type":"number","sortable":true,"missing_null_policy":"nulls_ordered"}}}}}}}
     );
@@ -1756,9 +1643,9 @@ test "external lake global frontier sort directory visits best ranges and stops 
         try std.testing.expect(try cursor.next(&output, 32 * 1024 * 1024, &cutoff) == null);
         try std.testing.expect(cursor.pruned);
         if (before) {
-            try std.testing.expect(cursor.cohorts.?.cursor_pruned >= 255);
-            try std.testing.expect(cursor.cohorts.?.cursor_pruned_subtrees > 0);
-            std.debug.print("CURSOR_RANGES excluded_records={d} excluded_subtrees={d}\n", .{ cursor.cohorts.?.cursor_pruned, cursor.cohorts.?.cursor_pruned_subtrees });
+            try std.testing.expect(cursor.cursor_pruned >= 255);
+            try std.testing.expect(cursor.cursor_pruned_subtrees > 0);
+            std.debug.print("CURSOR_RANGES excluded_records={d} excluded_subtrees={d}\n", .{ cursor.cursor_pruned, cursor.cursor_pruned_subtrees });
         }
         const batched = (try SortCursor.create(a, root, store, cached, .none, order, null)).?;
         defer batched.deinit();
@@ -1798,7 +1685,7 @@ test "external lake global frontier sort directory visits best ranges and stops 
             try std.testing.expectEqual(corpus.term_directory.identity(overlap_ref.artifact_id), (try cursor.next(&output, 1, &.{})).?.identities[0]);
             try std.testing.expect(try cursor.next(&output, 1, &.{}) == null);
             try std.testing.expect(cursor.pruned);
-            try std.testing.expect(cursor.cohorts.?.cursor_pruned_subtrees > 0);
+            try std.testing.expect(cursor.cursor_pruned_subtrees > 0);
         }
     }
 

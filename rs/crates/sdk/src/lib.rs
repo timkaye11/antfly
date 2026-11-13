@@ -729,7 +729,10 @@ impl Default for types::CreateEmbeddingsIndexRequest {
             enrichments: Vec::new(),
             execution: None,
             external: false,
+            external_vector_space: None,
             field: None,
+            lake_bulk_build: None,
+            lake_bulk_build_max_input_bytes: None,
             leann: None,
             mem_only: None,
             min_weight: None,
@@ -1220,3 +1223,13 @@ mod tests {
         );
     }
 }
+
+/// Optional client for the separately deployed source management service.
+#[cfg(feature = "sources")]
+pub mod sources;
+
+pub mod time_series;
+
+/// Simple-path helpers for the native agent memory API.
+pub mod memory;
+pub use memory::{MemorySpace, new_idempotency_key};

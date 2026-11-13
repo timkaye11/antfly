@@ -17,6 +17,10 @@ pub const AlgebraicAggregateConfig = struct {
     name: []const u8,
     op: []const u8,
     group_by: ?[]const []const u8 = null,
+    /// Schema datetime column used for temporal grouping. Requires bucket.
+    time: ?[]const u8 = null,
+    /// UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch.
+    bucket: ?[]const u8 = null,
     /// Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values.
     measure: ?[]const u8 = null,
 
@@ -25,6 +29,8 @@ pub const AlgebraicAggregateConfig = struct {
         .{ "name", "name", false },
         .{ "op", "op", false },
         .{ "group_by", "group_by", true },
+        .{ "time", "time", true },
+        .{ "bucket", "bucket", true },
         .{ "measure", "measure", true },
     };
 
@@ -44,6 +50,14 @@ pub const AlgebraicAggregateConfig = struct {
         try jw.write(self.op);
         if (self.group_by) |value| {
             try jw.objectField("group_by");
+            try jw.write(value);
+        }
+        if (self.time) |value| {
+            try jw.objectField("time");
+            try jw.write(value);
+        }
+        if (self.bucket) |value| {
+            try jw.objectField("bucket");
             try jw.write(value);
         }
         if (self.measure) |value| {
@@ -732,8 +746,14 @@ pub const CreateEmbeddingsIndexRequest = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
+    /// Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model.
+    external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -777,7 +797,10 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -833,8 +856,20 @@ pub const CreateEmbeddingsIndexRequest = struct {
             try jw.objectField("external");
             try jw.write(value);
         }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
+            try jw.write(value);
+        }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -1403,7 +1438,10 @@ pub const CreatedEmbeddingsIndex = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
     external: ?bool = null,
+    external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
@@ -1434,7 +1472,10 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -1490,8 +1531,20 @@ pub const CreatedEmbeddingsIndex = struct {
             try jw.objectField("external");
             try jw.write(value);
         }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
+            try jw.write(value);
+        }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -1572,7 +1625,10 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
     external: ?bool = null,
+    external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
@@ -1598,7 +1654,10 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -1639,8 +1698,20 @@ pub const CreatedEmbeddingsIndexConfig = struct {
             try jw.objectField("external");
             try jw.write(value);
         }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
+            try jw.write(value);
+        }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -1724,6 +1795,8 @@ pub const CreatedEnrichmentConfig = struct {
     template: ?[]const u8 = null,
     source_artifact_name: ?[]const u8 = null,
     expected_dims: ?i64 = null,
+    /// Effective embedding input mode; PDF pages are rasterized before embedding.
+    embedding_input: ?[]const u8 = null,
     /// Optional stable model/token-space identifier asserted for this embedding artifact.
     vector_space: ?[]const u8 = null,
     chunk_size: ?i64 = null,
@@ -1745,6 +1818,7 @@ pub const CreatedEnrichmentConfig = struct {
         .{ "template", "template", true },
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "expected_dims", "expected_dims", true },
+        .{ "embedding_input", "embedding_input", true },
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "chunk_overlap", "chunk_overlap", true },
@@ -1792,6 +1866,10 @@ pub const CreatedEnrichmentConfig = struct {
         }
         if (self.expected_dims) |value| {
             try jw.objectField("expected_dims");
+            try jw.write(value);
+        }
+        if (self.embedding_input) |value| {
+            try jw.objectField("embedding_input");
             try jw.write(value);
         }
         if (self.vector_space) |value| {
@@ -2945,6 +3023,8 @@ pub const DocumentExtractionConfig = struct {
     etag: ?[]const u8 = null,
     /// Static checksum recorded as source version metadata.
     checksum: ?[]const u8 = null,
+    /// Declares that `checksum` (or the row value named by `source.checksum_field`) is a digest of the original bytes, computed with this algorithm. When set and the row carries a well-formed digest, extraction identifies the row by that digest instead of by its location (URL, ETag, version, last-modified), so copying, re-hosting, or renaming a source does not force re-extraction as long as the bytes are unchanged. The downloaded bytes are verified against the declared digest; a mismatch fails extraction instead of keeping stale output alive. A present but malformed digest is also an error, never a silent fall back to location-based identity. Leaving this unset preserves prior behavior byte for byte, including for rows that only set `checksum_field`.
+    checksum_algorithm: ?[]const u8 = null,
     /// Static source version. Together with the other metadata it lets extraction skip unchanged sources.
     version: ?[]const u8 = null,
     /// Static last-modified timestamp recorded as source version metadata.
@@ -2953,6 +3033,7 @@ pub const DocumentExtractionConfig = struct {
     credentials: ?[]const u8 = null,
     /// Strip HTML markup from HTML sources before storing their text.
     html_strip_tags: ?bool = null,
+    native_text: ?DocumentExtractionNativeTextConfig = null,
     ocr: ?DocumentExtractionOcrConfig = null,
     transcription: ?DocumentExtractionTranscriptionConfig = null,
     /// How sources that match no explicit route are handled. `mixed_files` (alias `default`) detects PDFs, HTML, email, Office documents, ZIP archives, images, audio, and text. `explicit_only` (alias `none`) records unmatched sources as unsupported. Detection never requests a producer: detected images and audio without a configured producer report `ocr_not_configured` or `transcription_not_configured`.
@@ -2967,10 +3048,12 @@ pub const DocumentExtractionConfig = struct {
         .{ "content_type", "content_type", true },
         .{ "etag", "etag", true },
         .{ "checksum", "checksum", true },
+        .{ "checksum_algorithm", "checksum_algorithm", true },
         .{ "version", "version", true },
         .{ "last_modified", "last_modified", true },
         .{ "credentials", "credentials", true },
         .{ "html_strip_tags", "html_strip_tags", true },
+        .{ "native_text", "native_text", true },
         .{ "ocr", "ocr", true },
         .{ "transcription", "transcription", true },
         .{ "route_preset", "route_preset", true },
@@ -3007,6 +3090,10 @@ pub const DocumentExtractionConfig = struct {
             try jw.objectField("checksum");
             try jw.write(value);
         }
+        if (self.checksum_algorithm) |value| {
+            try jw.objectField("checksum_algorithm");
+            try jw.write(value);
+        }
         if (self.version) |value| {
             try jw.objectField("version");
             try jw.write(value);
@@ -3021,6 +3108,10 @@ pub const DocumentExtractionConfig = struct {
         }
         if (self.html_strip_tags) |value| {
             try jw.objectField("html_strip_tags");
+            try jw.write(value);
+        }
+        if (self.native_text) |value| {
+            try jw.objectField("native_text");
             try jw.write(value);
         }
         if (self.ocr) |value| {
@@ -3043,16 +3134,50 @@ pub const DocumentExtractionConfig = struct {
     }
 };
 
+/// Native document text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability.
+pub const DocumentExtractionNativeTextConfig = struct {
+    /// `source` retains decoded source text, including off-page runs, for auditing. `page` excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
+    policy: ?[]const u8 = null,
+    quality: ?DocumentExtractionTextQualityConfig = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", true },
+        .{ "quality", "quality", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        }
+        if (self.quality) |value| {
+            try jw.objectField("quality");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction.
 pub const DocumentExtractionOcrConfig = struct {
     reader: ?DocumentExtractionReaderConfig = null,
     generator: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// `auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page.
+    /// `auto` reads PDF pages whose native text fails `native_text.quality`, and images. `always` reads every page.
     mode: ?[]const u8 = null,
     /// Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts.
     prompt: ?[]const u8 = null,
     render: ?DocumentExtractionRenderConfig = null,
-    quality: ?DocumentExtractionOcrQualityConfig = null,
+    quality: ?DocumentExtractionTextQualityConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -3099,83 +3224,6 @@ pub const DocumentExtractionOcrConfig = struct {
         }
         if (self.quality) |value| {
             try jw.objectField("quality");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode.
-pub const DocumentExtractionOcrQualityConfig = struct {
-    /// Pages with fewer meaningful characters are read with OCR.
-    min_content_chars: ?i64 = null,
-    /// Minimum words before the garbled-text check applies.
-    garbled_min_words: ?i64 = null,
-    /// Words sampled by the garbled-text check.
-    garbled_sample_words: ?i64 = null,
-    /// Maximum ratio of single-character words before text counts as garbled.
-    max_single_char_word_ratio: ?f64 = null,
-    /// Minimum characters for a line to count in the corrupted-line check.
-    substantial_line_min_chars: ?i64 = null,
-    /// Maximum ratio of corrupted lines.
-    max_corrupted_line_ratio: ?f64 = null,
-    /// Font corruption score at which text is replaced by OCR.
-    font_corruption_score_threshold: ?f64 = null,
-    /// Maximum ratio of Unicode replacement characters.
-    max_replacement_char_ratio: ?f64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "min_content_chars", "min_content_chars", true },
-        .{ "garbled_min_words", "garbled_min_words", true },
-        .{ "garbled_sample_words", "garbled_sample_words", true },
-        .{ "max_single_char_word_ratio", "max_single_char_word_ratio", true },
-        .{ "substantial_line_min_chars", "substantial_line_min_chars", true },
-        .{ "max_corrupted_line_ratio", "max_corrupted_line_ratio", true },
-        .{ "font_corruption_score_threshold", "font_corruption_score_threshold", true },
-        .{ "max_replacement_char_ratio", "max_replacement_char_ratio", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.min_content_chars) |value| {
-            try jw.objectField("min_content_chars");
-            try jw.write(value);
-        }
-        if (self.garbled_min_words) |value| {
-            try jw.objectField("garbled_min_words");
-            try jw.write(value);
-        }
-        if (self.garbled_sample_words) |value| {
-            try jw.objectField("garbled_sample_words");
-            try jw.write(value);
-        }
-        if (self.max_single_char_word_ratio) |value| {
-            try jw.objectField("max_single_char_word_ratio");
-            try jw.write(value);
-        }
-        if (self.substantial_line_min_chars) |value| {
-            try jw.objectField("substantial_line_min_chars");
-            try jw.write(value);
-        }
-        if (self.max_corrupted_line_ratio) |value| {
-            try jw.objectField("max_corrupted_line_ratio");
-            try jw.write(value);
-        }
-        if (self.font_corruption_score_threshold) |value| {
-            try jw.objectField("font_corruption_score_threshold");
-            try jw.write(value);
-        }
-        if (self.max_replacement_char_ratio) |value| {
-            try jw.objectField("max_replacement_char_ratio");
             try jw.write(value);
         }
         try jw.endObject();
@@ -3335,6 +3383,8 @@ pub const DocumentExtractionReaderConfig = struct {
 
 /// How PDF pages are rasterized for OCR.
 pub const DocumentExtractionRenderConfig = struct {
+    /// PDF image sampling, separate from model resizing and normalization. `auto` smooths continuous-tone images while preserving one-bit scan coverage during minification. `pdf` honors the PDF's interpolation declarations. `smooth` uses bilinear sampling even for one-bit images (except stencil masks), which can soften fine lines. Effective policy, version, resolution, DPI and geometry are recorded in unit provenance.
+    sampling: ?[]const u8 = null,
     /// Render resolution in dots per inch.
     dpi: ?i64 = null,
     /// `requested_dpi` renders at `dpi` within the caps. `model_input` renders near the model's preferred input size.
@@ -3346,6 +3396,7 @@ pub const DocumentExtractionRenderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "sampling", "sampling", true },
         .{ "dpi", "dpi", true },
         .{ "resolution", "resolution", true },
         .{ "max_pixels", "max_pixels", true },
@@ -3362,6 +3413,10 @@ pub const DocumentExtractionRenderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.sampling) |value| {
+            try jw.objectField("sampling");
+            try jw.write(value);
+        }
         if (self.dpi) |value| {
             try jw.objectField("dpi");
             try jw.write(value);
@@ -3469,7 +3524,7 @@ pub const DocumentExtractionSourceConfig = struct {
     content_type_field: ?[]const u8 = null,
     /// Row field holding the source ETag.
     etag_field: ?[]const u8 = null,
-    /// Row field holding the source checksum.
+    /// Row field holding the source checksum. May name a dotted path (e.g. `metadata.sha256`) to reach a value nested under another row field.
     checksum_field: ?[]const u8 = null,
     /// Row field holding the source version.
     version_field: ?[]const u8 = null,
@@ -3518,6 +3573,83 @@ pub const DocumentExtractionSourceConfig = struct {
         }
         if (self.last_modified_field) |value| {
             try jw.objectField("last_modified_field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Text-quality thresholds. `native_text.quality` assesses native document text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics.
+pub const DocumentExtractionTextQualityConfig = struct {
+    /// Minimum non-whitespace Unicode characters before text passes the length check.
+    min_chars: ?i64 = null,
+    /// Minimum words before the garbled-text check applies.
+    garbled_min_words: ?i64 = null,
+    /// Words sampled by the garbled-text check.
+    garbled_sample_words: ?i64 = null,
+    /// Maximum ratio of single-character words before text counts as garbled.
+    max_single_char_word_ratio: ?f64 = null,
+    /// Minimum non-whitespace Unicode characters for a line to count in the corrupted-line check.
+    min_line_chars: ?i64 = null,
+    /// Maximum ratio of corrupted lines.
+    max_corrupted_line_ratio: ?f64 = null,
+    /// Font corruption score above which a substantial line counts as corrupted.
+    max_font_corruption: ?f64 = null,
+    /// Maximum ratio of Unicode replacement characters.
+    max_replacement_ratio: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "min_chars", "min_chars", true },
+        .{ "garbled_min_words", "garbled_min_words", true },
+        .{ "garbled_sample_words", "garbled_sample_words", true },
+        .{ "max_single_char_word_ratio", "max_single_char_word_ratio", true },
+        .{ "min_line_chars", "min_line_chars", true },
+        .{ "max_corrupted_line_ratio", "max_corrupted_line_ratio", true },
+        .{ "max_font_corruption", "max_font_corruption", true },
+        .{ "max_replacement_ratio", "max_replacement_ratio", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.min_chars) |value| {
+            try jw.objectField("min_chars");
+            try jw.write(value);
+        }
+        if (self.garbled_min_words) |value| {
+            try jw.objectField("garbled_min_words");
+            try jw.write(value);
+        }
+        if (self.garbled_sample_words) |value| {
+            try jw.objectField("garbled_sample_words");
+            try jw.write(value);
+        }
+        if (self.max_single_char_word_ratio) |value| {
+            try jw.objectField("max_single_char_word_ratio");
+            try jw.write(value);
+        }
+        if (self.min_line_chars) |value| {
+            try jw.objectField("min_line_chars");
+            try jw.write(value);
+        }
+        if (self.max_corrupted_line_ratio) |value| {
+            try jw.objectField("max_corrupted_line_ratio");
+            try jw.write(value);
+        }
+        if (self.max_font_corruption) |value| {
+            try jw.objectField("max_font_corruption");
+            try jw.write(value);
+        }
+        if (self.max_replacement_ratio) |value| {
+            try jw.objectField("max_replacement_ratio");
             try jw.write(value);
         }
         try jw.endObject();
@@ -3863,8 +3995,14 @@ pub const EmbeddingsIndexConfig = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
+    /// Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model.
+    external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -3904,7 +4042,10 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -3947,8 +4088,20 @@ pub const EmbeddingsIndexConfig = struct {
             try jw.objectField("external");
             try jw.write(value);
         }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
+            try jw.write(value);
+        }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -4547,6 +4700,8 @@ pub const EnrichmentConfig = struct {
     template: ?[]const u8 = null,
     /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor).
     source_artifact_name: ?[]const u8 = null,
+    /// pdf_page_images requires kind=embedding and a dense index. It consumes an original PDF URI selected by field or template and embeds its rendered pages. Upstream artifacts (source_artifact_name) and text chunking are not supported. Native field selectors address literal root keys; use a raw template for nested resource URIs.
+    embedding_input: ?[]const u8 = null,
     /// Expected embedding dimension for embedding enrichments.
     expected_dims: ?i64 = null,
     /// Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently.
@@ -4583,6 +4738,7 @@ pub const EnrichmentConfig = struct {
         .{ "field", "field", true },
         .{ "template", "template", true },
         .{ "source_artifact_name", "source_artifact_name", true },
+        .{ "embedding_input", "embedding_input", true },
         .{ "expected_dims", "expected_dims", true },
         .{ "vector_space", "vector_space", true },
         .{ "chunk_size", "chunk_size", true },
@@ -4630,6 +4786,10 @@ pub const EnrichmentConfig = struct {
         }
         if (self.source_artifact_name) |value| {
             try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.embedding_input) |value| {
+            try jw.objectField("embedding_input");
             try jw.write(value);
         }
         if (self.expected_dims) |value| {
@@ -7235,7 +7395,7 @@ pub const GraphMatch = struct {
     }
 };
 
-/// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
+/// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses Cypher relationship-simple trails: nodes may repeat, but the same physical relationship cannot be reused anywhere within one MATCH group. Each optional group has its own relationship scope. Parallel relationship IDs remain distinct. A zero-hop path binds both endpoints to the same node identity without reading an edge. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
 pub const GraphMatchEdge = struct {
     edge_filter: ?GraphRelationshipFilter = null,
     from: antfly_graph_identifier_openapi.GraphIdentifier,
@@ -8983,7 +9143,7 @@ pub const GraphResolverAdjudicationAcceptance = struct {
 
 /// Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges.
 pub const GraphResolverAdjudicationConfig = struct {
-    /// Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one.
+    /// Frozen typed, generated or cascade decider configuration. Standalone generated verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds to probabilistic stages and require categorical zero-or-one terminal verdicts. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace.
     decider: antfly_common_openapi.DeciderConfig,
     /// Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
     template: []const u8,
@@ -9087,6 +9247,8 @@ pub const GraphResolverConfig = struct {
     suppress: ?GraphResolverSuppressionConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
+    /// Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching.
+    candidate_key_prefix: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
     candidate_limit: ?i64 = null,
     name_embedding: ?[]const u8 = null,
@@ -9116,6 +9278,7 @@ pub const GraphResolverConfig = struct {
         .{ "suppress", "suppress", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
+        .{ "candidate_key_prefix", "candidate_key_prefix", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
         .{ "candidate_limit", "candidate_limit", true },
         .{ "name_embedding", "name_embedding", true },
@@ -9186,6 +9349,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.candidate_search) |value| {
             try jw.objectField("candidate_search");
+            try jw.write(value);
+        }
+        if (self.candidate_key_prefix) |value| {
+            try jw.objectField("candidate_key_prefix");
             try jw.write(value);
         }
         if (self.candidate_ann_index) |value| {
@@ -10050,8 +10217,14 @@ pub const IndexConfig = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
+    /// Optional immutable compatibility declaration for an external dense index. Only valid with external=true. Every non-null authored vector must supply metadata.embedding_spaces[indexName] with this exact identity; dimensions and finite values are checked independently. This is an assertion by the writer, not proof of the generating model.
+    external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
@@ -10123,7 +10296,10 @@ pub const IndexConfig = struct {
         .{ "publication_policy", "publication_policy", true },
         .{ "coverage_policy", "coverage_policy", true },
         .{ "external", "external", true },
+        .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "embedding_name", "embedding_name", true },
         .{ "source_artifact_name", "source_artifact_name", true },
@@ -10218,8 +10394,20 @@ pub const IndexConfig = struct {
             try jw.objectField("external");
             try jw.write(value);
         }
+        if (self.external_vector_space) |value| {
+            try jw.objectField("external_vector_space");
+            try jw.write(value);
+        }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -10848,20 +11036,50 @@ pub const IndexType = enum {
     }
 };
 
+/// Offline clustering algorithm for fresh native Parquet lake HBC indexes.
+pub const LakeBulkBuildAlgorithm = enum {
+    lloyd,
+    emeans,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .lloyd => "lloyd",
+            .emeans => "emeans",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "lloyd", .lloyd },
+            .{ "emeans", .emeans },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Tuning for algorithm=leann dense indexes. All fields are optional.
 pub const LeannIndexConfig = struct {
     /// Graph degree cap M. Most nodes keep M/5 neighbors after pruning; hubs keep up to M.
     max_degree: ?i64 = null,
     /// Compact code used to steer the graph walk. "rabitq" (default) carries error bounds, so only candidates that can still reach the top k are recomputed. "pq" follows the LEANN paper's fixed rerank ratio; prefer it only for very low dimensions (below about 64).
     quantizer: ?[]const u8 = null,
-    /// Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+    /// Whether document embeddings stay stored after the graph covers them. "auto" (the default when the index has its own embedder) keeps only a small stub for each embedding computed from text (a field, a text-only template, or a text chunk) and re-embeds a few such candidates per query, while embeddings computed from media (images, audio windows, model outputs) stay stored. "transient" stubs every covered embedding, so it requires inputs that re-embed from text: no media chunkers. "persistent" keeps every embedding, and is the only choice for external vectors, indexes fed by other enrichments, and the pq quantizer.
     vector_storage: ?[]const u8 = null,
     /// Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
     search_ef: ?i64 = null,
     /// Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates and loses fewer true neighbors.
     bound_scale: ?f32 = null,
-    /// Candidates recomputed per batch. 0 uses k.
+    /// Candidates recomputed per batch. 0 uses k for bounded search and 128 for full-effort search.
     batch_size: ?i64 = null,
+    /// Time a query may spend re-embedding candidates whose stored vectors were dropped. If the budget is spent before scoring finishes, the search returns an incomplete-coverage error; retry with a larger budget. 0 means no limit.
+    reembed_budget_ms: ?i64 = null,
+    /// How vectors that cannot be re-embedded from text (images, audio windows, model outputs) are kept once the graph covers them. "full" keeps the stored float32 vector. "int8" replaces it with a stub holding an int8 copy (about a quarter of the size), read back instead of re-embedding. Requires "auto" or "transient" storage.
+    media_vectors: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -10871,6 +11089,8 @@ pub const LeannIndexConfig = struct {
         .{ "search_ef", "search_ef", true },
         .{ "bound_scale", "bound_scale", true },
         .{ "batch_size", "batch_size", true },
+        .{ "reembed_budget_ms", "reembed_budget_ms", true },
+        .{ "media_vectors", "media_vectors", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -10905,6 +11125,14 @@ pub const LeannIndexConfig = struct {
         }
         if (self.batch_size) |value| {
             try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.reembed_budget_ms) |value| {
+            try jw.objectField("reembed_budget_ms");
+            try jw.write(value);
+        }
+        if (self.media_vectors) |value| {
+            try jw.objectField("media_vectors");
             try jw.write(value);
         }
         try jw.endObject();

@@ -77,7 +77,9 @@ import { QueryResultsList } from "../components/results";
 import SearchBoxBuilder from "../components/SearchBoxBuilder";
 import DocumentSchemasForm from "../components/schema-builder/DocumentSchemasForm";
 import { DocumentArtifactsPanel } from "../components/table/DocumentArtifactsPanel";
+import { TablePrivacyPanel } from "../components/table/TablePrivacyPanel";
 import { TableReprocessPanel } from "../components/table/TableReprocessPanel";
+import { TimeSeriesPanel } from "../components/table/TimeSeriesPanel";
 import { useApi } from "../hooks/use-api-config";
 import {
   type BasicField,
@@ -860,9 +862,11 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     semantic: "Search",
     graph: "Graph",
     faceted: "Component Builder",
+    "time-series": "Time series",
     bulk: "Upload",
     "document-builder": "Manual Entry",
     artifacts: "Artifacts",
+    privacy: "Privacy",
     reprocess: "Reprocess",
   };
 
@@ -1534,6 +1538,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
           </div>
         )}
 
+        {currentSection === "time-series" && tableName && (
+          <TimeSeriesPanel key={tableName} tableName={tableName} />
+        )}
+
         {/* Graph Explorer Section */}
         {currentSection === "graph" &&
           tableName &&
@@ -1575,6 +1583,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         {/* Manual Entry Section */}
         {currentSection === "document-builder" && (
           <DocumentBuilder tableName={tableName || ""} schema={tableSchema} />
+        )}
+
+        {currentSection === "privacy" && (
+          <TablePrivacyPanel key={tableName} tableName={tableName || ""} />
         )}
 
         {/* Artifacts Section */}

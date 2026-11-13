@@ -97,6 +97,25 @@ class LiteralSourceOwnership(unittest.TestCase):
                 ):
                     measurement.control_catalog_contents()
 
+    def test_conditional_imports_cannot_retain_a_physical_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            local = root / "pkg/antfly-embedded/src"
+            local.mkdir(parents=True)
+            (local / "source_catalog.zig").write_text(
+                "// header\n" * 16
+                + 'pub const hosted = if (enabled) @import("owner.zig") else struct {};\n'
+                + 'pub const safe = if (enabled) @import("leaf.zig") else struct {};\n'
+            )
+            (local / "owner.zig").write_text(
+                'pub const db = @import("storage/db/db.zig");\n'
+            )
+            (local / "leaf.zig").write_text("")
+            with mock.patch.object(measurement, "ZIG_ROOT", root):
+                rendered = measurement.control_catalog_contents()
+            self.assertNotIn("pub const hosted", rendered)
+            self.assertIn("pub const safe", rendered)
+
     def test_control_catalog_is_current_and_has_no_physical_imports(self):
         local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
         catalog = local / "source_catalog_control.zig"
@@ -228,7 +247,11 @@ class BuildFailureEvidence(unittest.TestCase):
             ),
             ("write coordination", {"antfly-runtime-distributed"}),
             ("physical DB", {"antfly-storage-kernel"}),
-            ("physical local query", {"antfly-storage-kernel"}),
+            (
+                "physical local query",
+                {"antfly-storage-kernel"},
+            ),
+            ("opaque query dispatcher", {"antfly-runtime-local_query"}),
             ("owner integration test", {"storage-owner-tests"}),
             ("consumer test root", {"api-table-read-tests"}),
             *(
@@ -358,7 +381,8 @@ class BuildFailureEvidence(unittest.TestCase):
                     measurement.shutil,
                     "disk_usage",
                     side_effect=lambda *_: mock.Mock(
-                        free=(8 if low_disk and len(seen) == 8 else 64) << 30
+                        free=(8 if low_disk and len(seen) == len(expected) - 3 else 64)
+                        << 30
                     ),
                 ),
             ):
@@ -654,8 +678,18 @@ class ParallelAuditIsolation(unittest.TestCase):
                 "write coordination",
                 {"antfly-runtime-distributed"},
             ),
-            "storage/db/db.zig": ("physical DB", {"antfly-storage-kernel"}),
-            "storage/query.zig": ("physical local query", {"antfly-storage-kernel"}),
+            "storage/db/db.zig": (
+                "physical DB",
+                {"antfly-storage-kernel"},
+            ),
+            "storage/query.zig": (
+                "physical local query",
+                {"antfly-storage-kernel"},
+            ),
+            "storage/local_query_dispatch.zig": (
+                "opaque query dispatcher",
+                {"antfly-runtime-local_query"},
+            ),
             "storage/kernel_owner_test.zig": (
                 "owner integration test",
                 {"storage-owner-tests"},
@@ -786,7 +820,7 @@ class ParallelAuditIsolation(unittest.TestCase):
                 self.assertLess(len(seen), len(sources))
                 self.assertTrue(any(row["status"] == "failed" for row in rows))
                 return
-            self.assertEqual(len(rows), 11)
+            self.assertEqual(len(rows), len(sources) + 4)
             self.assertTrue(all(row["status"] == "completed" for row in rows))
             self.assertCountEqual(seen, [label for label, _ in sources.values()])
             self.assertEqual(len(first_mutation), 2)
@@ -868,7 +902,7 @@ pub fn create(b: *std.Build) ?void {
         }),
     });
     b.step("unrelated", "unrelated").dependOn(&unrelated.step);
-    inline for (.{ "cli", "distributed", "storage_kernel", "enrichment_compute", "serverless", "inference", "api_kernel" }) |unit| {
+    inline for (.{ "cli", "distributed", "storage_kernel", "local_query", "enrichment_compute", "serverless", "inference", "api_kernel" }) |unit| {
         _ = b.step("runtime-unit-" ++ unit, unit);
     }
     return {};

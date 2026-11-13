@@ -2234,6 +2234,18 @@ const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
     .deinit = MetalKvStorage.hookDeinit,
 };
 
+test "Metal KV hook teardown uses its allocation owner instead of the request allocator" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const Bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
+    var owner = Bounded{ .backing = std.testing.allocator, .limit = 128 * 1024 };
+    var request = Bounded{ .backing = std.testing.allocator, .limit = 128 * 1024 };
+    const runtime: *metal_runtime.RawMetalDecodeRuntime = @ptrFromInt(@alignOf(usize));
+    const storage = try MetalKvStorage.create(owner.allocator(), runtime, .f16, 2, 256, 16);
+    storage.deviceWriteHook().deinit(request.allocator());
+    try std.testing.expectEqual(@as(usize, 0), owner.live);
+    try std.testing.expectEqual(@as(usize, 0), request.live);
+}
+
 test "MetalKvStorage.create rejects unsupported dtype" {
     if (!build_options.enable_metal) return error.SkipZigTest;
 

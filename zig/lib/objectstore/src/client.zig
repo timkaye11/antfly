@@ -37,6 +37,10 @@ pub const Client = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Provider state supports overlapping requests when its construction
+        /// allocator and each result allocator are also concurrency-safe.
+        /// Custom transports and in-memory implementations opt in explicitly.
+        supports_concurrent_requests: bool = false,
         supports_guarded_put: bool = false,
         put_at_revision: ?*const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, types.ObjectRevision, types.PutOptions) anyerror!types.PutResult = null,
         delete_at_revision: ?*const fn (*anyopaque, []const u8, []const u8, types.ObjectRevision, types.DeleteOptions) anyerror!void = null,
@@ -163,6 +167,7 @@ pub const Client = struct {
         if (opts.if_match_etag != null or opts.if_none_match) return error.InvalidArgument;
         if (opts.cancellation) |token| try token.check();
         if (opts.guard != null and !self.vtable.supports_guarded_put) return error.ObjectOperationUnsupported;
+        operation.input(body.len);
         var conditional = opts;
         if (revision) |value| switch (value) {
             .etag => |etag| {
@@ -203,6 +208,7 @@ pub const Client = struct {
         errdefer operation.failed();
         if (opts.cancellation) |token| try token.check();
         if (opts.guard != null and !self.vtable.supports_guarded_put) return error.ObjectOperationUnsupported;
+        operation.input(body.len);
         return try self.vtable.put_object(self.ptr, self.allocator, bucket, key, body, opts);
     }
 
@@ -215,6 +221,7 @@ pub const Client = struct {
         if (items.len == 0 or items.len > 8) return error.InvalidObjectBatch;
         for (items) |item| if (item.options.guard != null) return error.ObjectOperationUnsupported;
         for (items) |item| if (item.options.cancellation) |token| try token.check();
+        for (items) |item| operation.input(item.body.len);
         if (self.vtable.put_objects) |call| return call(self.ptr, self.allocator, bucket, items);
         const results = try self.allocator.alloc(types.PutResult, items.len);
         var initialized: usize = 0;
@@ -274,6 +281,7 @@ pub const Client = struct {
                 }
                 return err;
             };
+            operation.output(result.body.len);
             errdefer result.deinit(self.allocator);
             if (opts.cancellation) |token| try token.check();
             return result;
@@ -296,6 +304,7 @@ pub const Client = struct {
                 self.allocator.free(results);
             }
             if (results.len != items.len) return error.InvalidObjectBatch;
+            for (results) |result| if (result) |value| operation.output(value.body.len);
             for (items) |item| if (item.options.cancellation) |token| try token.check();
             return results;
         }
@@ -310,6 +319,7 @@ pub const Client = struct {
                 error.FileNotFound => null,
                 else => return err,
             };
+            if (result.*) |value| operation.output(value.body.len);
             initialized += 1;
         }
         return results;

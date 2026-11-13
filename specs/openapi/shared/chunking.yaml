@@ -79,6 +79,16 @@ components:
           minimum: 0
           maximum: 1000000
           description: "Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers."
+        min_chars:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          default: 0
+          description: >-
+            Minimum non-whitespace Unicode scalar values in a fixed text chunk.
+            Shorter chunks are omitted before storage and embedding; original
+            source offsets are preserved. Zero disables filtering (default).
+            Does not filter model-aware media windows or image/audio chunks.
         separator:
           type: string
           description: "Separator string for splitting (e.g., '\\n\\n' for paragraphs). Only used by fixed-size chunkers."
@@ -892,20 +902,20 @@ components:
         uri:
           type: string
           maxLength: 16384
-          description: HTTP(S) or S3 object URI resolved through configured content security and credentials.
+          description: HTTP(S), S3, or absolute file:// URI resolved through configured content security and credentials. Local files require an explicit remote_content.security.allowed_paths allowlist.
         mime_type:
           type: string
         version:
           type: string
           minLength: 1
           maxLength: 4096
-          description: Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read.
+          description: Quoted strong HTTP/S3 ETag, immutable S3 version ID, or lowercase SHA-256 hex digest for file_sha256. Local files are verified in a bounded streaming scan; unchanged files reuse a bounded process-local verification cache across continuation pages. Size, inode, mtime and ctime are checked around every range read.
         version_kind:
           type: string
-          enum: [strong_etag, s3_version_id]
-          description: Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+          enum: [strong_etag, s3_version_id, file_sha256]
+          description: Defaults to strong_etag. S3 version IDs require S3 sources; file_sha256 requires a local file URI.
         length:
           type: integer
           format: int64
           minimum: 1
-          description: Exact immutable object length, verified against Content-Range.
+          description: Exact immutable object length, verified against Content-Range or local file metadata.

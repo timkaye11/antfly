@@ -174,7 +174,41 @@ pub const ReplayPublication = struct {
     ) anyerror!u64,
 };
 
+/// Read-handle-owned provider construction. Called only on a cold stub miss.
+pub const QueryRecoveryFactory = struct {
+    /// Fork a lazy owner for an immutable retained catalog, without discovery.
+    fork: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!QueryRecoveryFactory = null,
+    ptr: *anyopaque,
+    create: *const fn (*anyopaque, @import("antfly_inference_execution_context").RequestContext) anyerror!enrichment_runtime_mod.Config,
+    release: *const fn (*anyopaque) void,
+
+    /// A failed cold setup must not turn an operational outage into a
+    /// permanently unusable read handle. Keep background repair's shared
+    /// provider policy, with construction/transport errors specific to setup.
+    pub fn isRetryableFailure(err: anyerror) bool {
+        return switch (err) {
+            error.OutOfMemory,
+            error.ConcurrencyUnavailable,
+            error.Canceled,
+            error.Cancelled,
+            error.EmbeddingProbeUnavailable,
+            error.RemoteCapabilityDiscoveryTransient,
+            error.ConnectionRefused,
+            error.NetworkUnreachable,
+            error.HostLacksNetworkAddresses,
+            error.TemporaryNameServerFailure,
+            error.NameServerFailure,
+            error.UnexpectedReadFailure,
+            error.SendFailed,
+            error.RecvFailed,
+            => true,
+            else => types.repair_failure.isTransient(err),
+        };
+    }
+};
+
 pub const AsyncContext = struct {
+    apply_exclusive_held: bool = false,
     replay_publication: ?ReplayPublication = null,
     alloc: Allocator,
     io: ?std.Io = null,
@@ -228,9 +262,20 @@ pub const AsyncContext = struct {
     /// enrichment coverage publication. Provider calls never run under this
     /// lock; healthy produced/skipped coverage stays off this path.
     artifact_repair_issue_mutex: std.atomic.Mutex = .unlocked,
+    /// Foreground replay borrows the stable owner's ledger coordination while
+    /// retaining its own projection/capture capabilities.
+    shared_artifact_repair_issue_mutex: ?*std.atomic.Mutex = null,
+
     background_closing: std.atomic.Value(bool) = .init(false),
     enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
+    query_recovery_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
+    query_recovery_factory: ?QueryRecoveryFactory = null,
+    query_recovery_ready: std.atomic.Value(bool) = .init(false),
+    query_recovery_mutex: std.Io.Mutex = .init,
+    query_recovery_condition: std.Io.Condition = .init,
+    query_recovery_in_progress: bool = false,
+    query_recovery_retry_at: u64 = 0,
     enrichment_desired_running: std.atomic.Value(bool) = .init(false),
     enrichment_restart_owner: @import("runtime_restart_owner.zig").Owner = .{},
     target_advance: @import("target_advance_tracker.zig").Tracker = .{},
@@ -243,6 +288,10 @@ pub const AsyncContext = struct {
     repair_options: types.ArtifactRepairRunOptions = .{},
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
+
+    pub fn artifactRepairIssueMutex(self: *const @This()) *std.atomic.Mutex {
+        return self.shared_artifact_repair_issue_mutex orelse &@constCast(self).artifact_repair_issue_mutex;
+    }
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         stopNativeProjectionMaintenance(self);
@@ -632,7 +681,9 @@ pub const ProfiledLock = struct {
 };
 
 pub const BatchExecutionContext = struct {
+    apply_exclusive_held: bool = false,
     alloc: Allocator,
+    ordered_artifact_publication_required: bool = false,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
@@ -1018,6 +1069,22 @@ pub const BatchVisibilityCompletion = struct {
     }
 };
 
+/// One synchronous prepared attempt's irreversible disposition. It is separate
+/// from the caller's cumulative progress marker: optimistic preparation may
+/// retry, while a committed attempt must propagate every later error unchanged.
+pub const PreparedCommitDisposition = struct {
+    pub const State = enum(u8) { preparing, primary_committed };
+    state: State = .preparing,
+
+    pub fn markPrimaryCommitted(self: *@This()) void {
+        self.state = .primary_committed;
+    }
+
+    pub fn permitsPreparationRetry(self: @This(), err: anyerror) bool {
+        return self.state == .preparing and (err == error.PreparedGenerationChanged or err == error.PreparedReadSetChanged);
+    }
+};
+
 pub const BatchExecutionOptions = struct {
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
@@ -1029,6 +1096,8 @@ pub const BatchExecutionOptions = struct {
     restore_staging: ?@import("restore_staging.zig").BatchAdmission = null,
     restore_artifacts: []const @import("restore_staging.zig").Artifact = &.{},
     restore_timestamps: ?*const std.StringHashMapUnmanaged(u64) = null,
+    restore_ttl_sources: ?*const std.StringHashMapUnmanaged(i128) = null,
+    restore_document_version_floor: u64 = 0,
     preserve_logical_values: bool = false,
     restore_replication_request: ?types.BatchRequest = null,
     /// Borrowed upload identity. Finalization retires staged bytes in the
@@ -1042,6 +1111,9 @@ pub const BatchExecutionOptions = struct {
     /// Internal progress marker; set only after the primary store accepts the
     /// write. Visibility admission errors must not invite replay of transforms.
     primary_committed: ?*bool = null,
+    /// Attempt-local borrow installed by batchInternalWithPreparationAllocator. Never
+    /// retained by asynchronous publication or shared across retries.
+    prepared_commit_disposition: ?*PreparedCommitDisposition = null,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
@@ -1056,6 +1128,9 @@ pub const BatchExecutionOptions = struct {
     native_topology_position: ?@import("receipt_position.zig").Native = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
+    /// Outcome-receipt marker committed with the primary write. Internal
+    /// metadata: unlike `extra_store_writes`, it never forces a replay record.
+    outcome_marker_write: ?docstore_mod.KVPair = null,
     extra_store_deletes: []const []const u8 = &.{},
     merge_chunk_expected_progress: ?[32]u8 = null,
     transaction_resolution: ?TransactionResolution = null,
@@ -1119,6 +1194,7 @@ pub const LocalExecutionState = struct {
     vector_migration_active: std.atomic.Value(bool) = .init(false),
     vector_migration_offline_candidate: bool = false,
     artifact_publication_dispatcher: ?ArtifactPublicationDispatcher = null,
+    producer_catalog_generation: AtomicU64 = .init(0),
     /// Planning and visibility observations have one shared owner.
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     visibility_runtime_stats: VisibilityRuntimeStats = .{},
@@ -1320,6 +1396,7 @@ pub fn freeDocumentExtractionUnitDescriptors(alloc: Allocator, descriptors: []Do
 }
 
 pub const PendingDocumentUnitDenseChunkEmbedding = struct {
+    generation: ?embedder_mod.DenseEmbedder.TextGeneration = null,
     reprocess_generation: ?u64 = null,
     embedding_name: []const u8,
     source_field: []const u8,
@@ -1342,6 +1419,7 @@ pub const PendingDocumentUnitDenseChunkEmbedding = struct {
 };
 
 pub const PendingDocumentUnitSparseChunkEmbedding = struct {
+    revision: ??[32]u8 = null,
     reprocess_generation: ?u64 = null,
     embedding_name: []const u8,
     producer_json: []const u8,
@@ -1660,12 +1738,14 @@ pub const GeneratedBatchWritePlan = struct {
 };
 
 pub const GeneratedDenseMemoJob = struct {
+    generation: embedder_mod.DenseEmbedder.TextGeneration = .{},
     key: GeneratedEmbeddingMemo.Key,
     text: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 };
 
 pub const GeneratedSparseMemoJob = struct {
+    revision: ?[32]u8 = null,
     key: GeneratedEmbeddingMemo.Key,
     text: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -1683,13 +1763,21 @@ pub const GeneratedEmbeddingMemo = struct {
     alloc: Allocator,
     reuse_stored_artifacts: bool = false,
     dense: std.AutoHashMapUnmanaged(Key, []f32) = .empty,
+    generations: std.StringHashMapUnmanaged(embedder_mod.DenseEmbedder.TextGeneration) = .empty,
     sparse: std.AutoHashMapUnmanaged(Key, SparseValue) = .empty,
+    sparse_revisions: std.StringHashMapUnmanaged(?[32]u8) = .empty,
 
     pub fn init(alloc: Allocator) GeneratedEmbeddingMemo {
         return .{ .alloc = alloc };
     }
 
     pub fn deinit(self: *@This()) void {
+        var names = self.generations.keyIterator();
+        while (names.next()) |name| self.alloc.free(name.*);
+        self.generations.deinit(self.alloc);
+        var sparse_names = self.sparse_revisions.keyIterator();
+        while (sparse_names.next()) |name| self.alloc.free(name.*);
+        self.sparse_revisions.deinit(self.alloc);
         var dense_values = self.dense.valueIterator();
         while (dense_values.next()) |vector| self.alloc.free(vector.*);
         self.dense.deinit(self.alloc);
@@ -1708,6 +1796,7 @@ pub const GeneratedEmbeddingMemo = struct {
         producer_json: []const u8,
         execution_json: []const u8,
         expected_dims: u32,
+        reprocess_generation: u64,
         source: []const u8,
     ) Key {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1718,12 +1807,96 @@ pub const GeneratedEmbeddingMemo = struct {
             hasher.update(&length_buf);
             hasher.update(part);
         }
+        var epoch_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &epoch_buf, reprocess_generation, .little);
+        hasher.update(&epoch_buf);
         var dims_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &dims_buf, expected_dims, .little);
         hasher.update(&dims_buf);
         var digest: Key = undefined;
         hasher.final(&digest);
         return digest;
+    }
+
+    /// Forced results are document-owned: deletion/recreation can reset the
+    /// numeric epoch. Ordinary writes retain cross-row deduplication.
+    pub fn keyForRequest(alloc: Allocator, store: anytype, request: enrichment_types.GeneratedEnrichmentRequest, source: []const u8, forced: bool) !Key {
+        const base = key(request.kind, @import("enrichment/enrichment_types.zig").requestEmbeddingName(request), request.producer_json, request.execution_json, if (request.kind == .sparse_embedding) 0 else request.expected_dims, request.reprocess_generation, source);
+        if (!forced) return base;
+        const identity = @import("doc_identity.zig");
+        var read = try store.beginProbeTxn();
+        defer read.abort();
+        var stamp: u64 = 0;
+        var tag: u8 = 0;
+        if (try identity.lookupOrdinalTxn(alloc, &read, request.doc_key)) |ordinal| {
+            const state = (try identity.lookupStateTxn(&read, ordinal)) orelse return error.InvalidDocIdentity;
+            if (!state.isLive()) return error.EnrichmentSourceChanged;
+            stamp = state.created_generation;
+            tag = 1;
+        } else {
+            const revisions = @import("../document_mutation_revision.zig");
+            const document = try revisions.keyForDocumentAlloc(alloc, request.doc_key);
+            stamp = try revisions.load(&read, document);
+        }
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("synchronous-forced-document-v1");
+        hash.update(&base);
+        hash.update(&.{tag});
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, stamp, .little);
+        hash.update(&encoded);
+        std.mem.writeInt(u64, &encoded, request.doc_key.len, .little);
+        hash.update(&encoded);
+        hash.update(request.doc_key);
+        var result: Key = undefined;
+        hash.final(&result);
+        return result;
+    }
+
+    /// One immutable provider lease per model per synchronous preparation.
+    pub fn generation(self: *@This(), provider: embedder_mod.DenseEmbedder, name: []const u8) !embedder_mod.DenseEmbedder.TextGeneration {
+        if (self.generations.get(name)) |captured| return captured;
+        const captured = try provider.captureTextGeneration(self.alloc, name);
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        try self.generations.put(self.alloc, owned, captured);
+        return captured;
+    }
+
+    pub fn sparseRevision(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !?[32]u8 {
+        if (self.sparse_revisions.get(name)) |revision| return revision;
+        const revision = try provider.captureRevision(self.alloc, name);
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        try self.sparse_revisions.put(self.alloc, owned, revision);
+        return revision;
+    }
+
+    /// One final check after every producer has finished, before preparation
+    /// transfers its artifacts to the source commit. Never perform provider
+    /// discovery while holding the storage writer or apply lock.
+    pub fn validateRevisions(self: *@This(), dense_provider: ?embedder_mod.DenseEmbedder, sparse_provider: ?embedder_mod.SparseEmbedder) !void {
+        var dense_generations = self.generations.iterator();
+        while (dense_generations.next()) |entry| {
+            const provider = dense_provider orelse return error.MissingDenseEmbedder;
+            try provider.requireTextGeneration(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+        }
+        var sparse_generations = self.sparse_revisions.iterator();
+        while (sparse_generations.next()) |entry| {
+            const provider = sparse_provider orelse return error.MissingSparseEmbedder;
+            try provider.requireRevision(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+
+    pub fn keyAtRevision(base: Key, revision: ?[32]u8) Key {
+        const current = revision orelse return base;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("synchronous-dense-generation-v1");
+        hash.update(&base);
+        hash.update(&current);
+        var result: Key = undefined;
+        hash.final(&result);
+        return result;
     }
 
     pub fn adoptDense(self: *@This(), key_value: Key, owned: []f32) ![]const f32 {
@@ -2310,6 +2483,10 @@ pub const GraphContenderChanges = std.StringHashMapUnmanaged(std.ArrayListUnmana
 pub const EmbeddingArtifactOrigin = union(enum) {
     authored,
     generated: ?u64,
+    /// Generated from text alone, so re-embedding the source reproduces it
+    /// (dense artifacts carry `text_input`; sparse ones treat it as
+    /// `generated`).
+    generated_text: ?u64,
 };
 
 pub const StoreWritePositions = std.StringHashMapUnmanaged(usize);

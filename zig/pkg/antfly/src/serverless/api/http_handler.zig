@@ -1991,6 +1991,7 @@ pub const HttpHandler = struct {
             source_hits,
         );
         defer ctx_owned.deinit(self.alloc);
+        ctx_owned.ctx.control.cancellation = execution.session.?.readCancellation();
 
         const db_hits = try allocDbAggregationHitsAlloc(self.alloc, &execution.session.?, source_hits);
         defer freeDbSearchHits(self.alloc, db_hits);
@@ -2047,6 +2048,15 @@ pub const HttpHandler = struct {
             .context_json = .fromSlice(context_json),
             .hits = if (hits.len == 0) null else hits.ptr,
             .hit_count = @intCast(hits.len),
+            .execution_deadline_ns = ctx.control.deadline_ns orelse 0,
+            .has_execution_deadline = @intFromBool(ctx.control.deadline_ns != null),
+            .cancellation_ctx = if (ctx.control.cancellation != null) @ptrCast(@constCast(&ctx.control.cancellation.?)) else null,
+            .cancellation_fn = if (ctx.control.cancellation != null) struct {
+                fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                    const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                    return @intFromBool(token.isCancelled());
+                }
+            }.cancelled else null,
         });
         defer response.deinit();
         const results = std.json.parseFromSliceLeaky(
@@ -6197,12 +6207,13 @@ pub const HttpHandler = struct {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         const guard = http_types.RequestGuard{ .context = request };
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
-        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (err) {
-            error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
+        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (normalizePublicAggregationError(err)) {
+            error.ManifestReadLeaseContended, error.ManifestVersionRetired, error.StorageBusy => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
+            error.UnsupportedNodeFilterQuery => return error.UnsupportedNodeFilterQuery,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
@@ -6211,6 +6222,8 @@ pub const HttpHandler = struct {
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
+            error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.GraphTraversalQueryBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
@@ -6243,7 +6256,7 @@ pub const HttpHandler = struct {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         return self.executePublicTableQueryViewJsonAlloc(table_name, view, request.cancellation) catch |err| switch (err) {
-            error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
+            error.ManifestReadLeaseContended, error.ManifestVersionRetired, error.StorageBusy => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
@@ -6376,6 +6389,8 @@ pub const HttpHandler = struct {
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
@@ -6387,6 +6402,8 @@ pub const HttpHandler = struct {
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
@@ -10425,13 +10442,7 @@ fn queryOperationalFailureResponse(alloc: Allocator, err: anyerror) !?HttpRespon
 /// well-formed capability this deployment cannot execute. Stateful and
 /// serverless query surfaces share this normalization so callers receive the
 /// same 400/422 contract independent of the serving architecture.
-fn normalizePublicAggregationError(err: anyerror) anyerror {
-    return switch (err) {
-        error.InvalidQueryRequest, error.InvalidAggregation => error.InvalidQueryRequest,
-        error.UnsupportedQueryRequest, error.UnsupportedAggregation => error.UnsupportedQueryRequest,
-        else => err,
-    };
-}
+const normalizePublicAggregationError = public_table_http.normalizePublicAggregationError;
 
 const UnsupportedArtifactIndexSourcesError = struct {
     @"error": []const u8 = "unsupported_index_capability",
@@ -12518,6 +12529,7 @@ test "serverless http handler create index expands schema-derived algebraic conf
 test "serverless create index normalization resolves and persists one probed embedding dimension" {
     const FakeProvider = struct {
         calls: usize = 0,
+        failure: ?anyerror = null,
 
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
@@ -12530,6 +12542,7 @@ test "serverless create index normalization resolves and persists one probed emb
         fn embedDense(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
+            if (self.failure) |failure| return failure;
             const vectors = try alloc.alloc([]f32, texts.len);
             errdefer alloc.free(vectors);
             var initialized: usize = 0;
@@ -12583,6 +12596,12 @@ test "serverless create index normalization resolves and persists one probed emb
         "{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"dimension\":3}",
         response,
     );
+    for ([_]anyerror{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded }) |failure| {
+        provider.failure = failure;
+        try std.testing.expectError(failure, normalizeServerlessCreateIndexConfig(alloc, "semantic_idx",
+            \\{"type":"embeddings","field":"body","embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+        , options));
+    }
 }
 
 test "serverless index catalog validation rejects malformed configs" {
@@ -12600,8 +12619,12 @@ test "serverless index catalog validation rejects malformed configs" {
         \\{"sales_rollup":{"type":"algebraic","version":1,"group_fields":[{"name":"customer","path":"customer","type":"keyword"}],"measure_fields":[{"name":"amount","path":"amount","type":"number"}],"materializations":[{"name":"bad","op":"sum","group_by":["missing"],"measure":"amount"}]}}
     ));
 
+    try validateServerlessIndexCatalog(alloc,
+        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"weekly","op":"count","time":"created_at","bucket":"week"}]}}
+    );
+
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
-        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"bad","op":"count","time":"created_at","bucket":"week"}]}}
+        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"bad","op":"count","time":"created_at","bucket":"fortnight"}]}}
     ));
 
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,

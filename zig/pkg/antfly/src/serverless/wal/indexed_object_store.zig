@@ -35,6 +35,8 @@ pub const IndexedObjectStore = struct {
     bucket: []u8,
     prefix: []u8,
     max_attempts: usize = 8,
+    /// Required for every mutation after native serving ownership is claimed.
+    native_owner: ?[16]u8 = null,
     cancellation: ?objectstore.CancellationToken = null,
     /// Optional host admission ceiling. Existing receipts bypass this limit.
     max_new_lsn: ?u64 = null,
@@ -107,6 +109,7 @@ pub const IndexedObjectStore = struct {
     pub const DocumentIndex = struct { first_lsn: u64, root: ?tree.Ref = null };
     pub const ReadParent = struct { latest_lsn: u64, write_epoch: u64, physical_first_lsn: u64, records: ?tree.Ref = null };
     pub const Head = struct {
+        native_owner: ?[16]u8 = null,
         format: u32 = 2,
         external_payloads: ?bool = null,
         packed_pages: ?bool = null,
@@ -181,6 +184,7 @@ pub const IndexedObjectStore = struct {
             var current = if (borrowed) initial.?.current else try ctx.readHead();
             defer if (!borrowed) current.deinit(self.alloc);
             try Context.check(&ctx);
+            try self.requireOwner(current.value);
             ctx.setEpoch(current.value.write_epoch);
             var uploads = tree.Forest{ .alloc = self.alloc, .underlying = ctx.store() };
             defer uploads.deinit();
@@ -312,6 +316,7 @@ pub const IndexedObjectStore = struct {
             const scratch = attempt.allocator();
             var current = try ctx.readHead();
             defer current.deinit(self.alloc);
+            try self.requireOwner(current.value);
             ctx.setEpoch(current.value.write_epoch);
             var uploads = tree.Forest{ .alloc = self.alloc, .underlying = ctx.store() };
             defer uploads.deinit();
@@ -668,6 +673,35 @@ pub const IndexedObjectStore = struct {
             return self.owner.commit(self.namespace, self.timestamp, self.payload, self.operation_id, self.current.value.latest_lsn, self);
         }
     };
+    fn requireOwner(self: *const @This(), head: Head) !void {
+        if (!std.meta.eql(head.native_owner, self.native_owner)) return error.LakeSourceOwnerRequired;
+    }
+    /// Claim by HEAD CAS: a pre-claim writer can no longer publish its old
+    /// observation; old binaries reject the new field on their next read.
+    pub fn claimNativeOwner(self: *@This(), namespace_: []const u8, owner: [16]u8) !void {
+        if (std.mem.allEqual(u8, &owner, 0)) return error.InvalidWal;
+        var ctx = try Context.init(self, namespace_, null);
+        defer ctx.deinit();
+        for (0..self.max_attempts) |_| {
+            var head = try ctx.readHead();
+            defer head.deinit(self.alloc);
+            if (head.value.native_owner) |previous| {
+                if (!std.mem.eql(u8, &previous, &owner)) return error.LakeSourceOwnerRequired;
+                self.native_owner = owner;
+                return;
+            }
+            var next = head.value;
+            next.native_owner = owner;
+            next.write_epoch = std.math.add(u64, next.write_epoch, 1) catch return error.WalLsnExhausted;
+            self.native_owner = owner;
+            ctx.writeHead(next, head.revision) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            return;
+        }
+        return error.LakeCheckpointConflict;
+    }
     pub fn beginAdmission(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8, operation_id: []const u8) !Admission {
         if (payload.len > payload_store.max_bytes) return error.WalRecordTooLarge;
         if (operation_id.len == 0 or operation_id.len > 4096) return error.InvalidWalOperationId;
@@ -675,6 +709,7 @@ pub const IndexedObjectStore = struct {
         defer ctx.deinit();
         var head = try ctx.readHead();
         errdefer head.deinit(self.alloc);
+        try self.requireOwner(head.value);
         const accepted = try self.findReceipt(ctx.store(), head.value, timestamp, payload, operation_id);
         return .{ .owner = self, .namespace = namespace, .timestamp = timestamp, .payload = payload, .operation_id = operation_id, .current = head, .accepted = accepted, .captured = .{ .head = head.value, .snapshot = try describeHead(self.alloc, ctx.domain, head.value), .observed_ns = ctx.opened_ns, .scope = try self.captureScope(namespace) } };
     }
@@ -772,6 +807,88 @@ pub const IndexedObjectStore = struct {
         var head = try ctx.readHead();
         defer head.deinit(self.alloc);
         return head.value.latest_lsn;
+    }
+
+    /// Forward iteration over one authenticated cut. Navigation pages and the
+    /// packed-object cache live for the cursor, while payloads are hydrated only
+    /// when next() is called. The owner must outlive this operation.
+    pub const CapturedReader = struct {
+        state: *State,
+        const State = struct {
+            alloc: A,
+            ctx: Context,
+            head: Head,
+            expected: u64,
+            end_lsn: u64,
+            max_record_bytes: usize,
+            upper: [8]u8,
+            cursor: ?tree.Cursor = null,
+        };
+        pub fn deinit(self: *CapturedReader) void {
+            const state = self.state;
+            if (state.cursor) |*cursor| cursor.deinit();
+            state.ctx.deinit();
+            state.alloc.destroy(state);
+        }
+        /// Returned payload and operation ID belong to `alloc`.
+        pub fn next(self: *CapturedReader, alloc: A) !?types.Record {
+            const state = self.state;
+            try Context.check(&state.ctx);
+            if (state.expected > state.end_lsn) return null;
+            const base_latest = state.head.latest_lsn - if (state.head.deferred_tail) |*tail| tail.count() else @as(usize, 0);
+            const encoded = value: {
+                if (state.expected == state.head.latest_lsn) if (state.head.inline_tail) |*tail| break :value tail.bytes[0..tail.len];
+                if (state.expected <= base_latest) {
+                    if (state.cursor == null) {
+                        var lower: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &lower, state.expected, .big);
+                        state.cursor = try tree.Cursor.init(state.alloc, state.ctx.store(), state.head.records, &lower, &state.upper);
+                    }
+                    const entry = (try state.cursor.?.next()) orelse return error.InvalidWal;
+                    if (entry.key.len != 8 or std.mem.readInt(u64, entry.key[0..8], .big) != state.expected) return error.InvalidWal;
+                    break :value entry.value;
+                }
+                if (state.head.deferred_tail) |*tail| {
+                    const view = try tail.view();
+                    const index: usize = @intCast(state.expected - base_latest - 1);
+                    if (index < view.record_count) break :value view.records[index];
+                }
+                return error.InvalidWal;
+            };
+            const record = try codec.parseRecord(encoded, 0);
+            if (record.lsn != state.expected or record.next_cursor != encoded.len) return error.InvalidWal;
+            const overhead = encoded.len + @sizeOf(types.Record);
+            if (overhead > state.max_record_bytes) return error.WalReadBudgetExceeded;
+            const payload = if (record.external_payload) try payload_store.load(alloc, state.ctx.store(), record.payload, state.max_record_bytes - overhead) else try alloc.dupe(u8, record.payload);
+            errdefer alloc.free(payload);
+            const id = if (record.operation_id) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (id) |value| alloc.free(value);
+            try Context.check(&state.ctx);
+            state.expected += 1;
+            return .{ .lsn = record.lsn, .timestamp_ns = record.timestamp_ns, .payload = payload, .operation_id = id };
+        }
+    };
+    pub fn capturedReader(self: *@This(), alloc: A, namespace: []const u8, captured: CapturedHead, options: struct {
+        start_lsn: u64,
+        end_lsn: u64,
+        max_record_bytes: usize,
+        cancellation: ?objectstore.CancellationToken = null,
+    }) !CapturedReader {
+        if (options.start_lsn == 0 or options.end_lsn == std.math.maxInt(u64)) return error.InvalidWal;
+        const state = try alloc.create(CapturedReader.State);
+        errdefer alloc.destroy(state);
+        state.* = .{ .alloc = alloc, .ctx = try Context.init(self, namespace, options.cancellation), .head = captured.head, .expected = options.start_lsn, .end_lsn = options.end_lsn, .max_record_bytes = options.max_record_bytes, .upper = undefined };
+        errdefer state.ctx.deinit();
+        if (!std.mem.eql(u8, &captured.scope, &try self.captureScope(namespace))) return error.WalSnapshotScopeMismatch;
+        if (!std.mem.eql(u8, &captured.snapshot.identity, &(try describeHead(self.alloc, state.ctx.domain, captured.head)).identity)) return error.InvalidWal;
+        state.ctx.opened_ns = captured.observed_ns;
+        state.ctx.bounded_roots = captured.head.root_lifetime_ms != null;
+        try Context.check(&state.ctx);
+        if (options.start_lsn < captured.head.first_lsn) return error.WalSnapshotExpired;
+        if (options.end_lsn > captured.head.latest_lsn) return error.WalVisibilityUnavailable;
+        const base_latest = captured.head.latest_lsn - if (captured.head.deferred_tail) |*tail| tail.count() else @as(usize, 0);
+        std.mem.writeInt(u64, &state.upper, @min(options.end_lsn, base_latest) + 1, .big);
+        return .{ .state = state };
     }
 
     pub fn readRangeAlloc(self: *@This(), alloc: A, namespace: []const u8, range: types.ReadRange) ![]types.Record {
@@ -1141,6 +1258,7 @@ pub const IndexedObjectStore = struct {
             const parsed = try std.json.parseFromSlice(Head, a, result.body, .{});
             defer parsed.deinit();
             const head = parsed.value;
+            if (head.native_owner) |owner| if (std.mem.allEqual(u8, &owner, 0)) return error.InvalidWal;
             if ((head.packed_pages orelse false) != (head.format == 5) and head.format != 6 and head.format != 7) return error.InvalidWal;
             if ((head.format != 7 and (head.deferred_indexes == true) != (head.format == 6)) or (head.deferred_tail != null and head.deferred_indexes != true)) return error.InvalidWal;
             if (head.deferred_tail) |*tail| try tail.validate(head.latest_lsn);
@@ -1195,6 +1313,7 @@ pub const IndexedObjectStore = struct {
         }
         fn writeHead(self: *@This(), head: Head, revision: ?objectstore.ObjectRevision) !void {
             try check(self);
+            try self.owner.requireOwner(head);
             const a = self.owner.alloc;
             const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{self.root});
             defer a.free(key);
@@ -2242,6 +2361,13 @@ test "serverless indexed unified WAL large transactions retain receipts and immu
     defer types.freeRecords(a, rows);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqualSlices(u8, body, rows[0].payload);
+    var reader = try fixture.wal.capturedReader(a, "transactions", captured, .{ .start_lsn = 1, .end_lsn = 1, .max_record_bytes = body.len + 4096 });
+    defer reader.deinit();
+    const hydrated = (try reader.next(a)).?;
+    defer a.free(hydrated.payload);
+    defer a.free(hydrated.operation_id.?);
+    try std.testing.expectEqualSlices(u8, body, hydrated.payload);
+    try std.testing.expect(try reader.next(a) == null);
     try std.testing.expectEqual(@as(?u64, 1), try fixture.wal.findIdempotent("transactions", 0, body, "one"));
     try std.testing.expectError(error.WalIdempotencyConflict, fixture.wal.findIdempotent("transactions", 0, "different", "one"));
     try std.testing.expectEqual(@as(u64, 1), try fixture.wal.appendIdempotent("transactions", 0, body, "one"));
@@ -2295,4 +2421,59 @@ test "serverless multiprovider admission cannot renew an expired managed HEAD" {
     try std.testing.expectError(error.WalSnapshotExpired, admission.append());
     try std.testing.expectError(error.WalAdmissionConsumed, admission.append());
     try std.testing.expectEqual(@as(u64, 1), try fixture.wal.latestLsn("docs"));
+}
+
+test "serverless indexed WAL captured reader preserves cuts budgets cancellation and root expiry" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |pack_enabled| {
+        for ([_]bool{ false, true }) |deferred| {
+            var fixture: ManagedReadFixture = undefined;
+            try fixture.init(a);
+            defer fixture.deinit();
+            fixture.wal.packed_pages_enabled = pack_enabled;
+            fixture.wal.deferred_indexes_enabled = deferred;
+            fixture.wal.inline_tail_enabled = true;
+            for (0..4) |i| {
+                const id = try std.fmt.allocPrint(a, "request-{d}", .{i});
+                defer a.free(id);
+                _ = try fixture.wal.appendIdempotent("reader", 0, id, id);
+            }
+            _ = try fixture.wal.materializePending("reader");
+            for (4..7) |i| {
+                const id = try std.fmt.allocPrint(a, "request-{d}", .{i});
+                defer a.free(id);
+                _ = try fixture.wal.appendIdempotent("reader", 0, id, id);
+            }
+            const captured = try fixture.wal.captureRead("reader");
+            _ = try fixture.wal.appendIdempotent("reader", 0, "later", "later");
+            const expected = try fixture.wal.readCapturedRangeAlloc(a, "reader", captured, .{ .start_lsn = 1, .end_lsn = 7 });
+            defer types.freeRecords(a, expected);
+            var canceled: std.atomic.Value(bool) = .init(false);
+            var reader = try fixture.wal.capturedReader(a, "reader", captured, .{ .start_lsn = 1, .end_lsn = 7, .max_record_bytes = 1024, .cancellation = objectstore.CancellationToken.fromAtomic(&canceled) });
+            defer reader.deinit();
+            canceled.store(true, .release);
+            try std.testing.expectError(error.Canceled, reader.next(a));
+            canceled.store(false, .release);
+            for (expected) |row| {
+                const actual = (try reader.next(a)).?;
+                defer a.free(actual.payload);
+                defer if (actual.operation_id) |id| a.free(id);
+                try std.testing.expectEqual(row.lsn, actual.lsn);
+                try std.testing.expectEqualStrings(row.payload, actual.payload);
+                try std.testing.expectEqualStrings(row.operation_id.?, actual.operation_id.?);
+            }
+            try std.testing.expect(try reader.next(a) == null);
+            var limited = try fixture.wal.capturedReader(a, "reader", captured, .{ .start_lsn = 1, .end_lsn = 7, .max_record_bytes = 1 });
+            defer limited.deinit();
+            try std.testing.expectError(error.WalReadBudgetExceeded, limited.next(a));
+            try std.testing.expectError(error.WalSnapshotScopeMismatch, fixture.wal.capturedReader(a, "other", captured, .{ .start_lsn = 1, .end_lsn = 7, .max_record_bytes = 1024 }));
+            var expiring = try fixture.wal.capturedReader(a, "reader", captured, .{ .start_lsn = 1, .end_lsn = 7, .max_record_bytes = 1024 });
+            defer expiring.deinit();
+            const first = (try expiring.next(a)).?;
+            defer a.free(first.payload);
+            defer a.free(first.operation_id.?);
+            fixture.now_ns += 31 * std.time.ns_per_s;
+            try std.testing.expectError(error.WalSnapshotExpired, expiring.next(a));
+        }
+    }
 }

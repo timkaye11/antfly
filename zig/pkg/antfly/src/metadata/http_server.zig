@@ -227,6 +227,9 @@ pub const AdminSource = struct {
         table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
+        linearizable_routing_token: ?*const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.CatalogRoutingChangeToken = null,
+        owner_readiness: ?*const fn (*anyopaque, metadata_api.OwnerReadinessRequest, operation.RequestContext) anyerror!metadata_api.OwnerReadiness = null,
+        privacy_policy_binding: ?*const fn (*anyopaque, []const u8, operation.RequestContext) anyerror!metadata_api.PrivacyPolicyBinding = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         wait_for_routing_change: ?*const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, confirm_absence: bool) anyerror!metadata_api.CatalogRoutingChangeResult = null,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
@@ -656,6 +659,9 @@ pub const AdminSource = struct {
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
+                .linearizable_routing_token = metadataServiceRoutingToken,
+                .owner_readiness = metadataServiceOwnerReadiness,
+                .privacy_policy_binding = metadataServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServiceWaitForRoutingChange,
                 .validate_publication = metadataServiceValidatePublication,
@@ -728,6 +734,9 @@ pub const AdminSource = struct {
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
+                .linearizable_routing_token = metadataHttpServiceRoutingToken,
+                .owner_readiness = metadataHttpServiceOwnerReadiness,
+                .privacy_policy_binding = metadataHttpServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
                 .validate_publication = metadataHttpServiceValidatePublication,
@@ -964,6 +973,30 @@ pub const AdminSource = struct {
         return try svc.catalogTableRoutingSnapshot(table_name, request.deadline_ns);
     }
 
+    fn metadataServiceRoutingToken(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingChangeToken {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        try svc.ensureLinearizableReadWithContext(request);
+        const token = try svc.catalogRoutingChangeToken();
+        try request.ensureActive();
+        return token;
+    }
+
+    fn metadataServiceOwnerReadiness(ptr: *anyopaque, input: metadata_api.OwnerReadinessRequest, request: operation.RequestContext) !metadata_api.OwnerReadiness {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        const result = try svc.ownerReadiness(input, .{ .deadline_ns = request.deadline_ns, .io = request.deadline_io, .cancellation = request.cancellation });
+        try request.ensureActive();
+        return result;
+    }
+
+    fn metadataServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.PrivacyPolicyBinding {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
+        return svc.privacyPolicyBinding(table_name, request.deadline_ns);
+    }
+
     fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         svc.freeCatalogRoutingSnapshot(snapshot);
@@ -1018,10 +1051,11 @@ pub const AdminSource = struct {
         expected: metadata_table_manager.TableRecord,
         replacement: metadata_table_manager.TableRecord,
     ) !metadata_api.CatalogMutationStamp {
+        if (try service.admitPrivacyProgressOnService(svc, expected, replacement))
+            return svc.replaceTableDefinitionStamped(expected, replacement);
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
-        const current = findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
-        if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+        try service.validateCurrentTableDefinitionOnService(svc, &snapshot, expected, replacement);
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(std.heap.page_allocator, replacement.indexes_json);
         try managed_embedder.validateEmbeddingProducerOwnershipJson(std.heap.page_allocator, replacement.indexes_json);
         if (try extension_table_ownership.definitionMutationTouchesOwnedState(
@@ -1476,6 +1510,30 @@ pub const AdminSource = struct {
         try svc.ensureLinearizableReadWithContext(request);
         try request.ensureActive();
         return try svc.catalogTableRoutingSnapshot(table_name, request.deadline_ns);
+    }
+
+    fn metadataHttpServiceRoutingToken(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingChangeToken {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        try svc.ensureLinearizableReadWithContext(request);
+        const token = try svc.catalogRoutingChangeToken();
+        try request.ensureActive();
+        return token;
+    }
+
+    fn metadataHttpServiceOwnerReadiness(ptr: *anyopaque, input: metadata_api.OwnerReadinessRequest, request: operation.RequestContext) !metadata_api.OwnerReadiness {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        const result = try svc.ownerReadiness(input, .{ .deadline_ns = request.deadline_ns, .io = request.deadline_io, .cancellation = request.cancellation });
+        try request.ensureActive();
+        return result;
+    }
+
+    fn metadataHttpServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.PrivacyPolicyBinding {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
+        return svc.privacyPolicyBinding(table_name, request.deadline_ns);
     }
 
     fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -1976,6 +2034,9 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_linearizable_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableRoutingSnapshot));
         try server.post(routes.Routes.internal_table_routing_snapshot, httpx.Handler.bind(self, metadataTableRoutingSnapshot));
         try server.post(routes.Routes.internal_linearizable_table_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableTableRoutingSnapshot));
+        try server.post(routes.Routes.internal_routing_token, httpx.Handler.bind(self, metadataRoutingToken));
+        try server.post(routes.Routes.internal_owner_readiness, httpx.Handler.bind(self, metadataOwnerReadiness));
+        try server.post(routes.Routes.internal_privacy_policy_binding, httpx.Handler.bind(self, metadataPrivacyPolicyBinding));
         try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_routing_authority, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_await_route, httpx.Handler.bind(self, metadataAwaitRoute));
@@ -2536,6 +2597,42 @@ pub const MetadataHttpServer = struct {
         defer self.source.freeRoutingSnapshot(&result);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedRoutingSnapshotJsonUntil(ctx, result);
+    }
+
+    fn metadataRoutingToken(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        const capture = self.source.vtable.linearizable_routing_token orelse return ctx.status(404).text("routing token unsupported");
+        const token = capture(self.source.ptr, request) catch |err| return metadataReadError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return ctx.json(token);
+    }
+
+    fn metadataOwnerReadiness(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const body = (try ctx.body()) orelse "";
+        var parsed = std.json.parseFromSlice(metadata_api.OwnerReadinessRequest, ctx.allocator, body, .{ .allocate = .alloc_always }) catch return ctx.status(400).text("invalid owner readiness request");
+        defer parsed.deinit();
+        if (parsed.value.table_id == 0 or parsed.value.owners.len == 0 or parsed.value.owners.len > 1024) return ctx.status(400).text("invalid owner readiness request");
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        const capture = self.source.vtable.owner_readiness orelse return ctx.status(503).text("owner readiness unavailable");
+        const result = capture(self.source.ptr, parsed.value, request) catch |err| return metadataReadError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return ctx.json(result);
+    }
+
+    fn metadataPrivacyPolicyBinding(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        var parsed = parseTableRoutingSnapshotRequest(ctx) catch return ctx.status(400).text("invalid privacy binding request");
+        defer parsed.deinit();
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        const capture = self.source.vtable.privacy_policy_binding orelse return ctx.status(503).text("privacy binding unavailable");
+        const binding = capture(self.source.ptr, parsed.value.table_name, request) catch |err| return metadataReadError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return ctx.json(binding);
     }
 
     fn metadataLinearizableTableRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {

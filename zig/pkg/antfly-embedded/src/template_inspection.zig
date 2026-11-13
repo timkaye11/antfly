@@ -20,6 +20,27 @@ const hbs = @import("handlebars");
 const Value = hbs.Value;
 const HelperContext = hbs.HelperContext;
 const ContentPart = @import("antfly_template_content").ContentPart;
+/// Borrowed request-lifetime observer; durable owners decide scheduling.
+pub const RetryHintObserver = struct {
+    ptr: *anyopaque,
+    note_fn: *const fn (*anyopaque, u64, u64, ?[32]u8) void,
+    source_bytes: ?[]const u8 = null,
+    request_fingerprint: u64 = 0,
+    pub fn scoped(self: @This(), fingerprint: u64) @This() {
+        var result = self;
+        result.request_fingerprint = fingerprint;
+        return result;
+    }
+    pub fn note(self: @This(), milliseconds: u64) void {
+        const digest: ?[32]u8 = if (self.source_bytes) |bytes| blk: {
+            var value: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &value, .{});
+            break :blk value;
+        } else null;
+        self.note_fn(self.ptr, self.request_fingerprint, milliseconds, digest);
+    }
+};
+
 pub const remote_credentials_argument = "credentials";
 
 pub fn mediaHelper(ctx: HelperContext) anyerror!Value {
@@ -131,8 +152,10 @@ pub const ErrorDirective = struct {
     /// Returns true if the status indicates the resource is permanently
     /// unavailable and should not be retried.
     pub fn isPermanent(self: ErrorDirective) bool {
-        return self.status == 401 or self.status == 403 or
-            self.status == 404 or self.status == 410 or self.status == 413;
+        return switch (self.status) {
+            400...407, 409...424, 426...428, 430...499 => true,
+            else => false,
+        };
     }
 };
 
@@ -206,4 +229,34 @@ pub fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
     if (directives.len == 0) return;
     if (directives[0].isPermanent()) return error.PermanentPromptFailure;
     return error.TransientPromptFailure;
+}
+
+/// Evaluate helper dependencies without performing remote work. This follows
+/// conditional branches and subexpressions through the normal template engine.
+pub fn canReplayLocally(alloc: Allocator, source: []const u8, document: []const u8) !bool {
+    if (std.mem.indexOf(u8, source, "remote") == null and std.mem.indexOf(u8, source, "transcribeAudio") == null) return true;
+    const Probe = struct {
+        fn remote(ctx: HelperContext) anyerror!Value {
+            const used: *bool = @ptrCast(@alignCast(ctx.userdata.?));
+            used.* = true;
+            return .{ .string = "" };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var used = false;
+    var helpers: hbs.HelperMap = .{};
+    for ([_][]const u8{ "remoteMedia", "remotePDF", "remoteText", "transcribeAudio" }) |name|
+        try helpers.put(arena.allocator(), name, hbs.Helper.withData(&Probe.remote, @ptrCast(&used)));
+    const rendered = try @import("template.zig").renderDocumentWithHelpers(alloc, source, document, &helpers);
+    defer alloc.free(rendered);
+    return !used;
+}
+
+test "leann local replay inspects executed helpers without remote work" {
+    const a = std.testing.allocator;
+    try std.testing.expect(try canReplayLocally(a, "remote literal {{remote_field}}", "{\"remote_field\":\"text\"}"));
+    try std.testing.expect(try canReplayLocally(a, "{{#if image}}{{remoteMedia url=image}}{{else}}{{body}}{{/if}}", "{\"body\":\"alpha\"}"));
+    for ([_][]const u8{ "{{transcribeAudio url=image}}", "remote literal {{transcribeAudio url=image}}", "{{remoteMedia url=image mode=extract}}", "{{remotePDF url=image}}", "{{remoteText url=image}}", "{{#if (remoteText url=image)}}yes{{/if}}" }) |source|
+        try std.testing.expect(!try canReplayLocally(a, source, "{\"image\":\"https://example.invalid/file.pdf\"}"));
 }

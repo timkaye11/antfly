@@ -40,7 +40,20 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 25;
+pub const batch_protocol_version: u16 = 29;
+/// Version 29 understands dense text-origin and int8-stub flags. Activation
+/// certifies every applying replica before these envelopes or fragments appear.
+pub const batch_dense_artifact_flags_protocol_version: u16 = 29;
+/// Version 28 preserves neutral document-version semantics when decoding
+/// guarded graph cleanup. Earlier v27 peers reject these commands, so the
+/// corrected leader must activate this version across every applying replica.
+pub const batch_graph_cleanup_neutral_protocol_version: u16 = 28;
+/// Explicit document revision semantics and source-preserving retained tails.
+/// Missing command tags retain the pre-v27 timestamp semantics on replay.
+pub const batch_document_revisions_protocol_version: u16 = 27;
+/// Version 26 binds generated vector publications to resolved model revisions
+/// and admits catalog-aware grouped-source activation.
+pub const batch_execution_identity_protocol_version: u16 = 26;
 /// Version 25 carries leader-planned LEANN records (`_leann_record`), which
 /// replicas persist and apply verbatim in log order. Older peers cannot
 /// treat them as empty batches.

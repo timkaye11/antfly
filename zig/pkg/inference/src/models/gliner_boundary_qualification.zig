@@ -20,11 +20,13 @@
 //!
 //! The production table holds exactly the artifacts that passed a reviewed
 //! release qualification: exact weight/sidecar digests, backend, feature
-//! set, and safe LengthContract bounds measured on the real artifact (see
+//! set, and LengthContract coverage measured on the real artifact (see
 //! zig/pkg/inference/models/gliner2/GLINER25.md for the record). This module
 //! does not consume JSON evidence, expose a runtime override, or
-//! authenticate release evidence. Adding a row is a reviewed release
-//! decision, not an inference from successful loading or from the
+//! authenticate release evidence. Serving checks identity/backend/features
+//! here, then actual model/resource limits in the executors; measured geometry
+//! remains an evidence contract rather than an execution-capacity limit.
+//! Adding a row is a reviewed release decision, not an inference from successful loading or from the
 //! architecture-wide runtime_available flag.
 const std = @import("std");
 const bundle = @import("gliner_boundary_bundle.zig");
@@ -1296,7 +1298,7 @@ test "boundary qualification range matching has no saturating or overflow accept
 
 test "boundary qualification Transformers wrapper has exactly the original fp32 profiles" {
     const identity = fastino_gliner25_base_v1_transformers;
-    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(std.testing.allocator, "models/base/config_transformers.json");
+    const bytes = try @import("../architectures/gliner/fixture_bytes.zig").fixtureBytes(std.testing.allocator, "models/base/config_transformers.json");
     defer std.testing.allocator.free(bytes);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});

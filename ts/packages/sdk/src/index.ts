@@ -38,11 +38,14 @@ export {
   AntflyClient,
   DEFAULT_WRITE_MAX_REQUEST_BYTES,
   DEFAULT_WRITE_MAX_RESPONSE_BYTES,
+  type GraphDiagnostic,
+  GraphExecutionError,
   HierarchyCursorStaleError,
   INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES,
   type IndexMutationTemporarilyUnavailableCode,
   IndexMutationTemporarilyUnavailableError,
   type IndexOperations,
+  type PrivacyTableTarget,
   QUERY_TEMPORARILY_UNAVAILABLE_CODES,
   type QueryExecutionOptions,
   type QueryTemporarilyUnavailableCode,
@@ -88,6 +91,7 @@ export {
   InferenceAPIError,
   InferenceCapacityError,
   InferenceClient,
+  InferenceTransportError,
 } from "./inference-client.js";
 export {
   decodeNumericDenseFrame,
@@ -151,8 +155,6 @@ export type {
   RewriteResponse,
   Style,
   TextContentPart,
-  TranscribeRequest,
-  TranscribeResponse,
   TransientCapacityError,
 } from "./inference-types.js";
 export { logLevels, logStyles } from "./inference-types.js";
@@ -181,6 +183,9 @@ export {
 export { Client, type SDKConfig } from "./sdk.js";
 // Type exports
 export type {
+  AgentContextDiagnostics,
+  AgentContextEvent,
+  AgentContextManagement,
   // Chat Agent types
   AgentDecision,
   AgentQuestion,
@@ -540,9 +545,42 @@ export type {
 } from "./client.js";
 export { ChatGPTConnectionError } from "./client.js";
 export { AntflyHTTPError, AntflyResponseError } from "./errors.js";
-export type { MemoryNumbers, MemoryPaths, MemorySchemas } from "./memory.js";
+export type { GraphData, GraphDecoded, GraphIdentity, GraphValue } from "./graph-wire.js";
+export { decodeGraphValue, encodeGraphParameter } from "./graph-wire.js";
+export type { AudioReadMetadata, AudioReadOptions, AudioReadSegment } from "./inference-types.js";
+export type {
+  MemoryCallOptions,
+  MemoryEpisodeQuery,
+  MemoryHistoryQuery,
+  MemoryListQuery,
+  MemoryNumbers,
+  MemoryPageQuery,
+  MemoryPaths,
+  MemoryRememberInput,
+  MemorySchemas,
+  MemoryScopeOptions,
+} from "./memory.js";
 export { parseMemoryJSON, stringifyMemoryJSON } from "./memory.js";
 export * from "./models.js";
+export type {
+  SeriesBucket,
+  SeriesPoint,
+  SeriesQueryOptions,
+  SeriesRange,
+  SeriesSQLOptions,
+  TimeSeries,
+} from "./time-series.js";
+export {
+  fixedDurationNanoseconds,
+  SeriesImportError,
+  seriesBatch,
+  seriesQuery,
+  seriesRead,
+  seriesResults,
+  seriesSQL,
+  seriesTimestampNanoseconds,
+  timeSeriesTable,
+} from "./time-series.js";
 export type {
   CatalogTablespaceBindingRequest,
   ChatGPTAccount,
@@ -550,7 +588,26 @@ export type {
   ChatGPTOutcome,
   CreateTablespaceRequest,
   DatabaseCatalogRecord,
+  GraphCatalogEntry,
+  GraphDefinition,
+  GraphLabelMapping,
+  GraphQueryRequest,
+  GraphQueryResult,
+  GraphQueryStats,
+  GraphRelationshipMapping,
+  GraphWriteReceipt,
+  GraphWriteStatus,
   NamespaceCatalogRecord,
+  PrivacyCategory,
+  PrivacyFinding,
+  PrivacyFindingsPage,
+  PrivacyPolicy,
+  PrivacyPreview,
+  PrivacyPreviewRequest,
+  PrivacyProducer,
+  PrivacyScan,
+  PrivacyScanRequest,
+  PrivacyStatus,
   RenameCatalogResourceRequest,
   TablespaceCatalogRecord,
 } from "./types.js";
