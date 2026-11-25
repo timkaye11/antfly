@@ -230,6 +230,9 @@ def check_sync_publication_errors(binary):
             for source, code in (
                 ("fixture-durability-unknown.aflite", "DurabilityOutcomeUnknown"),
                 ("fixture-path-exists.aflite", "PathAlreadyExists"),
+                ("fixture-writer-locked.aflite", "WriterLocked"),
+                ("fixture-expansion-limit.aflite", "BackupExpansionLimitExceeded"),
+                ("fixture-receipt-missing.aflite", "SyncReceiptDeliveryFailed"),
             ):
                 result, _ = invoke(
                     binary,
@@ -253,6 +256,11 @@ def check_sync_publication_errors(binary):
                     if code == "DurabilityOutcomeUnknown":
                         require(error["execution"] == "unconfirmed", str(error))
                         require(error["category"] != "argument", str(error))
+                    if code == "SyncReceiptDeliveryFailed":
+                        require(error["execution"] == "complete", str(error))
+                        require(error["category"] == "delivery", str(error))
+                if code == "SyncReceiptDeliveryFailed":
+                    require(b"published --out" in result.stderr, str(result.stderr))
                 if code == "DurabilityOutcomeUnknown":
                     require(
                         b"may already have been published" in result.stderr,
@@ -852,6 +860,40 @@ def run(binary):
         json.loads(calls[-1][2])["stream"] is False,
         "human retrieval requested streaming by default",
     )
+
+    # A queued phase failure leaves the job available for an explicit resume.
+    refused_job = {
+        "job_id": "job:1",
+        "state": "queued",
+        "phase": "research",
+        "query": "one",
+        "last_error": "ConnectionRefused",
+    }
+    for arguments in (
+        ["--resume-job", "job:1"],
+        [
+            "--job",
+            "--table",
+            "docs",
+            "--query",
+            "one",
+            "--generator",
+            '{"provider":"antfly","model":"fixture"}',
+        ],
+    ):
+        with server(refused_job, status=202) as (url, calls):
+            result, _ = invoke(
+                binary,
+                ["--output", "json", "agents", "research", *arguments],
+                environment(url),
+            )
+        require(result.returncode != 0, "queued phase failure reported CLI success")
+        require(len(calls) == 1, "CLI retried a refused connection")
+        require(json.loads(result.stdout) == refused_job, str(result.stdout))
+        require(
+            b"ConnectionRefused; resume with --resume-job job:1" in result.stderr,
+            str(result.stderr),
+        )
 
     # Workflow payloads share presentation budgets without discarding lifecycle
     # controls. Explicit JSON remains the unmodified transport response.
