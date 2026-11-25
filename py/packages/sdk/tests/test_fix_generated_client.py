@@ -5,6 +5,7 @@ import pytest
 from fix_generated_client import (
     EMBED_REQUEST,
     FILES,
+    NATIVE_CHECKPOINT_RESUME_OPERATIONS,
     NDJSON_HEADER,
     NDJSON_RESPONSE,
     RELATIONAL_QUERY,
@@ -61,6 +62,18 @@ def write_generated_files(root: Path, signature_count: int) -> None:
             "response = client.get_httpx_client().request(**kwargs)\n"
             "response = await client.get_async_httpx_client().request(**kwargs)\n"
         )
+    for relative in NATIVE_CHECKPOINT_RESUME_OPERATIONS:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "from ...client import Client\n"
+            + ("body: File | File | Unset = UNSET\n" * 5)
+            + 'if isinstance(body, File):\n    _kwargs["content"] = body.payload\n'
+            '    headers["Content-Type"] = "application/vnd.antfly.attachments.v1"\n'
+            'if isinstance(body, File):\n    _kwargs["content"] = body.payload\n'
+            '    headers["Content-Type"] = "application/vnd.antfly.attachments.v2"\n'
+            "response = await client.get_async_httpx_client().request(**kwargs)\n"
+        )
     path = root / EMBED_REQUEST
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -105,6 +118,16 @@ def test_required_ndjson_body_is_not_made_optional(tmp_path: Path) -> None:
         limit = " max_response_bytes=1 << 20," if relative.stem == "poll_sql_notifications" else ""
         assert f"response = sql_request(client.get_httpx_client(),{limit}**kwargs)" in source
         assert f"response = await sql_request_async(client.get_async_httpx_client(),{limit}**kwargs)" in source
+
+    for relative in NATIVE_CHECKPOINT_RESUME_OPERATIONS:
+        source = (tmp_path / relative).read_text()
+        assert source.count("body: File") == 5
+        assert "Unset = UNSET" not in source
+        assert source.count('_kwargs["content"] = body.payload') == 2
+        assert source.count("application/vnd.antfly.attachments.v1") == 1
+        assert source.count("application/vnd.antfly.attachments.v2") == 1
+        assert "from ....native_kv_transport import native_kv_request_async" in source
+        assert "response = await native_kv_request_async(client.get_async_httpx_client(),**kwargs)" in source
     embed_source = (tmp_path / EMBED_REQUEST).read_text()
     assert embed_source.count("if isinstance(self.input_, list):") == 1
     assert "ordered content inputs cannot be mixed" in embed_source
@@ -118,6 +141,45 @@ def test_generator_shape_drift_fails_before_writing(tmp_path: Path) -> None:
         fix_generated_client(tmp_path)
 
     assert {relative: (tmp_path / relative).read_text() for relative in FILES} == before
+
+
+@pytest.mark.parametrize("operation", NATIVE_CHECKPOINT_RESUME_OPERATIONS)
+def test_native_checkpoint_generator_shape_drift_fails_before_any_writes(tmp_path: Path, operation: Path) -> None:
+    write_generated_files(tmp_path, signature_count=5)
+    path = tmp_path / operation
+    path.write_text(
+        path.read_text().replace("await client.get_async_httpx_client().request(", "await changed_request(")
+    )
+    files = [*FILES, RELATIONAL_QUERY, *SQL_OPERATIONS, *NATIVE_CHECKPOINT_RESUME_OPERATIONS]
+    before = {relative: (tmp_path / relative).read_bytes() for relative in files}
+    with pytest.raises(RuntimeError, match="unexpected generated shape"):
+        fix_generated_client(tmp_path)
+    assert {relative: (tmp_path / relative).read_bytes() for relative in files} == before
+
+
+@pytest.mark.parametrize("mutation", ["missing-v1", "third-media", "reversed", "signature-drift"])
+def test_native_checkpoint_dual_media_shape_is_exact_and_atomic(tmp_path: Path, mutation: str) -> None:
+    write_generated_files(tmp_path, signature_count=5)
+    path = tmp_path / NATIVE_CHECKPOINT_RESUME_OPERATIONS[0]
+    source = path.read_text()
+    if mutation == "missing-v1":
+        source = source.replace('    headers["Content-Type"] = "application/vnd.antfly.attachments.v1"\n', "")
+    elif mutation == "third-media":
+        source += (
+            'headers["Content-Type"] = "application/vnd.antfly.attachments.v3"\n_kwargs["content"] = body.payload\n'
+        )
+    elif mutation == "signature-drift":
+        source = source.replace("body: File | File | Unset = UNSET", "body: File", 1)
+    else:
+        first = "application/vnd.antfly.attachments.v1"
+        second = "application/vnd.antfly.attachments.v2"
+        source = source.replace(first, "TEMP").replace(second, first).replace("TEMP", second)
+    path.write_text(source)
+    files = [*FILES, RELATIONAL_QUERY, *SQL_OPERATIONS, *NATIVE_CHECKPOINT_RESUME_OPERATIONS]
+    before = {relative: (tmp_path / relative).read_bytes() for relative in files}
+    with pytest.raises(RuntimeError, match="binary file body"):
+        fix_generated_client(tmp_path)
+    assert {relative: (tmp_path / relative).read_bytes() for relative in files} == before
 
 
 @pytest.mark.parametrize("operation", SQL_OPERATIONS)

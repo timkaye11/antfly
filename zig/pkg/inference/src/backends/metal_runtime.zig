@@ -181,6 +181,30 @@ pub const MetalDeviceInfo = extern struct {
     reserved: [7]u8 = @splat(0),
 };
 
+pub fn nativeCheckpointDestination() !@import("../runtime/kv/attention_match_release.zig").Destination {
+    var info: MetalDeviceInfo = .{};
+    if (termite_metal_device_info_get(&info) != 0) return error.UnqualifiedCompactionArtifact;
+    var name: [512]u8 = undefined;
+    const name_len = termite_metal_copy_device_name(name[0..].ptr, name.len);
+    var compiler: [1024]u8 = undefined;
+    const compiler_len = termite_metal_copy_compiler_identity(compiler[0..].ptr, compiler.len);
+    if (name_len == 0 or name_len > name.len or compiler_len == 0 or compiler_len > compiler.len)
+        return error.UnqualifiedCompactionArtifact;
+    var destination: @import("../runtime/kv/attention_match_release.zig").Destination = .{
+        .device_registry_id = info.registry_id,
+        .physical_memory_bytes = termite_metal_physical_memory_bytes(),
+        .device_name_sha256 = undefined,
+        .compiler_identity_sha256 = undefined,
+    };
+    std.crypto.hash.sha2.Sha256.hash(name[0..name_len], &destination.device_name_sha256, .{});
+    const host_compiler = @import("../runtime/kv/attention_match_compiler.zig");
+    destination.compiler_identity_sha256 = host_compiler.fingerprint(compiler[0..compiler_len], host_compiler.Profile.current());
+    try destination.validate();
+    return destination;
+}
+
+pub extern fn termite_metal_physical_memory_bytes() u64;
+
 pub const MetalGeneratedPipelineInfo = extern struct {
     static_threadgroup_memory_length: u64 = 0,
     thread_execution_width: u32 = 0,
@@ -1313,6 +1337,36 @@ fn f32ToF16Bits(value: f32) u16 {
     return @bitCast(@as(f16, @floatCast(value)));
 }
 
+fn f16BitsToF32(bits: u16) f32 {
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+
+fn widenF16LittleEndian(bytes: []const u8, output: []f32) bool {
+    const required = std.math.mul(usize, output.len, @sizeOf(u16)) catch return false;
+    if (bytes.len < required) return false;
+    for (output, 0..) |*value, i| {
+        value.* = f16BitsToF32(std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little));
+    }
+    return true;
+}
+
+fn f16PleQ8StagingPolicy(enable: bool, disable: bool) bool {
+    return enable and !disable;
+}
+
+fn f16PleQ8StagingEnabled() bool {
+    return f16PleQ8StagingPolicy(
+        getenvBool("TERMITE_METAL_ENABLE_PLE_MODEL_PROJ_F16_Q8"),
+        getenvBool("TERMITE_METAL_DISABLE_PLE_MODEL_PROJ_F16_Q8"),
+    );
+}
+
+const f16_ple_q8_transient_cap: usize = 128 * 1024 * 1024;
+
+fn f16PleQ8TransientCap(explicit_cap: ?usize) usize {
+    return @min(explicit_cap orelse f16_ple_q8_transient_cap, f16_ple_q8_transient_cap);
+}
+
 test "Metal BF16 mirror conversion rounds ties to even" {
     try std.testing.expectEqual(@as(u16, 0x3f80), f32ToBf16BitsRoundNearestEven(1.0));
     try std.testing.expectEqual(@as(u16, 0x3f80), f32ToBf16BitsRoundNearestEven(@bitCast(@as(u32, 0x3f808000))));
@@ -1322,6 +1376,23 @@ test "Metal BF16 mirror conversion rounds ties to even" {
 test "Metal F16 mirror conversion uses IEEE half precision" {
     try std.testing.expectEqual(@as(u16, 0x3c00), f32ToF16Bits(1.0));
     try std.testing.expectEqual(@as(u16, 0xc000), f32ToF16Bits(-2.0));
+    try std.testing.expectEqual(@as(f32, 1.0), f16BitsToF32(0x3c00));
+    try std.testing.expectEqual(@as(f32, -2.0), f16BitsToF32(0xc000));
+    const encoded = [_]u8{ 0x00, 0x3c, 0x00, 0xc0, 0x00, 0x38 };
+    var widened: [3]f32 = undefined;
+    try std.testing.expect(widenF16LittleEndian(&encoded, &widened));
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, -2.0, 0.5 }, &widened);
+    try std.testing.expect(!widenF16LittleEndian(encoded[0..5], &widened));
+}
+
+test "Metal F16 PLE Q8 staging is opt in and disable wins" {
+    try std.testing.expect(!f16PleQ8StagingPolicy(false, false));
+    try std.testing.expect(f16PleQ8StagingPolicy(true, false));
+    try std.testing.expect(!f16PleQ8StagingPolicy(false, true));
+    try std.testing.expect(!f16PleQ8StagingPolicy(true, true));
+    try std.testing.expectEqual(f16_ple_q8_transient_cap, f16PleQ8TransientCap(null));
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), f16PleQ8TransientCap(64 * 1024 * 1024));
+    try std.testing.expectEqual(f16_ple_q8_transient_cap, f16PleQ8TransientCap(256 * 1024 * 1024));
 }
 
 fn traceGlinerStages() bool {
@@ -1671,6 +1742,14 @@ pub fn noteDecoderRuntimeGreedyPrepared(self: anytype, kv_tokens: usize) void {
     self.raw_decoder_prepared_kv_tokens = @max(self.raw_decoder_prepared_kv_tokens, kv_tokens);
 }
 
+/// Slot rollback must revoke the aggregate family fast-hit certificate. KV
+/// allocations may remain reusable, but a later family prepare must re-check
+/// and repopulate every immutable slot before publishing readiness again.
+pub fn invalidateDecoderRuntimeFamilyPrepared(self: anytype) void {
+    self.raw_decoder_family_prepared = false;
+    self.raw_decoder_prepared_kv_tokens = 0;
+}
+
 pub fn decoderRuntimePreparedSlotsMatchFamily(self: anytype, gpt_config: anytype) bool {
     return decoderRuntimePreparedSlotsMatchFamilyWithTail(self, gpt_config, true);
 }
@@ -1995,6 +2074,32 @@ pub fn forwardLastLogitsTensorFamily(
     };
 }
 
+/// Try the backend-owned singleton frame that returns canonical full logits.
+/// `.unsupported` is the only clean decline. Any failure after admission is
+/// returned as an error so callers cannot append the same KV position twice.
+pub fn forwardBackendOwnedFullLogitsFamily(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: anytype,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const anyopaque,
+) !decoder_gated_runtime.BackendOwnedFullLogits {
+    return switch (gpt_config.family) {
+        .gemma => decoder_gated_runtime.forwardBackendOwnedFullLogitsAtomic(
+            cb,
+            allocator,
+            gpt_config,
+            configured_layer_count,
+            token_id,
+            seq_len,
+            @ptrCast(@alignCast(decode_context)),
+        ),
+        else => .unsupported,
+    };
+}
+
 pub fn forwardGreedyTokenPipelinedArmFamily(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -2018,6 +2123,31 @@ pub fn forwardGreedyTokenPipelinedArmFamily(
     };
 }
 
+pub fn forwardGreedyTokenPipelinedArmSuppressFamily(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: anytype,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const anyopaque,
+    suppress_token_ids: []const i32,
+) !bool {
+    return switch (gpt_config.family) {
+        .gemma => decoder_gated_runtime.forwardGreedyTokenPipelinedArmSuppress(
+            cb,
+            allocator,
+            gpt_config,
+            configured_layer_count,
+            token_id,
+            seq_len,
+            @ptrCast(@alignCast(decode_context)),
+            suppress_token_ids,
+        ),
+        else => false,
+    };
+}
+
 pub fn forwardGreedyTokenPipelinedStepFamily(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -2034,6 +2164,55 @@ pub fn forwardGreedyTokenPipelinedStepFamily(
             configured_layer_count,
             seq_len,
             @ptrCast(@alignCast(decode_context)),
+        ),
+        else => null,
+    };
+}
+
+pub fn forwardGreedyTokenPipelinedStepSuppressFamily(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: anytype,
+    configured_layer_count: usize,
+    seq_len: usize,
+    decode_context: *const anyopaque,
+    suppress_token_ids: []const i32,
+) !?i64 {
+    return switch (gpt_config.family) {
+        .gemma => decoder_gated_runtime.forwardGreedyTokenPipelinedStepSuppress(
+            cb,
+            allocator,
+            gpt_config,
+            configured_layer_count,
+            seq_len,
+            @ptrCast(@alignCast(decode_context)),
+            suppress_token_ids,
+        ),
+        else => null,
+    };
+}
+
+pub fn forwardGreedyTokenSuppressFamily(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: anytype,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const anyopaque,
+    suppress_token_ids: []const i32,
+) !?i64 {
+    if (suppress_token_ids.len == 0) return null;
+    return switch (gpt_config.family) {
+        .gemma => decoder_gated_runtime.forwardGreedyTokenSuppress(
+            cb,
+            allocator,
+            gpt_config,
+            configured_layer_count,
+            token_id,
+            seq_len,
+            @ptrCast(@alignCast(decode_context)),
+            suppress_token_ids,
         ),
         else => null,
     };
@@ -2638,6 +2817,56 @@ pub fn decoderRuntimeQuantEmbeddingLookup(
     scale: f32,
 ) !?MetalTensor {
     return decoderRuntimeQuantEmbeddingLookupBounded(self, storage, ids, total, dim, scale, false);
+}
+
+pub fn decoderRuntimeSelectBoundedPleQ6(self: anytype, storage: *const QuantizedStorage, dim: usize) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (quantizedRuntimeLinearKind(storage) != .q6_k) return error.BoundedPleRouteUnavailable;
+    if (dim != 8960 and dim != 10752) return error.BoundedPleRouteUnavailable;
+    const rows = quantizedEmbeddingRows(storage, dim) orelse return error.BoundedPleRouteUnavailable;
+    const rc = termite_metal_decode_runtime_select_bounded_ple_q6(runtime, storage.raw_bytes.ptr, storage.raw_bytes.len, rows, dim);
+    if (rc != 0) return error.BoundedPleRouteUnavailable;
+    return true;
+}
+
+pub fn decoderRuntimeBoundedPleQ6Lookup(
+    self: anytype,
+    storage: *const QuantizedStorage,
+    ids: []const i64,
+    dim: usize,
+    scale: f32,
+) !MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return error.BoundedPleRouteUnavailable;
+    if (ids.len == 0 or ids.len > 512 or (dim != 8960 and dim != 10752)) return error.BoundedPleRouteUnavailable;
+    if (quantizedRuntimeLinearKind(storage) != .q6_k) return error.BoundedPleRouteUnavailable;
+    const rows = quantizedEmbeddingRows(storage, dim) orelse return error.BoundedPleRouteUnavailable;
+    const ids_u32 = try std.heap.c_allocator.alloc(u32, ids.len);
+    defer std.heap.c_allocator.free(ids_u32);
+    for (ids, 0..) |id, i| {
+        if (id < 0) return error.BoundedPleRouteUnavailable;
+        const idx: usize = @intCast(id);
+        if (idx >= rows or idx > std.math.maxInt(u32)) return error.BoundedPleRouteUnavailable;
+        ids_u32[i] = @intCast(idx);
+    }
+    const shape = [_]i32{ @intCast(ids.len), @intCast(dim) };
+    var output = try MetalTensor.deviceAllocate(runtime, ids.len * dim * @sizeOf(f32), .private, &shape);
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_q6_k_packed_rows_staged_host_device(
+        runtime,
+        @backingInt(MetalQuantFormat.q6_k),
+        storage.raw_bytes.ptr,
+        storage.raw_bytes.len,
+        rows,
+        dim,
+        ids_u32.ptr,
+        ids.len,
+        scale,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) return error.BoundedPleRouteUnavailable;
+    return output;
 }
 
 /// Disabling mapping keeps the prepared allocation equal to the charged raw
@@ -3396,6 +3625,116 @@ pub fn decoderRuntimeApplyHeadRmsNormRope(self: anytype, request: anytype) !?Met
     return finishDeviceOutput(&output, rc);
 }
 
+pub const RuntimeGemmaQkPairResult = struct { q: MetalTensor, k: MetalTensor };
+
+/// Returns null only for the C helper's clean pre-encode decline. Any negative
+/// result is fatal because the helper may already have retained resources or
+/// encoded work; callers must not replay the split path.
+pub fn decoderRuntimeApplyGemmaQkHeadRopePair(self: anytype, request: anytype) !?RuntimeGemmaQkPairResult {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !hasActiveFrame(self.raw_decode_runtime)) return null;
+    if (!request.q.isDevice() or !request.k.isDevice() or request.rows != 1 or request.num_heads == 0 or request.num_kv_heads == 0 or request.head_dim == 0 or request.rope_dim == 0) return null;
+    if (request.q.elemCount() != request.num_heads * request.head_dim or request.k.elemCount() != request.num_kv_heads * request.head_dim) return null;
+    if (request.q.dtype != .f32 or request.k.dtype != .f32) return null;
+    var q_out = if (request.q_output) |out| try out.retainedCopy() else try MetalTensor.deviceAllocate(runtime, request.q.elemCount() * @sizeOf(f32), .private, request.q.shape());
+    errdefer q_out.deinit();
+    var k_out = if (request.k_output) |out| try out.retainedCopy() else try MetalTensor.deviceAllocate(runtime, request.k.elemCount() * @sizeOf(f32), .private, request.k.shape());
+    errdefer k_out.deinit();
+    if (!q_out.isDevice() or !k_out.isDevice() or q_out.dtype != .f32 or k_out.dtype != .f32 or q_out.elemCount() != request.q.elemCount() or k_out.elemCount() != request.k.elemCount()) {
+        q_out.deinit();
+        k_out.deinit();
+        return null;
+    }
+    const rc = termite_metal_decode_runtime_apply_gemma_qk_head_rope_pair_device(runtime, request.q.deviceHandle(), request.q.deviceByteOffset(), request.k.deviceHandle(), request.k.deviceByteOffset(), q_out.deviceHandle(), q_out.deviceByteOffset(), k_out.deviceHandle(), k_out.deviceByteOffset(), request.rows, request.num_heads, request.num_kv_heads, request.head_dim, request.rope_dim, request.position, request.q_norm_slot, request.k_norm_slot, request.theta, request.freq_scale, request.eps, request.q_value_scale, @intFromBool(request.consecutive_pairs));
+    if (rc == 1) {
+        q_out.deinit();
+        k_out.deinit();
+        return null;
+    }
+    if (rc != 0) return error.MetalGemmaQkPairEncodeFailed;
+    return .{ .q = q_out, .k = k_out };
+}
+
+pub const RuntimeGemmaQkvResult = struct { q: MetalTensor, k: MetalTensor, v: MetalTensor };
+
+/// Returns null only for validation failure or the C helper's clean pre-encode
+/// decline. Negative C results are fatal because encoding may have started.
+pub fn decoderRuntimeApplyGemmaQkvHeadNormRope(self: anytype, request: anytype) !?RuntimeGemmaQkvResult {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !hasActiveFrame(self.raw_decode_runtime)) return null;
+    if (request.rows != 1 or request.num_heads == 0 or request.num_kv_heads == 0 or request.head_dim == 0 or request.rope_dim == 0 or request.rope_dim > request.head_dim or request.num_heads % request.num_kv_heads != 0) return null;
+    if (request.qk_eps != 0.0 or @as(u32, @bitCast(request.v_eps)) != 0x358637bd) return null;
+    if (!request.q.isDevice() or !request.k.isDevice() or !request.v.isDevice() or request.q.dtype != .f32 or request.k.dtype != .f32 or request.v.dtype != .f32) return null;
+
+    const q_values = std.math.mul(usize, request.rows, request.num_heads) catch return null;
+    const q_elements = std.math.mul(usize, q_values, request.head_dim) catch return null;
+    const kv_values = std.math.mul(usize, request.rows, request.num_kv_heads) catch return null;
+    const kv_elements = std.math.mul(usize, kv_values, request.head_dim) catch return null;
+    const q_bytes = std.math.mul(usize, q_elements, @sizeOf(f32)) catch return null;
+    const kv_bytes = std.math.mul(usize, kv_elements, @sizeOf(f32)) catch return null;
+    if (request.q.elemCount() != q_elements or request.k.elemCount() != kv_elements or request.v.elemCount() != kv_elements) return null;
+    if (request.q.deviceHandle() == null or request.k.deviceHandle() == null or request.v.deviceHandle() == null) return null;
+    if (request.q.deviceByteLen() != q_bytes or request.k.deviceByteLen() != kv_bytes or request.v.deviceByteLen() != kv_bytes) return null;
+
+    var q_out = if (request.q_output) |out| try out.retainedCopy() else try MetalTensor.deviceAllocate(runtime, q_bytes, .private, request.q.shape());
+    errdefer q_out.deinit();
+    var k_out = if (request.k_output) |out| try out.retainedCopy() else try MetalTensor.deviceAllocate(runtime, kv_bytes, .private, request.k.shape());
+    errdefer k_out.deinit();
+    var v_out = if (request.v_output) |out| try out.retainedCopy() else try MetalTensor.deviceAllocate(runtime, kv_bytes, .private, request.v.shape());
+    errdefer v_out.deinit();
+
+    const outputs_valid = q_out.isDevice() and k_out.isDevice() and v_out.isDevice() and
+        q_out.dtype == .f32 and k_out.dtype == .f32 and v_out.dtype == .f32 and
+        q_out.elemCount() == q_elements and k_out.elemCount() == kv_elements and v_out.elemCount() == kv_elements and
+        q_out.deviceByteLen() == q_bytes and k_out.deviceByteLen() == kv_bytes and v_out.deviceByteLen() == kv_bytes and
+        q_out.deviceHandle() != null and k_out.deviceHandle() != null and v_out.deviceHandle() != null;
+    if (!outputs_valid) {
+        v_out.deinit();
+        k_out.deinit();
+        q_out.deinit();
+        return null;
+    }
+
+    const rc = termite_metal_decode_runtime_apply_gemma_qkv_head_norm_rope_device(
+        runtime,
+        request.q.deviceHandle(),
+        request.q.deviceByteOffset(),
+        request.k.deviceHandle(),
+        request.k.deviceByteOffset(),
+        request.v.deviceHandle(),
+        request.v.deviceByteOffset(),
+        q_out.deviceHandle(),
+        q_out.deviceByteOffset(),
+        k_out.deviceHandle(),
+        k_out.deviceByteOffset(),
+        v_out.deviceHandle(),
+        v_out.deviceByteOffset(),
+        request.rows,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        request.rope_dim,
+        request.position,
+        request.q_norm_slot,
+        request.k_norm_slot,
+        request.theta,
+        request.freq_scale,
+        request.qk_eps,
+        request.v_eps,
+        request.q_value_scale,
+        @intFromBool(request.consecutive_pairs),
+    );
+    if (rc == 1) {
+        v_out.deinit();
+        k_out.deinit();
+        q_out.deinit();
+        return null;
+    }
+    if (rc < 0) return error.MetalGemmaQkvHeadEncodeFailed;
+    if (rc != 0) return error.MetalGemmaQkvHeadUnexpectedStatus;
+    return .{ .q = q_out, .k = k_out, .v = v_out };
+}
+
 pub fn decoderRuntimeApplyHeadRmsNormRopeBatched(self: anytype, request: anytype, heads_per_row: usize, position_period: usize) !?MetalTensor {
     const destination = preparedDecoderOutput(request);
     const runtime = self.raw_decode_runtime orelse return declinePreparedDecoderOutput(destination);
@@ -3500,8 +3839,8 @@ pub fn decoderRuntimeApplyHeadRmsNormRopeRowsScratch(self: anytype, request: any
 pub fn decoderRuntimeApplyRmsNormScratch(self: anytype, request: anytype, output_index: usize, stats: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (request.slot >= decoder_runtime_layer_norm_slot_capacity) return null;
-    if (!rawRmsNormSlotPrepared(self, request.slot)) return null;
+    if (request.slot >= decoder_runtime_rms_norm_slot_capacity) return null;
+    if (!self.raw_rms_norm_slots_prepared[request.slot]) return null;
     if (self.raw_rms_norm_slot_hidden_sizes[request.slot] != request.hidden_size) return null;
     if (request.hidden_size == 0 or request.input.ndim() != 2 or output_index >= 6) return null;
     if (@as(usize, @intCast(request.input.dim(0))) != 1) return null;
@@ -4382,6 +4721,23 @@ pub fn sampleLogitsDevice(self: anytype, request: anytype) !?usize {
     return token_id;
 }
 
+pub const QualificationArgmaxPolicy = struct {
+    require_finite: bool = false,
+    softcap: f32 = 0,
+};
+
+/// Scope strict qualification to an exclusive decoder call and restore the
+/// returned policy on all exits. Apply the study's final softcap before checking
+/// finiteness and lowest-index ties. UINT_MAX means a post-softcap logit was
+/// non-finite; the qualification caller must reject that result.
+pub fn setQualificationArgmaxPolicy(runtime: ?*RawMetalDecodeRuntime, policy: QualificationArgmaxPolicy) !QualificationArgmaxPolicy {
+    const raw = runtime orelse return error.StrictArgmaxUnsupported;
+    var previous_softcap_bits: u32 = 0;
+    const previous = termite_metal_decode_runtime_set_qualification_argmax_policy(raw, @intFromBool(policy.require_finite), @bitCast(policy.softcap), &previous_softcap_bits);
+    if (previous < 0) return error.StrictArgmaxUnsupported;
+    return .{ .require_finite = previous != 0, .softcap = @bitCast(previous_softcap_bits) };
+}
+
 pub fn argmaxLogitsDevice(self: anytype, input: MetalTensor, out_dim: usize) !?usize {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -4915,7 +5271,20 @@ pub fn decoderRuntimeApplyAddLayerNormInto(
     ) == 0;
 }
 
-/// An explicitly selected destination in the already-reserved dense plan.
+pub fn decoderRuntimeApplyRmsNormInto(self: anytype, request: anytype, output: MetalTensor, stats: anytype) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (!hasActiveFrame(runtime) or hasSubmittedFrame(runtime) or request.slot >= decoder_runtime_rms_norm_slot_capacity or
+        !self.raw_rms_norm_slots_prepared[request.slot] or self.raw_rms_norm_slot_hidden_sizes[request.slot] != request.hidden_size or
+        request.hidden_size == 0 or !request.input.isDevice() or !output.isDevice() or
+        request.input.ndim() != 2 or output.ndim() != 2 or request.input.dim(0) != 1 or output.dim(0) != 1 or
+        request.input.elemCount() != request.hidden_size or output.elemCount() != request.hidden_size or
+        request.input.deviceHandle() == output.deviceHandle()) return false;
+    const rc = termite_metal_decode_runtime_apply_rms_norm_device(runtime, request.slot, request.input.deviceHandle(), request.input.deviceByteOffset(), request.hidden_size, request.eps, output.deviceHandle(), output.deviceByteOffset());
+    if (rc != 0) return false;
+    stats.decoder_runtime_apply_layer_norm_calls += 1;
+    return true;
+}
+
 /// Borrowed synchronously; cleanup is always supplied by the actual caller.
 pub const PreparedDecoderPairOutputs = struct { first: PreparedDecoderOutput, second: PreparedDecoderOutput };
 pub const PreparedDecoderOutput = struct {
@@ -5670,7 +6039,7 @@ pub fn decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self: anytype, request: any
         if (format == .unsupported) return false;
         var refine_linear_slot: usize = std.math.maxInt(usize);
         if (exactLmHeadLinearSlot(self, request.linear_slot, request.hidden_size, request.out_dim)) |slot| {
-            if (quant_kind != .q4_k or
+            if (!lmHeadRefineMainKindSupported(quant_kind) or
                 ensureQuantizedRuntimeLinearSlotPrepared(self, slot, request.hidden_size, request.out_dim) != .q6_k) return false;
             refine_linear_slot = slot;
         }
@@ -6022,6 +6391,30 @@ pub fn decoderRuntimeApplyPleResidualDevice(self: anytype, request: anytype) !?M
     };
 }
 
+/// Preflight the optional model-weight tail before custom attention mutates KV.
+/// Preparing a quantized linear slot here never reads or seeds an ordinary KV slot.
+pub fn decoderRuntimeAttentionOutputResidualFormat(self: anytype, linear_slot: usize, input_size: usize, hidden_size: usize, pre_norm_slot: ?usize, post_norm_slot: ?usize) ?MetalQuantFormat {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or input_size == 0 or hidden_size == 0) return null;
+    const kind = ensureQuantizedRuntimeLinearSlotPrepared(self, linear_slot, input_size, hidden_size);
+    const format = metalQuantFormatForKind(kind);
+    // Keep this in sync with the native residual-tail dispatcher. Other
+    // prepared linear formats must take the unfused path before KV append.
+    switch (format) {
+        .q8_0, .i2_s, .q4_0, .q4_k, .q5_k => {},
+        else => return null,
+    }
+    if (pre_norm_slot) |slot| {
+        if (slot >= decoder_runtime_rms_norm_slot_capacity or !self.raw_rms_norm_slots_prepared[slot] or
+            self.raw_rms_norm_slot_hidden_sizes[slot] != input_size) return null;
+    }
+    if (post_norm_slot) |slot| {
+        if (slot >= decoder_runtime_rms_norm_slot_capacity or !self.raw_rms_norm_slots_prepared[slot] or
+            self.raw_rms_norm_slot_hidden_sizes[slot] != hidden_size) return null;
+    }
+    return format;
+}
+
 pub fn decoderRuntimeApplyAttentionOutputResidualDevice(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -6036,19 +6429,7 @@ pub fn decoderRuntimeApplyAttentionOutputResidualDevice(self: anytype, request: 
     }
     if (!request.attention_output.isDevice() or !request.residual.isDevice()) return null;
     if (request.attention_output.deviceByteOffset() != 0) return null;
-    const linear_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, request.linear_slot, request.attention_input_size, request.hidden_size);
-    const linear_format = metalQuantFormatForKind(linear_kind);
-    if (linear_format == .unsupported) return null;
-    if (request.pre_linear_rms_norm_slot) |slot| {
-        if (slot >= decoder_runtime_rms_norm_slot_capacity) return null;
-        if (!rawRmsNormSlotPrepared(self, slot)) return null;
-        if (self.raw_rms_norm_slot_hidden_sizes[slot] != request.attention_input_size) return null;
-    }
-    if (request.post_linear_rms_norm_slot) |slot| {
-        if (slot >= decoder_runtime_rms_norm_slot_capacity) return null;
-        if (!rawRmsNormSlotPrepared(self, slot)) return null;
-        if (self.raw_rms_norm_slot_hidden_sizes[slot] != request.hidden_size) return null;
-    }
+    const linear_format = decoderRuntimeAttentionOutputResidualFormat(self, request.linear_slot, request.attention_input_size, request.hidden_size, request.pre_linear_rms_norm_slot, request.post_linear_rms_norm_slot) orelse return null;
 
     const out_shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden_size) };
     var output = try MetalTensor.deviceAllocate(
@@ -6076,6 +6457,7 @@ pub fn decoderRuntimeApplyAttentionOutputResidualDevice(self: anytype, request: 
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
+    if (@import("builtin").is_test and rc != 0 and getenvBool("ANTFLY_CONTEXT_PROFILE")) std.debug.print("attention_match_residual_tail_status rc={d} format={s} input={d} hidden={d}\n", .{ rc, @tagName(linear_format), request.attention_input_size, request.hidden_size });
     return finishDeviceOutput(&output, rc);
 }
 
@@ -11629,6 +12011,11 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         return false;
     }
     if (request.in_dim == 0 or request.out_dim == 0 or request.slot >= decoder_runtime_linear_slot_capacity) return false;
+    // Native Q8_0 linear kernels address independent blocks in every input
+    // row. Flattened element alignment alone cannot admit a matrix whose
+    // row width cuts through a block; retain its original dense projection.
+    const q8_block_values = gguf_tensor_types.valuesPerBlock(.{ .known = .Q8_0 }) orelse return false;
+    const q8_row_aligned = request.in_dim % q8_block_values == 0;
     const retain_dense_fallback = if (@hasField(@TypeOf(request), "retain_dense_fallback"))
         request.retain_dense_fallback
     else
@@ -11662,7 +12049,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             (!prefer_bf16_fallback and !prefer_f16_mps_fallback and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized))) or
         (request.quantized_storage == null and
             (self.raw_linear_slot_kinds[request.slot] == .dense or
-                (retain_dense_fallback and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized))));
+                (retain_dense_fallback and q8_row_aligned and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized))));
     const required_precision_matches = !require_preferred_dense_precision or
         (slot_prepared and self.raw_linear_slot_kinds[request.slot] == .dense and
             preparedDenseLinearPrecisionMatches(
@@ -11858,15 +12245,17 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             else
                 null;
             // Q4_K is admitted only with an exact checkpoint-format companion.
-            // Q4_0 remains an explicitly warned evidence-only configuration.
-            if (target == .Q4_K) {
+            // Q4_0 keeps its legacy raw-logit diagnostic behavior unless the
+            // separate Class-B shortlist experiment is explicitly enabled.
+            const companion_required = lmHeadQ6CompanionRequired(target, lmHeadQ40Q6RefineEnabled());
+            if (companion_required) {
                 if (!typeHasField(@TypeOf(self), "raw_linear_slot_lm_head_refine_slots") or
                     refine_slot == null or
                     refine_slot.? >= decoder_runtime_linear_slot_capacity or
                     refine_slot.? == request.slot or
                     rawLinearSlotPrepared(self, refine_slot.?)) break :repack;
                 if (termite_metal_decode_runtime_lm_head_q4_q6_refine_ready(runtime) == 0) {
-                    std.log.warn("lm_head Q4_K repack requested but refine pipelines are unavailable; preserving checkpoint Q6_K head", .{});
+                    std.log.warn("lm_head {s} Q6-refine requested but refine pipelines are unavailable; preserving checkpoint Q6_K head", .{@tagName(target)});
                     break :repack;
                 }
             }
@@ -11890,9 +12279,9 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                     owned.deinit();
                     std.heap.c_allocator.destroy(owned);
                 };
-                if (target == .Q4_K) {
+                if (companion_required) {
                     exact_storage_owner = dupQuantizedStorage(storage) catch |err| {
-                        std.log.warn("lm_head Q4_K refine copy failed ({s}); preserving checkpoint Q6_K head", .{@errorName(err)});
+                        std.log.warn("lm_head {s} Q6-refine copy failed ({s}); preserving checkpoint Q6_K head", .{ @tagName(target), @errorName(err) });
                         break :repack;
                     };
                 }
@@ -11949,6 +12338,61 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         const expected_elements = std.math.mul(usize, request.in_dim, request.out_dim) catch return false;
         const expected_bytes = std.math.mul(usize, expected_elements, @sizeOf(u16)) catch return false;
         if (bytes.len < expected_bytes) return false;
+        const prefer_q8 = if (@hasField(@TypeOf(request), "prefer_q8_over_dense_bf16"))
+            request.prefer_q8_over_dense_bf16
+        else
+            false;
+        // Gemma4 GGUFs currently store the PLE model projection as native
+        // F16, while the original staging policy handled only BF16. Keep the
+        // existing request tag for ABI compatibility, but require a separate
+        // opt-in until this approximate F16 -> Q8 route is qualified.
+        if (prefer_q8 and f16PleQ8StagingEnabled() and retain_dense_fallback and q8_row_aligned) q8: {
+            const dense_f32_bytes = std.math.mul(usize, expected_elements, @sizeOf(f32)) catch break :q8;
+            const explicit_cap = if (comptime @hasField(@TypeOf(request), "dense_fallback_max_bytes"))
+                request.dense_fallback_max_bytes
+            else
+                @as(?usize, null);
+            // This explicit opt-in identifies the PLE projection. Permit its
+            // bounded E2B/E4B transient even when the generic dense staging
+            // default is 32 MiB, preserve any lower caller cap, and never
+            // exceed 128 MiB.
+            if (dense_f32_bytes > f16PleQ8TransientCap(explicit_cap)) break :q8;
+            const dense = std.heap.c_allocator.alloc(f32, expected_elements) catch break :q8;
+            defer std.heap.c_allocator.free(dense);
+            if (!widenF16LittleEndian(bytes, dense)) break :q8;
+            const q8_storage = (makeRuntimeQ8StorageFromDense(dense, request.in_dim, request.out_dim) catch break :q8) orelse break :q8;
+            var q8_storage_owned = true;
+            defer if (q8_storage_owned) {
+                q8_storage.deinit();
+                std.heap.c_allocator.destroy(q8_storage);
+            };
+            const bias_shape = [_]i32{@intCast(request.out_dim)};
+            const bias_tensor = MetalTensor.ownedCloneFrom(bias_base[0..request.out_dim], &bias_shape) catch break :q8;
+            self.raw_linear_slot_dense_biases[request.slot] = bias_tensor;
+            if (prepareLinearSlotBias(
+                runtime,
+                request.slot,
+                bias_base,
+                request.out_dim,
+                bias_is_zero,
+            ) != 0) {
+                if (self.raw_linear_slot_dense_biases[request.slot]) |*stored_bias| stored_bias.deinit();
+                self.raw_linear_slot_dense_biases[request.slot] = null;
+                break :q8;
+            }
+            std.log.info(
+                "dense-f16 PLE slot {d} staged to q8_0: rows={d} cols={d}",
+                .{ request.slot, request.out_dim, request.in_dim },
+            );
+            stats.decoder_runtime_prepare_linear_calls += 1;
+            self.raw_linear_slot_quantized_storage[request.slot] = q8_storage;
+            q8_storage_owned = false;
+            self.raw_linear_slot_kinds[request.slot] = .quantized;
+            self.raw_linear_slots_prepared[request.slot] = true;
+            self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
+            self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+            return true;
+        }
         if (termite_metal_decode_runtime_prepare_linear_f16(
             runtime,
             request.slot,
@@ -12040,7 +12484,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         // frame). Slots that opt in are staged to Q8_0 instead: half the
         // bytes on the planned quant-MMV route. Any failure falls back to
         // the dense-BF16 path unchanged.
-        if (prefer_q8 and retain_dense_fallback) q8: {
+        if (prefer_q8 and retain_dense_fallback and q8_row_aligned) q8: {
             const dense_f32_bytes = std.math.mul(usize, expected_bytes, @sizeOf(f32)) catch break :q8;
             if (dense_f32_bytes > runtimeQ8StagingDenseMaxBytesForRequest(request)) break :q8;
             const dense = std.heap.c_allocator.alloc(f32, expected_bytes) catch break :q8;
@@ -12187,7 +12631,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
     // An explicit F32 mirror must retain the original dense values. Its local
     // mirror budget also reaches this staging branch, even when the global Q8
     // budget is zero. Keep quantized checkpoint handling above unchanged.
-    if (retain_dense_fallback and !prefer_f32_mps_fallback and (dense_bytes <= dense_fallback_max_bytes or request_prefers_q8)) {
+    if (retain_dense_fallback and q8_row_aligned and !prefer_f32_mps_fallback and (dense_bytes <= dense_fallback_max_bytes or request_prefers_q8)) {
         if (try makeRuntimeQ8StorageFromDense(prepared_weight[0..dense_values], request.in_dim, request.out_dim)) |q8_storage| {
             errdefer {
                 q8_storage.deinit();
@@ -12358,12 +12802,21 @@ fn lmHeadQ4RepackFormat() ?gguf_tensor_types.KnownTensorType {
         std.ascii.eqlIgnoreCase(raw, "no") or
         std.ascii.eqlIgnoreCase(raw, "off")) return null;
     if (std.ascii.eqlIgnoreCase(raw, "q4_0")) {
-        // Kept for A/B evidence only: measured instant-EOT quality collapse
-        // (symmetric no-min 4-bit on an embedding-tied head).
-        std.log.warn(
-            "TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK=q4_0 is a measured quality-collapse configuration; evidence runs only",
-            .{},
-        );
+        // Turning off an explicitly requested shortlist experiment restores
+        // the checkpoint head, rather than the legacy raw Q4_0 diagnostic.
+        if (lmHeadQ40RepackPolicy(
+            getenvFlagEnabled("TERMITE_METAL_ENABLE_LM_HEAD_Q4_0_Q6_REFINE"),
+            getenvFlagEnabled("TERMITE_METAL_DISABLE_LM_HEAD_Q4_0_Q6_REFINE"),
+        ) == .checkpoint) return null;
+        if (lmHeadQ40Q6RefineEnabled()) {
+            std.log.warn("lm_head Q4_0 + Q6 shortlist is experimental and does not certify the global Q6 argmax", .{});
+        } else {
+            // Raw Q4_0 remains an evidence-only quality-collapse configuration.
+            std.log.warn(
+                "TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK=q4_0 is a measured quality-collapse configuration; evidence runs only",
+                .{},
+            );
+        }
         return .Q4_0;
     }
     if (std.mem.eql(u8, raw, "1") or
@@ -12373,6 +12826,39 @@ fn lmHeadQ4RepackFormat() ?gguf_tensor_types.KnownTensorType {
         std.ascii.eqlIgnoreCase(raw, "q4_k")) return .Q4_K;
     std.log.warn("invalid TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK={s}; repack disabled", .{raw});
     return null;
+}
+
+fn lmHeadQ40RepackPolicy(enable_requested: bool, disable_requested: bool) enum { raw, refined, checkpoint } {
+    if (!enable_requested) return .raw;
+    return if (disable_requested) .checkpoint else .refined;
+}
+
+/// Approximate shortlist experiment only. The Q4_0 top eight nominates rows
+/// and checkpoint Q6_K weights re-score those rows, but this does not prove
+/// that the global Q6_K argmax is present. Default-off; disable wins.
+fn lmHeadQ40Q6RefineEnabled() bool {
+    if (comptime @import("builtin").os.tag == .freestanding) return false;
+    return lmHeadQ40RepackPolicy(
+        getenvFlagEnabled("TERMITE_METAL_ENABLE_LM_HEAD_Q4_0_Q6_REFINE"),
+        getenvFlagEnabled("TERMITE_METAL_DISABLE_LM_HEAD_Q4_0_Q6_REFINE"),
+    ) == .refined;
+}
+
+fn lmHeadQ6CompanionRequired(
+    target: gguf_tensor_types.KnownTensorType,
+    q40_refine_enabled: bool,
+) bool {
+    return target == .Q4_K or (target == .Q4_0 and q40_refine_enabled);
+}
+
+test "Q4_0 Q6-refine policy is default off and disable wins" {
+    try std.testing.expectEqual(.raw, lmHeadQ40RepackPolicy(false, false));
+    try std.testing.expectEqual(.refined, lmHeadQ40RepackPolicy(true, false));
+    try std.testing.expectEqual(.raw, lmHeadQ40RepackPolicy(false, true));
+    try std.testing.expectEqual(.checkpoint, lmHeadQ40RepackPolicy(true, true));
+    try std.testing.expect(lmHeadQ6CompanionRequired(.Q4_K, false));
+    try std.testing.expect(!lmHeadQ6CompanionRequired(.Q4_0, false));
+    try std.testing.expect(lmHeadQ6CompanionRequired(.Q4_0, true));
 }
 
 /// Only vocab-sized tails qualify; ordinary projections keep their checkpoint
@@ -13780,6 +14266,7 @@ pub const RawRuntimeMemoryStats = extern struct {
     q6_k_linear_reduce_f16_input: u64 = 0,
     q6_k_high_row_mm_matrix_dispatches: u64 = 0,
     lm_head_q4_q6_refine_dispatches: u64 = 0,
+    lm_head_q6_full_argmax_dispatches: u64 = 0,
     // Mirrors `uint64_t antfly_generated_dispatch_counts[12][4]` in
     // termite_metal_decode_runtime_memory_stats (metal_kernels.m); the extern
     // layout must stay in lockstep with the C struct.
@@ -15196,6 +15683,179 @@ pub extern fn termite_metal_generated_pipeline_create(
     error_buffer: [*c]u8,
     error_capacity: usize,
 ) ?*RawMetalGeneratedPipeline;
+pub extern fn termite_metal_generated_alias(
+    runtime: ?*RawMetalDecodeRuntime,
+    data: [*]u8,
+    bytes: usize,
+) ?*anyopaque;
+pub extern fn termite_metal_generated_dispatch(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    threads: usize,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    threads: usize,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_coalesced_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    threads: usize,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_accesses_coalesced_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    threads: usize,
+    write_mask: u8,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_pair(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    first_handles: [*]const ?*anyopaque,
+    first_offsets: [*]const usize,
+    first_lengths: [*]const usize,
+    first_count: usize,
+    first_params: *const anyopaque,
+    first_params_bytes: usize,
+    first_threads: usize,
+    second_handles: [*]const ?*anyopaque,
+    second_offsets: [*]const usize,
+    second_lengths: [*]const usize,
+    second_count: usize,
+    second_params: *const anyopaque,
+    second_params_bytes: usize,
+    second_threads: usize,
+    wait_nanos_out: *u64,
+    gpu_nanos_out: *u64,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_threadgroups_owned(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    grid_x: usize,
+    grid_y: usize,
+    grid_z: usize,
+    group_x: usize,
+    group_y: usize,
+    group_z: usize,
+    wait_nanos_out: *u64,
+    gpu_nanos_out: *u64,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_threadgroups_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    grid_x: usize,
+    grid_y: usize,
+    grid_z: usize,
+    group_x: usize,
+    group_y: usize,
+    group_z: usize,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_threadgroups_coalesced_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    grid_x: usize,
+    grid_y: usize,
+    grid_z: usize,
+    group_x: usize,
+    group_y: usize,
+    group_z: usize,
+) c_int;
+pub extern fn termite_metal_generated_dispatch_threadgroups_accesses_coalesced_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    handles: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    lengths: [*]const usize,
+    count: usize,
+    params: *const anyopaque,
+    params_bytes: usize,
+    grid_x: usize,
+    grid_y: usize,
+    grid_z: usize,
+    group_x: usize,
+    group_y: usize,
+    group_z: usize,
+    write_mask: u8,
+) c_int;
+pub extern fn termite_metal_context_split_dispatch_pair_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    stage_handles: [*]const ?*anyopaque,
+    stage_offsets: [*]const usize,
+    stage_lengths: [*]const usize,
+    stage_count: usize,
+    stage_params: *const anyopaque,
+    stage_params_bytes: usize,
+    stage_threads: usize,
+    reduce_handles: [*]const ?*anyopaque,
+    reduce_offsets: [*]const usize,
+    reduce_lengths: [*]const usize,
+    reduce_count: usize,
+    reduce_params: *const anyopaque,
+    reduce_params_bytes: usize,
+    reduce_threads: usize,
+) c_int;
+pub extern fn termite_metal_replay_split_dispatch_pair_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    pipeline: ?*const RawMetalGeneratedPipeline,
+    stage_handles: [*]const ?*anyopaque,
+    stage_offsets: [*]const usize,
+    stage_lengths: [*]const usize,
+    stage_count: usize,
+    stage_params: *const anyopaque,
+    stage_params_bytes: usize,
+    stage_threads: usize,
+    reduce_handles: [*]const ?*anyopaque,
+    reduce_offsets: [*]const usize,
+    reduce_lengths: [*]const usize,
+    reduce_count: usize,
+    reduce_params: *const anyopaque,
+    reduce_params_bytes: usize,
+    reduce_threads: usize,
+) c_int;
 pub extern fn termite_metal_generated_pipeline_info_get(
     generated: ?*const RawMetalGeneratedPipeline,
     info: *MetalGeneratedPipelineInfo,
@@ -19731,6 +20391,12 @@ pub extern fn termite_metal_decode_runtime_begin_prepared_frame(runtime: ?*RawMe
 pub extern fn termite_metal_decode_runtime_submit_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_cancel_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_wait_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub const ContextFrameCompletion = *const fn (?*anyopaque, c_int) callconv(.c) c_int;
+pub extern fn termite_metal_decode_runtime_set_context_frame_completion(
+    runtime: ?*RawMetalDecodeRuntime,
+    ctx: ?*anyopaque,
+    completion: ContextFrameCompletion,
+) c_int;
 pub extern fn termite_metal_decode_runtime_flush_active_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_active_frame_has_work(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_has_active_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
@@ -19762,10 +20428,16 @@ pub extern fn termite_metal_decode_runtime_pop_compute_region(runtime: ?*RawMeta
 pub extern fn termite_metal_decode_runtime_begin_planned_compute_scope(runtime: ?*RawMetalDecodeRuntime, source: usize, region: usize) c_int;
 pub extern fn termite_metal_decode_runtime_planned_compute_barrier(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_end_planned_compute_scope(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_active_planned_access_diagnostics(runtime: ?*RawMetalDecodeRuntime, counters: [*]u64, count: usize) c_int;
 pub extern fn termite_metal_decode_runtime_push_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime: ?*RawMetalDecodeRuntime, requested: c_int) c_int;
+pub extern fn termite_metal_decode_runtime_begin_native_frame_policy(runtime: ?*RawMetalDecodeRuntime, concurrent_requested: c_int, resource_barriers: c_int) c_int;
+pub extern fn termite_metal_decode_runtime_end_native_frame_policy(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_native_frame_policy_state(runtime: ?*const RawMetalDecodeRuntime) c_uint;
+pub extern fn termite_metal_decode_runtime_concurrent_planned_dispatch_enabled(runtime: ?*const RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_configure_a4b_dag_scheduler(runtime: ?*RawMetalDecodeRuntime, qualified_a4b_model: c_int) c_int;
+pub extern fn termite_metal_decode_runtime_configure_model_geometry(runtime: ?*RawMetalDecodeRuntime, geometry: u32) c_int;
 pub extern fn termite_metal_decode_runtime_begin_a4b_concurrent_ffn_scope(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_end_a4b_concurrent_ffn_scope(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_concurrent_planned_dispatch_policy_probe(requested: c_int, force_enabled: c_int, force_disabled: c_int) c_int;
@@ -19852,6 +20524,7 @@ test "GLiNER Decide Metal cache limits cannot change during an active frame" {
 }
 pub extern fn termite_metal_decode_runtime_begin_embedding_workspace(runtime: ?*RawMetalDecodeRuntime, bytes: usize) c_int;
 pub extern fn termite_metal_decode_runtime_end_embedding_workspace(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_trim_checkpoint_graph_workspace(runtime: ?*RawMetalDecodeRuntime, released_capacity_bytes: *usize) c_int;
 pub extern fn termite_metal_decode_runtime_trim_embedding_workspace(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_embedding_workspace_bytes(runtime: ?*RawMetalDecodeRuntime) usize;
 pub extern fn termite_metal_decode_runtime_expert_subbuffer_cache_snapshot(
@@ -19876,6 +20549,7 @@ pub extern fn termite_metal_buffer_retain_external(runtime: ?*RawMetalDecodeRunt
 pub extern fn termite_metal_buffer_alloc(runtime: ?*RawMetalDecodeRuntime, length: usize, storage_mode: c_int) ?*anyopaque;
 pub extern fn termite_metal_buffer_alloc_fresh(runtime: ?*RawMetalDecodeRuntime, length: usize, storage_mode: c_int) ?*anyopaque;
 pub extern fn termite_metal_buffer_release(handle: ?*anyopaque) void;
+pub extern fn termite_metal_buffer_allocated_bytes(handle: ?*anyopaque) u64;
 extern fn termite_metal_decode_runtime_release_buffer(runtime: ?*RawMetalDecodeRuntime, handle: ?*anyopaque) void;
 pub extern fn termite_metal_buffer_contents(handle: ?*anyopaque) ?*anyopaque;
 pub extern fn termite_metal_buffer_upload(
@@ -19938,6 +20612,17 @@ pub extern fn termite_metal_buffer_copy(
     dst_offset: usize,
     length: usize,
 ) c_int;
+pub extern fn termite_metal_buffer_copy_on_active_frame(
+    runtime: ?*RawMetalDecodeRuntime,
+    capture_domain: ?*anyopaque,
+    active_frame_token: ?*anyopaque,
+    expected_frame_nonce: u64,
+    src_handle: ?*anyopaque,
+    src_offset: usize,
+    dst_handle: ?*anyopaque,
+    dst_offset: usize,
+    length: usize,
+) c_int;
 pub const BufferGatherSource = extern struct {
     device: ?*anyopaque = null,
     host: ?*const anyopaque = null,
@@ -19959,6 +20644,25 @@ pub extern fn termite_metal_buffer_copy_pair(
     dst_b_offset: usize,
     length_b: usize,
 ) c_int;
+pub const ExactKvRangeCopy = extern struct {
+    src_k: ?*anyopaque,
+    src_v: ?*anyopaque,
+    src_k_offset: usize,
+    src_v_offset: usize,
+    dst_k: ?*anyopaque,
+    dst_v: ?*anyopaque,
+    dst_k_offset: usize,
+    dst_v_offset: usize,
+    bytes: usize,
+    rows: u32,
+    source_start: u32,
+    heads: u32,
+    dim: u32,
+    destination_head_capacity_rows: u32,
+    destination_ring_capacity_rows: u32,
+    destination_layout: u32,
+};
+pub extern fn termite_metal_exact_kv_range_copy_batch(runtime: ?*RawMetalDecodeRuntime, copies: [*]const ExactKvRangeCopy, count: usize) c_int;
 pub extern fn termite_metal_buffer_slice_last_dim_2d(
     runtime: ?*RawMetalDecodeRuntime,
     src_handle: ?*anyopaque,
@@ -20317,6 +21021,20 @@ pub fn configureA4bDagScheduler(runtime: ?*RawMetalDecodeRuntime, qualified_a4b_
     ) == 0;
 }
 
+pub const DecoderRuntimeModelGeometry = enum(u32) {
+    other = 1,
+    gemma4_e4b_dense42 = 2,
+    gemma4_e2b_dense35 = 3,
+};
+
+pub fn configureDecoderRuntimeModelGeometry(runtime: ?*RawMetalDecodeRuntime, geometry: DecoderRuntimeModelGeometry) bool {
+    return termite_metal_decode_runtime_configure_model_geometry(runtime, @backingInt(geometry)) == 0;
+}
+
+pub fn resetDecoderRuntimeModelGeometry(runtime: ?*RawMetalDecodeRuntime) bool {
+    return termite_metal_decode_runtime_configure_model_geometry(runtime, 0) == 0;
+}
+
 pub fn beginA4bConcurrentFfnScope(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
     return switch (termite_metal_decode_runtime_begin_a4b_concurrent_ffn_scope(runtime)) {
         0 => {},
@@ -20344,6 +21062,34 @@ pub fn beginPlannedComputeScope(runtime: ?*RawMetalDecodeRuntime, source: usize,
         -2 => FrameError.FrameNotActive,
         -3 => FrameError.PlannedScopeActive,
         else => FrameError.SubmissionFailed,
+    };
+}
+
+pub const ActivePlannedAccessDiagnostics = struct {
+    resource_barriers: u64,
+    conflicts_raw: u64,
+    conflicts_war: u64,
+    conflicts_waw: u64,
+    access_barriers: u64,
+};
+
+/// Returns the CPU-side range-hazard evidence for the frame currently being
+/// encoded. Call before submit: submission transfers the active-frame state.
+pub fn activePlannedAccessDiagnostics(runtime: ?*RawMetalDecodeRuntime) !ActivePlannedAccessDiagnostics {
+    var counters: [5]u64 = @splat(0);
+    switch (termite_metal_decode_runtime_active_planned_access_diagnostics(runtime, &counters, counters.len)) {
+        0 => {},
+        -1 => return error.RuntimeUnavailable,
+        -2 => return error.FrameNotActive,
+        -3 => return error.InvalidPlannedAccessDiagnostics,
+        else => return error.SubmissionFailed,
+    }
+    return .{
+        .resource_barriers = counters[0],
+        .conflicts_raw = counters[1],
+        .conflicts_war = counters[2],
+        .conflicts_waw = counters[3],
+        .access_barriers = counters[4],
     };
 }
 
@@ -20654,10 +21400,316 @@ pub fn lastFrameGpuNanos(runtime: ?*RawMetalDecodeRuntime) u64 {
     return termite_metal_decode_runtime_last_frame_gpu_nanos(runtime);
 }
 
+extern fn termite_metal_decode_runtime_prepare_e2b_f16_mirrors(runtime: ?*RawMetalDecodeRuntime, cap: u64, kv_reserve: u64, scratch_reserve: u64, additional_weight_reserve: u64, e4_transient_down_scratch_bytes: u64, cohort: u32, model_layer_count: usize, gate_slots: [*]const usize, up_slots: [*]const usize, down_slots: [*]const usize, layer_count: usize, max_rows: usize, allocated_bytes_out: *u64) c_int;
+extern fn termite_metal_decode_runtime_disarm_e2b_f16_mirrors(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn termite_metal_decode_runtime_finish_bounded_ple_prefill(runtime: ?*RawMetalDecodeRuntime, cap: u64, kv_reserve: u64, scratch_reserve: u64, additional_weight_reserve: u64) c_int;
+extern fn termite_metal_decode_runtime_reset_bounded_ple_request(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn termite_metal_decode_runtime_revoke_e2b_f16_mirror_authority(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn termite_metal_decode_runtime_unadmit_e2b_f16_mirrors(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn termite_metal_decode_runtime_e2b_f16_mirror_stats(runtime: ?*RawMetalDecodeRuntime, out: [*]u64, count: usize) c_int;
+extern fn termite_metal_decode_runtime_e4_fused_half_stats(runtime: ?*RawMetalDecodeRuntime, out: *E4FusedHalfStats) c_int;
+extern fn termite_metal_decode_runtime_e4_fused_half_stats_contract_probe(out: *E4FusedHalfStats) c_int;
+extern fn termite_metal_decode_runtime_e4_fused_half_eligible(runtime: ?*RawMetalDecodeRuntime, rows: usize, hidden_size: usize, intermediate_size: usize, activation_kind: u32, post_gate_rms_norm_slot: usize) c_int;
+extern fn termite_metal_decode_runtime_e4_fused_half_eligibility_contract_probe() c_int;
+extern fn termite_metal_decode_runtime_e2_fused_half_stats(runtime: ?*RawMetalDecodeRuntime, out: *E2FusedHalfStats) c_int;
+extern fn termite_metal_decode_runtime_reset_e2_fused_half_stats(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn termite_metal_decode_runtime_e2_fused_half_stats_contract_probe(out: *E2FusedHalfStats) c_int;
+extern fn termite_metal_decode_runtime_e2_fused_half_policy_contract_probe() c_int;
 extern fn termite_metal_decode_runtime_current_allocated_size(runtime: ?*RawMetalDecodeRuntime) u64;
+extern fn termite_metal_decode_runtime_begin_observed_device_scope(runtime: ?*RawMetalDecodeRuntime, cap: u64, owner: *u64) bool;
+extern fn termite_metal_decode_runtime_end_observed_device_scope(owner: u64) bool;
+extern fn termite_metal_decode_runtime_observed_device_memory(runtime: ?*RawMetalDecodeRuntime, current: *u64, peak: *u64, exceeded: *bool) void;
+extern fn termite_metal_decode_runtime_linear_slot_materialized(runtime: ?*RawMetalDecodeRuntime, slot: usize, kind: u32, in_dim: usize, out_dim: usize) c_int;
+
+pub const E2bF16MirrorStats = struct { prepare_attempts: u64 = 0, prepare_successes: u64 = 0, prepare_rejections: u64 = 0, prepare_rollbacks: u64 = 0, route_hits: u64 = 0, route_misses: u64 = 0, invalidations: u64 = 0, allocated_bytes: u64 = 0, e4_prefix_suffix_q4_fallbacks: u64 = 0 };
+pub fn e2bF16MirrorStats(runtime: ?*RawMetalDecodeRuntime) E2bF16MirrorStats {
+    var values: [9]u64 = @splat(0);
+    if (termite_metal_decode_runtime_e2b_f16_mirror_stats(runtime, &values, values.len) != 0) return .{};
+    return .{ .prepare_attempts = values[0], .prepare_successes = values[1], .prepare_rejections = values[2], .prepare_rollbacks = values[3], .route_hits = values[4], .route_misses = values[5], .invalidations = values[6], .allocated_bytes = values[7], .e4_prefix_suffix_q4_fallbacks = values[8] };
+}
+
+pub const E4FusedHalfStats = extern struct {
+    attempts: u64 = 0,
+    hits: u64 = 0,
+    pair_dispatches: u64 = 0,
+    down_dispatches: u64 = 0,
+    fallbacks: u64 = 0,
+    fatal_failures: u64 = 0,
+};
+
+pub const E2FusedHalfStats = extern struct {
+    attempts: u64 = 0,
+    hits: u64 = 0,
+    pair_6144_dispatches: u64 = 0,
+    pair_12288_dispatches: u64 = 0,
+    down_6144_dispatches: u64 = 0,
+    down_12288_dispatches: u64 = 0,
+    fallbacks: u64 = 0,
+    fatal_failures: u64 = 0,
+};
+
+pub fn e2FusedHalfStats(runtime: ?*RawMetalDecodeRuntime) !E2FusedHalfStats {
+    var result: E2FusedHalfStats = .{};
+    if (termite_metal_decode_runtime_e2_fused_half_stats(runtime, &result) != 0)
+        return error.MetalE2FusedHalfStatsUnavailable;
+    return result;
+}
+
+pub fn resetE2FusedHalfStats(runtime: ?*RawMetalDecodeRuntime) bool {
+    return termite_metal_decode_runtime_reset_e2_fused_half_stats(runtime) == 0;
+}
+
+pub fn e4FusedHalfStats(runtime: ?*RawMetalDecodeRuntime) !E4FusedHalfStats {
+    var result: E4FusedHalfStats = .{};
+    if (termite_metal_decode_runtime_e4_fused_half_stats(runtime, &result) != 0)
+        return error.MetalE4FusedHalfStatsUnavailable;
+    return result;
+}
+
+fn e4FusedHalfEligible(runtime: ?*RawMetalDecodeRuntime, request: anytype) bool {
+    const none = std.math.maxInt(usize);
+    return termite_metal_decode_runtime_e4_fused_half_eligible(
+        runtime,
+        request.rows,
+        request.hidden_size,
+        request.intermediate_size,
+        @backingInt(request.activation),
+        request.post_gate_rms_norm_slot orelse none,
+    ) == 1;
+}
+
+test "E4 fused half read-only stats preserve C ABI order and fail closed" {
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_e4_fused_half_eligibility_contract_probe());
+    var result: E4FusedHalfStats = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_e4_fused_half_stats_contract_probe(&result));
+    try std.testing.expectEqual(@as(u64, 11), result.attempts);
+    try std.testing.expectEqual(@as(u64, 12), result.hits);
+    try std.testing.expectEqual(@as(u64, 13), result.pair_dispatches);
+    try std.testing.expectEqual(@as(u64, 14), result.down_dispatches);
+    try std.testing.expectEqual(@as(u64, 15), result.fallbacks);
+    try std.testing.expectEqual(@as(u64, 16), result.fatal_failures);
+    const canary: E4FusedHalfStats = .{ .attempts = 91, .hits = 92, .pair_dispatches = 93, .down_dispatches = 94, .fallbacks = 95, .fatal_failures = 96 };
+    result = canary;
+    try std.testing.expectEqual(@as(c_int, -1), termite_metal_decode_runtime_e4_fused_half_stats(null, &result));
+    try std.testing.expectEqualDeep(canary, result);
+}
+
+test "E2 fused half policy and read-only stats preserve C ABI order" {
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_e2_fused_half_policy_contract_probe());
+    var result: E2FusedHalfStats = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_e2_fused_half_stats_contract_probe(&result));
+    try std.testing.expectEqual(@as(u64, 21), result.attempts);
+    try std.testing.expectEqual(@as(u64, 22), result.hits);
+    try std.testing.expectEqual(@as(u64, 23), result.pair_6144_dispatches);
+    try std.testing.expectEqual(@as(u64, 24), result.pair_12288_dispatches);
+    try std.testing.expectEqual(@as(u64, 25), result.down_6144_dispatches);
+    try std.testing.expectEqual(@as(u64, 26), result.down_12288_dispatches);
+    try std.testing.expectEqual(@as(u64, 27), result.fallbacks);
+    try std.testing.expectEqual(@as(u64, 28), result.fatal_failures);
+    const canary: E2FusedHalfStats = .{
+        .attempts = 81,
+        .hits = 82,
+        .pair_6144_dispatches = 83,
+        .pair_12288_dispatches = 84,
+        .down_6144_dispatches = 85,
+        .down_12288_dispatches = 86,
+        .fallbacks = 87,
+        .fatal_failures = 88,
+    };
+    result = canary;
+    try std.testing.expectEqual(@as(c_int, -1), termite_metal_decode_runtime_e2_fused_half_stats(null, &result));
+    try std.testing.expectEqualDeep(canary, result);
+    try std.testing.expect(!resetE2FusedHalfStats(null));
+}
+
+pub fn disarmE2bF16Mirrors(self: anytype) void {
+    _ = termite_metal_decode_runtime_disarm_e2b_f16_mirrors(self.raw_decode_runtime);
+}
+
+pub fn finishBoundedPlePrefill(self: anytype, admission: ops.DecoderRuntimeE2bF16MirrorAdmission) bool {
+    if (!admission.requestFactsValid()) return false;
+    return termite_metal_decode_runtime_finish_bounded_ple_prefill(
+        self.raw_decode_runtime,
+        admission.backend_cap_bytes,
+        admission.declared_backend_kv_bytes,
+        admission.declared_backend_scratch_bytes,
+        admission.additional_unprepared_weight_bytes,
+    ) == 0;
+}
+
+pub fn resetBoundedPleRequest(self: anytype) bool {
+    return termite_metal_decode_runtime_reset_bounded_ple_request(self.raw_decode_runtime) == 0;
+}
+
+pub fn unadmitE2bF16Mirrors(self: anytype) bool {
+    return termite_metal_decode_runtime_unadmit_e2b_f16_mirrors(self.raw_decode_runtime) == 0;
+}
+
+pub fn revokeE2bF16MirrorAuthority(self: anytype) bool {
+    return termite_metal_decode_runtime_revoke_e2b_f16_mirror_authority(self.raw_decode_runtime) == 0;
+}
+
+pub fn prepareE2bF16Mirrors(self: anytype, admission: ops.DecoderRuntimeE2bF16MirrorAdmission) bool {
+    if (!admission.valid() or admission.first_layer != 0 or admission.layer_count > 64) return false;
+    const runtime = self.raw_decode_runtime orelse return false;
+    var gate: [64]usize = undefined;
+    var up: [64]usize = undefined;
+    var down: [64]usize = undefined;
+    for (0..admission.layer_count) |layer| {
+        gate[layer] = decoder_gated_runtime.linearSlot(layer, .mlp_gate);
+        up[layer] = decoder_gated_runtime.linearSlot(layer, .mlp_up);
+        down[layer] = decoder_gated_runtime.linearSlot(layer, .mlp_down);
+    }
+    var allocated: u64 = 0;
+    return termite_metal_decode_runtime_prepare_e2b_f16_mirrors(runtime, admission.backend_cap_bytes, admission.declared_backend_kv_bytes, admission.declared_backend_scratch_bytes, admission.additional_unprepared_weight_bytes, admission.e4_transient_down_scratch_bytes, @backingInt(admission.cohort), admission.model_layer_count, &gate, &up, &down, admission.layer_count, admission.max_prefill_rows, &allocated) == 0;
+}
 
 pub fn currentAllocatedSize(runtime: ?*RawMetalDecodeRuntime) u64 {
     return termite_metal_decode_runtime_current_allocated_size(runtime);
+}
+
+pub const ObservedDeviceMemory = struct { current: u64, peak: u64, exceeded: bool };
+
+pub fn beginObservedDeviceScope(runtime: ?*RawMetalDecodeRuntime, cap: u64) ?u64 {
+    var owner: u64 = 0;
+    return if (termite_metal_decode_runtime_begin_observed_device_scope(runtime, cap, &owner)) owner else null;
+}
+
+pub fn endObservedDeviceScope(owner: u64) bool {
+    return termite_metal_decode_runtime_end_observed_device_scope(owner);
+}
+
+pub fn observedDeviceMemory(runtime: ?*RawMetalDecodeRuntime) ObservedDeviceMemory {
+    var result: ObservedDeviceMemory = .{ .current = 0, .peak = 0, .exceeded = false };
+    termite_metal_decode_runtime_observed_device_memory(runtime, &result.current, &result.peak, &result.exceeded);
+    return result;
+}
+
+pub const E2bMirrorMaterialization = struct {
+    prepared_slots: usize = 0,
+    quant_slots: usize = 0,
+    dense_slots: usize = 0,
+};
+
+fn materializePreparedRuntimeLinearSlotsWith(self: anytype, comptime registrar: anytype) ?E2bMirrorMaterialization {
+    const runtime = self.raw_decode_runtime orelse return null;
+    _ = runtime;
+    const trace = getenvFlagEnabled("ANTFLY_TRACE_E2B_F16_MIRROR_PREPARE");
+    var result: E2bMirrorMaterialization = .{};
+    for (0..decoder_runtime_linear_slot_capacity) |slot| {
+        if (!self.raw_linear_slots_prepared[slot]) continue;
+        const in_dim = self.raw_linear_slot_in_dims[slot];
+        const out_dim = self.raw_linear_slot_out_dims[slot];
+        if (in_dim == 0 or out_dim == 0) {
+            if (trace) std.debug.print("metal_e2b_mirror_materialize_fail: slot={d} kind={s} in={d} out={d} reason=zero_dimension\n", .{ slot, @tagName(self.raw_linear_slot_kinds[slot]), in_dim, out_dim });
+            return null;
+        }
+        result.prepared_slots += 1;
+        switch (self.raw_linear_slot_kinds[slot]) {
+            .quantized => {
+                if (!registrar(self, slot, .quantized, in_dim, out_dim)) {
+                    if (trace) std.debug.print("metal_e2b_mirror_materialize_fail: slot={d} kind=quantized in={d} out={d} reason=registrar\n", .{ slot, in_dim, out_dim });
+                    return null;
+                }
+                result.quant_slots += 1;
+            },
+            .dense => {
+                if (!registrar(self, slot, .dense, in_dim, out_dim)) {
+                    if (trace) std.debug.print("metal_e2b_mirror_materialize_fail: slot={d} kind=dense in={d} out={d} reason=c_physical_slot\n", .{ slot, in_dim, out_dim });
+                    return null;
+                }
+                result.dense_slots += 1;
+            },
+            .none => {
+                if (trace) std.debug.print("metal_e2b_mirror_materialize_fail: slot={d} kind=none in={d} out={d} reason=prepared_none\n", .{ slot, in_dim, out_dim });
+                return null;
+            },
+        }
+    }
+    if (result.prepared_slots == 0) {
+        if (trace) std.debug.print("metal_e2b_mirror_materialize_fail: slot=-1 kind=none in=0 out=0 reason=no_prepared_slots\n", .{});
+        return null;
+    }
+    return result;
+}
+
+fn registerPreparedRuntimeLinearSlot(self: anytype, slot: usize, kind: RawLinearSlotKind, in_dim: usize, out_dim: usize) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return switch (kind) {
+        .quantized => blk: {
+            const ensured = ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim);
+            if (ensured == .none) {
+                if (getenvFlagEnabled("ANTFLY_TRACE_E2B_F16_MIRROR_PREPARE")) std.debug.print(
+                    "metal_e2b_mirror_materialize_fail: slot={d} kind=quantized in={d} out={d} reason=quant_ensure\n",
+                    .{ slot, in_dim, out_dim },
+                );
+                break :blk false;
+            }
+            const physical = termite_metal_decode_runtime_linear_slot_materialized(runtime, slot, 2, in_dim, out_dim) == 1;
+            if (!physical and getenvFlagEnabled("ANTFLY_TRACE_E2B_F16_MIRROR_PREPARE")) std.debug.print(
+                "metal_e2b_mirror_materialize_fail: slot={d} kind=quantized in={d} out={d} reason=c_physical_slot ensured={s}\n",
+                .{ slot, in_dim, out_dim, @tagName(ensured) },
+            );
+            break :blk physical;
+        },
+        .dense => termite_metal_decode_runtime_linear_slot_materialized(runtime, slot, 1, in_dim, out_dim) == 1,
+        .none => false,
+    };
+}
+
+pub fn materializeAllPreparedRuntimeLinearSlots(self: anytype) ?E2bMirrorMaterialization {
+    return materializePreparedRuntimeLinearSlotsWith(self, registerPreparedRuntimeLinearSlot);
+}
+
+const E2bMirrorMaterializerTestProvider = struct {
+    raw_decode_runtime: ?*RawMetalDecodeRuntime = @ptrFromInt(0x1000),
+    raw_linear_slots_prepared: [decoder_runtime_linear_slot_capacity]bool = @splat(false),
+    raw_linear_slot_kinds: [decoder_runtime_linear_slot_capacity]RawLinearSlotKind = @splat(.none),
+    raw_linear_slot_in_dims: [decoder_runtime_linear_slot_capacity]usize = @splat(0),
+    raw_linear_slot_out_dims: [decoder_runtime_linear_slot_capacity]usize = @splat(0),
+    physical: [decoder_runtime_linear_slot_capacity]bool = @splat(false),
+    quant_ensure_fails: [decoder_runtime_linear_slot_capacity]bool = @splat(false),
+    visited: [decoder_runtime_linear_slot_capacity]bool = @splat(false),
+};
+
+fn e2bMirrorTestRegistrar(provider: *E2bMirrorMaterializerTestProvider, slot: usize, kind: RawLinearSlotKind, _: usize, _: usize) bool {
+    provider.visited[slot] = true;
+    if (kind == .quantized and provider.quant_ensure_fails[slot]) return false;
+    return provider.physical[slot];
+}
+
+fn e2bMirrorTestSlot(provider: *E2bMirrorMaterializerTestProvider, slot: usize, kind: RawLinearSlotKind, physical: bool) void {
+    provider.raw_linear_slots_prepared[slot] = true;
+    provider.raw_linear_slot_kinds[slot] = kind;
+    provider.raw_linear_slot_in_dims[slot] = 32;
+    provider.raw_linear_slot_out_dims[slot] = 32;
+    provider.physical[slot] = physical;
+}
+
+test "E2B mirror materializer ignores unprepared provider slots and visits capacity tail" {
+    var provider: E2bMirrorMaterializerTestProvider = .{};
+    provider.raw_linear_slot_kinds[0] = .none;
+    const last = decoder_runtime_linear_slot_capacity - 1;
+    e2bMirrorTestSlot(&provider, last, .quantized, true);
+    const result = materializePreparedRuntimeLinearSlotsWith(&provider, e2bMirrorTestRegistrar) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), result.prepared_slots);
+    try std.testing.expect(!provider.visited[0]);
+    try std.testing.expect(provider.visited[last]);
+}
+
+test "E2B mirror materializer fails quant ensure dense C and prepared none" {
+    var quant_fail: E2bMirrorMaterializerTestProvider = .{};
+    e2bMirrorTestSlot(&quant_fail, 3, .quantized, true);
+    quant_fail.quant_ensure_fails[3] = true;
+    try std.testing.expect(materializePreparedRuntimeLinearSlotsWith(&quant_fail, e2bMirrorTestRegistrar) == null);
+
+    var dense_missing: E2bMirrorMaterializerTestProvider = .{};
+    e2bMirrorTestSlot(&dense_missing, 4, .dense, false);
+    try std.testing.expect(materializePreparedRuntimeLinearSlotsWith(&dense_missing, e2bMirrorTestRegistrar) == null);
+
+    var none: E2bMirrorMaterializerTestProvider = .{};
+    e2bMirrorTestSlot(&none, 5, .none, true);
+    try std.testing.expect(materializePreparedRuntimeLinearSlotsWith(&none, e2bMirrorTestRegistrar) == null);
 }
 
 pub fn setActiveFrameRegime(runtime: ?*RawMetalDecodeRuntime, regime: FrameRegime) FrameError!void {
@@ -20883,6 +21935,26 @@ pub extern fn termite_metal_decode_runtime_prepare_quant_embedding_table(
     weight_bytes: usize,
     rows: usize,
     dim: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_select_bounded_ple_q6(
+    runtime: ?*RawMetalDecodeRuntime,
+    source: [*c]const u8,
+    source_bytes: usize,
+    rows: usize,
+    dim: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_q6_k_packed_rows_staged_host_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    format: u32,
+    source: [*c]const u8,
+    source_bytes: usize,
+    source_rows: usize,
+    dim: usize,
+    ids: [*c]const u32,
+    nrows: usize,
+    scale: f32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_quant_embedding_table_no_copy_region(
     runtime: ?*RawMetalDecodeRuntime,
@@ -21755,6 +22827,11 @@ pub extern fn termite_metal_decode_runtime_prepare_model_mapped_buffer(
     mapped_raw: [*]const u8,
     mapped_bytes: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_full_model_mapped_buffer(
+    runtime: ?*RawMetalDecodeRuntime,
+    mapped_raw: [*]const u8,
+    mapped_bytes: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_bitnet_tl1_linear_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -21875,6 +22952,12 @@ pub extern fn termite_metal_decode_runtime_apply_linear_multi_row_device(
     output_offset: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_borrow_active_layer_projection_scratch_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    index: usize,
+    bytes: usize,
+    output_handle: *?*anyopaque,
+) c_int;
+pub extern fn termite_metal_decode_runtime_borrow_active_direct_hidden_scratch_device(
     runtime: ?*RawMetalDecodeRuntime,
     index: usize,
     bytes: usize,
@@ -22305,6 +23388,8 @@ pub extern fn termite_metal_decode_runtime_apply_prefill_quantized_setup_device(
     k_ready_handle: *?*anyopaque,
     v_ready_handle: *?*anyopaque,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_apply_gemma_qk_head_rope_pair_device(runtime: ?*RawMetalDecodeRuntime, q_input_handle: ?*anyopaque, q_input_offset: usize, k_input_handle: ?*anyopaque, k_input_offset: usize, q_output_handle: ?*anyopaque, q_output_offset: usize, k_output_handle: ?*anyopaque, k_output_offset: usize, rows: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, rope_dim: usize, position: usize, q_norm_slot: usize, k_norm_slot: usize, theta: f32, freq_scale: f32, eps: f32, q_value_scale: f32, consecutive_pairs: u32) c_int;
+pub extern fn termite_metal_decode_runtime_apply_gemma_qkv_head_norm_rope_device(runtime: ?*RawMetalDecodeRuntime, q_input_handle: ?*anyopaque, q_input_offset: usize, k_input_handle: ?*anyopaque, k_input_offset: usize, v_input_handle: ?*anyopaque, v_input_offset: usize, q_output_handle: ?*anyopaque, q_output_offset: usize, k_output_handle: ?*anyopaque, k_output_offset: usize, v_output_handle: ?*anyopaque, v_output_offset: usize, rows: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, rope_dim: usize, position: usize, q_norm_slot: usize, k_norm_slot: usize, theta: f32, freq_scale: f32, qk_eps: f32, v_eps: f32, q_value_scale: f32, consecutive_pairs: u32) c_int;
 pub extern fn termite_metal_decode_runtime_apply_prefill_gated_frame_layer_q8_0_device(
     runtime: ?*RawMetalDecodeRuntime,
     shares_kv: c_int,
@@ -22377,6 +23462,12 @@ pub extern fn termite_metal_decode_runtime_apply_prefill_gated_frame_layer_q8_0_
     paged_base_key_row_bytes: usize,
     paged_v_row_stride: usize,
     suffix_tokens: usize,
+    capture_domain: ?*anyopaque,
+    capture_destination: ?*anyopaque,
+    capture_destination_offset: usize,
+    capture_bytes: usize,
+    capture_source_offset: usize,
+    capture_sample_rows: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_scratch_device(
     runtime: ?*RawMetalDecodeRuntime,
@@ -22603,6 +23694,13 @@ pub extern fn termite_metal_decode_runtime_apply_attention_output_residual_devic
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_set_qualification_argmax_policy(
+    runtime: ?*RawMetalDecodeRuntime,
+    required: c_int,
+    softcap_bits: u32,
+    previous_softcap_bits: *u32,
+) c_int;
+
 pub extern fn termite_metal_decode_runtime_read_token_id(
     runtime: ?*RawMetalDecodeRuntime,
     output_token_id: [*c]u32,
@@ -23990,6 +25088,51 @@ pub extern fn termite_metal_decode_runtime_discard_paged_kv_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
 ) c_int;
+pub const PagedKvAllocationSnapshot = extern struct {
+    live_bytes: u64,
+    peak_bytes: u64,
+    readback_bytes: u64,
+    allocation_count: u64,
+    growth_count: u64,
+    leased_slot_count: u64,
+};
+pub const PagedKvSlotAllocationInfo = extern struct {
+    key_allocated_bytes: u64,
+    value_allocated_bytes: u64,
+    installed_live_bytes: u64,
+    active_frame_retained_bytes: u64,
+    submitted_frame_retained_bytes: u64,
+    lease_readback_bytes: u64,
+    key_requested_bytes: u64,
+    value_requested_bytes: u64,
+    leased: u8,
+    reserved: [7]u8,
+};
+pub const PagedKvSlotTransitionInfo = extern struct {
+    operation_nonce: u64,
+    newly_allocated_bytes: u64,
+    overflow: u8,
+    reserved: [7]u8,
+};
+pub extern fn termite_metal_decode_runtime_paged_kv_allocation_snapshot(
+    runtime: ?*const RawMetalDecodeRuntime,
+    snapshot: *PagedKvAllocationSnapshot,
+) c_int;
+pub extern fn termite_metal_decode_runtime_attention_span_slot_allocation_info(
+    runtime: ?*const RawMetalDecodeRuntime,
+    slot: usize,
+    info: *PagedKvSlotAllocationInfo,
+) c_int;
+pub extern fn termite_metal_decode_runtime_attention_span_slot_transition_info(
+    runtime: ?*const RawMetalDecodeRuntime,
+    slot: usize,
+    info: *PagedKvSlotTransitionInfo,
+) c_int;
+pub extern fn termite_metal_decode_runtime_attention_span_slot_note_readback(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    bytes: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -24005,6 +25148,25 @@ pub extern fn termite_metal_decode_runtime_compact_attention_span_slot(
     format: u32,
     source_token_offsets: [*c]const u32,
     selected_count: usize,
+    key_row_bytes: usize,
+    v_row_stride: usize,
+    position_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_clone_attention_span_slot_prefix(
+    runtime: ?*RawMetalDecodeRuntime,
+    source_slot: usize,
+    destination_slot: usize,
+    format: u32,
+    token_count: usize,
+    key_row_bytes: usize,
+    v_row_stride: usize,
+    position_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_publish_attention_span_slot_ring(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    logical_tokens: usize,
+    physical_capacity_tokens: usize,
     key_row_bytes: usize,
     v_row_stride: usize,
     position_offset: usize,
@@ -24408,6 +25570,7 @@ pub extern fn termite_metal_decode_runtime_apply_attention_f32_gated_block_quant
     paged_base_key_row_bytes: usize,
     paged_v_row_stride: usize,
     suffix_tokens: usize,
+    precomputed_attention_handle: ?*anyopaque,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_apply_attention_gated_block_q_slot_device_kv_device(
     runtime: ?*RawMetalDecodeRuntime,
@@ -25332,9 +26495,14 @@ pub fn exactLmHeadLinearSlot(self: anytype, main_slot: usize, in_dim: usize, out
         self.raw_linear_slot_out_dims[refine_slot] != out_dim) return null;
     const main_storage = self.raw_linear_slot_quantized_storage[main_slot] orelse return null;
     const refine_storage = self.raw_linear_slot_quantized_storage[refine_slot] orelse return null;
-    if (quantizedRuntimeLinearKind(main_storage) != .q4_k or
+    const main_kind = quantizedRuntimeLinearKind(main_storage);
+    if (!lmHeadRefineMainKindSupported(main_kind) or
         quantizedRuntimeLinearKind(refine_storage) != .q6_k) return null;
     return refine_slot;
+}
+
+fn lmHeadRefineMainKindSupported(kind: RawQuantizedRuntimeLinearKind) bool {
+    return kind == .q4_k or kind == .q4_0;
 }
 
 /// Resolve the slot used by full-logit consumers. Checkpoint semantics are the
@@ -25392,6 +26560,9 @@ test "LM-head full-logit and resident-sampling policy is fail closed" {
     try std.testing.expect(residentLmHeadLogitsAreCheckpointExact(null, true));
     try std.testing.expect(!residentLmHeadLogitsAreCheckpointExact(null, false));
     try std.testing.expect(!residentLmHeadLogitsAreCheckpointExact(19, true));
+    try std.testing.expect(lmHeadRefineMainKindSupported(.q4_k));
+    try std.testing.expect(lmHeadRefineMainKindSupported(.q4_0));
+    try std.testing.expect(!lmHeadRefineMainKindSupported(.q6_k));
 }
 
 fn setRuntimeQuantPrepareMode(self: anytype, slot: usize, mode: RawQuantizedRuntimeLinearStorageMode) void {
@@ -25546,6 +26717,25 @@ fn mappedQuantWeightSpan(storage: *const QuantizedStorage, descriptor: PackedWei
     return mappedQuantRawSpan(storage, descriptor.raw_bytes, @alignOf(u16));
 }
 
+fn prepareDenseModelBufferIfRequested(self: anytype, storage: *const QuantizedStorage) void {
+    if (self.raw_model_mapped_buffer_prepared or
+        !getenvFlagEnabled("TERMITE_METAL_ENABLE_DENSE_MODEL_BUFFER") or
+        getenvFlagEnabled("TERMITE_METAL_DISABLE_DENSE_MODEL_BUFFER") or
+        quantMappedWeightsDisabled()) return;
+    const runtime = self.raw_decode_runtime orelse return;
+    const source = storage.raw_mmap_source_bytes orelse return;
+    // This opt-in experiment reuses the model owner's existing mapping. It
+    // allocates no weight copy. Bound the mapping itself to 6 GiB; existing
+    // admission still owns KV, scratch, and combined limits. Unsupported
+    // mappings retain the ordinary per-tensor path.
+    if (source.len == 0 or source.len > 6 * 1024 * 1024 * 1024) return;
+    if (termite_metal_decode_runtime_prepare_full_model_mapped_buffer(
+        runtime,
+        source.ptr,
+        source.len,
+    ) == 0) self.raw_model_mapped_buffer_prepared = true;
+}
+
 fn ensureRuntimeQuantSlotPrepared(
     self: anytype,
     slot: usize,
@@ -25576,6 +26766,7 @@ fn ensureRuntimeQuantSlotPrepared(
             return false;
         }
         if (mapped_span) |span| {
+            prepareDenseModelBufferIfRequested(self, slot_descriptor.storage);
             incrementRuntimeQuantMappedAttempts(self);
             const mapped_started_at = monotonicNowNs();
             const mapped_rc = termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy_region(
@@ -26336,6 +27527,13 @@ pub fn dupQuantizedStorage(storage: *const QuantizedStorage) !*QuantizedStorage 
         .packed_expert = storage.packed_expert,
         .raw_owned = raw_owned,
         .raw_mmap_backed = raw_mmap_backed,
+        // A borrowed view retains the same model mapping and lifetime as its
+        // source. A private copy must never retain that original mapping.
+        .raw_mmap_source_bytes = if (raw_mmap_backed and !raw_owned and raw_mmap_region == null and
+            raw_bytes.ptr == storage.raw_bytes.ptr and raw_bytes.len == storage.raw_bytes.len)
+            storage.raw_mmap_source_bytes
+        else
+            null,
         .raw_mmap_region = raw_mmap_region,
         .allocator = std.heap.c_allocator,
     };
@@ -26351,14 +27549,16 @@ pub fn dupQuantizedStorage(storage: *const QuantizedStorage) !*QuantizedStorage 
 }
 
 test "dupQuantizedStorage preserves mmap backing metadata" {
-    var raw: [34]u8 = @as([34]u8, @splat(0));
+    var model_bytes: [68]u8 = @as([68]u8, @splat(0));
+    const raw = model_bytes[16..50];
     const shape = [_]i64{ 1, 32 };
     const storage = QuantizedStorage{
         .tensor_type = .{ .known = .Q8_0 },
-        .raw_bytes = &raw,
+        .raw_bytes = raw,
         .shape = &shape,
         .raw_owned = false,
         .raw_mmap_backed = true,
+        .raw_mmap_source_bytes = &model_bytes,
         .allocator = std.testing.allocator,
     };
 
@@ -26371,6 +27571,8 @@ test "dupQuantizedStorage preserves mmap backing metadata" {
     try std.testing.expect(!duped.raw_owned);
     try std.testing.expect(duped.raw_mmap_backed);
     try std.testing.expect(duped.raw_bytes.ptr == storage.raw_bytes.ptr);
+    try std.testing.expect(duped.raw_mmap_source_bytes.?.ptr == storage.raw_mmap_source_bytes.?.ptr);
+    try std.testing.expectEqual(storage.raw_mmap_source_bytes.?.len, duped.raw_mmap_source_bytes.?.len);
 }
 
 test "dupQuantizedStorage keeps owned mmap copies mmap backed" {
@@ -26410,6 +27612,7 @@ test "dupQuantizedStorage duplicates owned mmap regions as mmap backed" {
         .raw_owned = false,
         .raw_mmap_backed = true,
         .raw_mmap_region = region,
+        .raw_mmap_source_bytes = region.data,
         .allocator = std.testing.allocator,
     };
     defer if (storage.raw_mmap_region) |*owned_region| owned_region.deinit();
@@ -26424,6 +27627,7 @@ test "dupQuantizedStorage duplicates owned mmap regions as mmap backed" {
     try std.testing.expect(duped.raw_mmap_backed);
     try std.testing.expect(duped.raw_mmap_region != null);
     try std.testing.expect(duped.raw_bytes.ptr != storage.raw_bytes.ptr);
+    try std.testing.expect(duped.raw_mmap_source_bytes == null);
     try std.testing.expectEqualSlices(u8, payload[0..], duped.raw_bytes);
 }
 
@@ -27664,6 +28868,13 @@ pub fn runPrefillPagedGatedFrameLayerDevice(
         break :blk RawPlannedLayerContract.fromContract(request.planned_block_contract);
     } else RawPlannedLayerContract.fromContract(request.planned_block_contract);
     const output_scale_value_opt: ?f32 = if (@hasField(@TypeOf(request), "output_scale_value")) request.output_scale_value else null;
+    const capture_plan = if (@hasField(@TypeOf(request), "recent_query_capture_plan")) request.recent_query_capture_plan else null;
+    // The embedded Q8 frame entry point only supports one contiguous capture.
+    // A strided batch must fall through to the setup/block path, where all
+    // plans are preflighted before the first copy and encoded by the generic
+    // stride-aware capture operation.
+    const capture_batch = if (@hasField(@TypeOf(request), "recent_query_capture_batch")) request.recent_query_capture_batch else null;
+    if (capture_batch != null) return null;
     var timing: RawAttentionGatedBlockTiming = .{};
     try input_mt.retainForActiveFrame();
     try residual_mt.retainForActiveFrame();
@@ -27744,6 +28955,12 @@ pub fn runPrefillPagedGatedFrameLayerDevice(
         paged_layer.base_key_row_bytes,
         paged_layer.v_row_stride,
         if (request.shares_kv) 0 else request.rows,
+        if (capture_plan) |plan| plan.capture_domain else null,
+        if (capture_plan) |plan| plan.destination_buffer else null,
+        if (capture_plan) |plan| plan.destination_byte_offset else 0,
+        if (capture_plan) |plan| plan.byte_count else 0,
+        if (capture_plan) |plan| plan.source_byte_offset else 0,
+        if (capture_plan) |plan| plan.sample_rows else 0,
     );
     stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - started_at);
     stats.compressed_block_attention_span_nanos += timing.attention_span_nanos;
@@ -27996,6 +29213,23 @@ pub fn tryApplyDenseRuntimeLinearWithOutput(
 /// Borrow one of the private, active-frame projection buffers. Callers must
 /// only use it for a value whose lifetime ends before that scratch index is
 /// reused in the same frame.
+/// Read-only capacity preflight. In particular, never grow projection
+/// storage after a native frame starts or allocate a tensor ownership record.
+pub fn decoderRuntimeActiveLayerProjectionScratchHandle(self: anytype, index: usize, rows: usize, cols: usize) ?*anyopaque {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (!hasActiveFrame(runtime) or hasSubmittedFrame(runtime) or index >= 6 or rows == 0 or cols == 0 or
+        rows > std.math.maxInt(i32) or cols > std.math.maxInt(i32)) return null;
+    const elements = std.math.mul(usize, rows, cols) catch return null;
+    const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return null;
+    var handle: ?*anyopaque = null;
+    if (termite_metal_decode_runtime_borrow_active_layer_projection_scratch_device(runtime, index, bytes, &handle) != 0) return null;
+    return handle;
+}
+
+pub fn decoderRuntimeActiveLayerProjectionScratchReady(self: anytype, index: usize, rows: usize, cols: usize) bool {
+    return decoderRuntimeActiveLayerProjectionScratchHandle(self, index, rows, cols) != null;
+}
+
 pub fn decoderRuntimeBorrowActiveLayerProjectionScratch(
     self: anytype,
     index: usize,
@@ -28011,6 +29245,27 @@ pub fn decoderRuntimeBorrowActiveLayerProjectionScratch(
     if (termite_metal_decode_runtime_borrow_active_layer_projection_scratch_device(runtime, index, bytes, &handle) != 0) return null;
     const shape = [_]i32{ @intCast(rows), @intCast(cols) };
     return MetalTensor.deviceBorrowed(@ptrCast(runtime), handle orelse return null, 0, bytes, &shape);
+}
+
+/// Borrow one pre-reserved direct-block hidden buffer. This API never grows
+/// storage: callers must reserve the full layer plan before beginning the
+/// frame, then keep the value alive only until its last encoded consumer.
+pub fn decoderRuntimeBorrowActiveDirectHiddenScratch(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    index: usize,
+    rows: usize,
+    cols: usize,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !hasActiveFrame(runtime) or hasSubmittedFrame(runtime)) return null;
+    if (index >= 4 or rows == 0 or cols == 0 or rows > std.math.maxInt(i32) or cols > std.math.maxInt(i32)) return null;
+    const elements = std.math.mul(usize, rows, cols) catch return null;
+    const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return null;
+    var handle: ?*anyopaque = null;
+    if (termite_metal_decode_runtime_borrow_active_direct_hidden_scratch_device(runtime, index, bytes, &handle) != 0) return null;
+    const shape = [_]i32{ @intCast(rows), @intCast(cols) };
+    return try MetalTensor.deviceBorrowedWithAllocator(allocator, @ptrCast(runtime), handle orelse return null, 0, bytes, &shape);
 }
 
 /// Two Nomic hidden-state buffers are ping-ponged across encoder layers. They
@@ -28882,6 +30137,87 @@ pub fn tryApplyQuantizedRuntimeLinearInto(
 /// slots share a fused format; otherwise each projection runs on its own,
 /// still in place. Returns the freshly allocated Q, or null when the slots
 /// are not quantized or the shapes do not fit.
+pub fn tryApplyQuantizedRuntimeLinearQkvAllInto(
+    self: anytype,
+    q_slot: usize,
+    k_slot: usize,
+    v_slot: usize,
+    input: MetalTensor,
+    in_dim: usize,
+    q_out_dim: usize,
+    kv_out_dim: usize,
+    q_out: MetalTensor,
+    k_out: MetalTensor,
+    v_out: MetalTensor,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (q_slot >= decoder_runtime_linear_slot_capacity or k_slot >= decoder_runtime_linear_slot_capacity or v_slot >= decoder_runtime_linear_slot_capacity) return false;
+    if (in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0) return false;
+    if (self.raw_linear_slot_kinds[q_slot] != .quantized or self.raw_linear_slot_kinds[k_slot] != .quantized or self.raw_linear_slot_kinds[v_slot] != .quantized) return false;
+    if (!input.isDevice() or !q_out.isDevice() or !k_out.isDevice() or !v_out.isDevice()) return false;
+    if (input.ndim() != 2 or @as(usize, @intCast(input.dim(0))) != 1 or @as(usize, @intCast(input.dim(1))) != in_dim) return false;
+    if (q_out.ndim() != 2 or @as(usize, @intCast(q_out.dim(0))) != 1 or @as(usize, @intCast(q_out.dim(1))) != q_out_dim) return false;
+    if (q_out.deviceHandle() == input.deviceHandle() or k_out.deviceHandle() == input.deviceHandle() or v_out.deviceHandle() == input.deviceHandle() or
+        q_out.deviceHandle() == k_out.deviceHandle() or q_out.deviceHandle() == v_out.deviceHandle() or k_out.deviceHandle() == v_out.deviceHandle()) return false;
+    if (k_out.ndim() != 2 or @as(usize, @intCast(k_out.dim(0))) != 1 or @as(usize, @intCast(k_out.dim(1))) != kv_out_dim) return false;
+    if (v_out.ndim() != 2 or @as(usize, @intCast(v_out.dim(0))) != 1 or @as(usize, @intCast(v_out.dim(1))) != kv_out_dim) return false;
+    if (referenceQuantizedRuntimeLinearDebug()) return false;
+    const q_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, q_slot, in_dim, q_out_dim);
+    const k_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, k_slot, in_dim, kv_out_dim);
+    const v_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, v_slot, in_dim, kv_out_dim);
+    if (q_kind == .none or k_kind == .none or v_kind == .none) return false;
+    const fused: ?[3]MetalQuantFormat = if (q_kind == .q4_0 and k_kind == .q4_0 and v_kind == .q4_0)
+        .{ .q4_0, .q4_0, .q4_0 }
+    else if (q_kind == .q4_k and k_kind == .q4_k and v_kind == .q4_k)
+        .{ .q4_k, .q4_k, .q4_k }
+    else if (q_kind == .q5_k and k_kind == .q4_k and v_kind == .q4_k)
+        .{ .q5_k, .q4_k, .q4_k }
+    else if (q_kind == .q8_0 and k_kind == .q8_0 and v_kind == .q8_0)
+        .{ .q8_0, .q8_0, .q8_0 }
+    else
+        null;
+    if (fused) |formats| {
+        var q_mut = q_out;
+        const rc = termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
+            runtime,
+            @backingInt(formats[0]),
+            @backingInt(formats[1]),
+            @backingInt(formats[2]),
+            q_slot,
+            k_slot,
+            v_slot,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            1,
+            in_dim,
+            q_out_dim,
+            kv_out_dim,
+            q_out.deviceHandle(),
+            q_out.deviceByteOffset(),
+            k_out.deviceHandle(),
+            k_out.deviceByteOffset(),
+            v_out.deviceHandle(),
+            v_out.deviceByteOffset(),
+        );
+        if (rc == 0) {
+            var k_mut = k_out;
+            var v_mut = v_out;
+            if (applyRuntimeLinearBiasDevice(self, q_slot, &q_mut, 1, q_out_dim) and
+                applyRuntimeLinearBiasDevice(self, k_slot, &k_mut, 1, kv_out_dim) and
+                applyRuntimeLinearBiasDevice(self, v_slot, &v_mut, 1, kv_out_dim))
+            {
+                return true;
+            }
+            return false;
+        }
+    }
+    // Mixed or unfused formats: separate kernels, still into the slab rows.
+    if (!try tryApplyQuantizedRuntimeLinearInto(self, k_slot, input, 1, in_dim, kv_out_dim, k_out)) return false;
+    if (!try tryApplyQuantizedRuntimeLinearInto(self, v_slot, input, 1, in_dim, kv_out_dim, v_out)) return false;
+    return try tryApplyQuantizedRuntimeLinearInto(self, q_slot, input, 1, in_dim, q_out_dim, q_out);
+}
+
 pub fn tryApplyQuantizedRuntimeLinearQkvInto(
     self: anytype,
     q_slot: usize,
@@ -29721,6 +31057,15 @@ pub fn tryRawQuantizedGatedFfnResidualHost(
     };
 }
 
+fn residentE4PrefillM64Admission(request: anytype, all_q4_0: bool) bool {
+    if (!@hasField(@TypeOf(request), "resident_e4_prefill_m64")) return false;
+    return request.resident_e4_prefill_m64 and
+        (request.rows == 511 or request.rows == 512) and request.hidden_size == 2560 and
+        request.intermediate_size == 10240 and request.activation == .gelu_new and
+        request.post_gate_rms_norm_slot == null and request.post_down_rms_norm_slot != null and
+        all_q4_0;
+}
+
 pub fn retireDenseFfnValue(value: *MetalTensor, request: anytype) void {
     if (@hasField(@TypeOf(request), "prepared_outputs")) if (request.prepared_outputs) |outputs| {
         value.deinitWithCleanup(outputs.current);
@@ -29892,6 +31237,17 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
 
     const multirow_q4 = !getenvFlagEnabled("TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN") and
         (if (@hasField(@TypeOf(request), "multirow_q4")) request.multirow_q4 else getenvFlagEnabled("ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN") or getenvFlagEnabled("ANTFLY_GEMMA4_METAL_OCR_MULTIROW"));
+    const resident_e4_prefill_m64 = !getenvFlagEnabled("TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN") and
+        residentE4PrefillM64Admission(request, all_q4_0) and e4FusedHalfEligible(runtime, request);
+    // A typed resident call may only use the independently qualified M64
+    // kernel. If runtime eligibility disappeared (disabled feature, missing
+    // pipeline, or rollback geometry), decline without silently activating
+    // the legacy per-row Q4 backend.
+    if (@hasField(@TypeOf(request), "resident_e4_prefill_m64") and request.resident_e4_prefill_m64 and
+        !resident_e4_prefill_m64)
+    {
+        return null;
+    }
     const none = std.math.maxInt(usize);
     const out_shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden_size) };
     const prepared_output = try ffnPreparedTarget(request, .projection);
@@ -29910,7 +31266,25 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
     const residual_handle = residual.deviceHandle();
     const output_handle = output.deviceHandle();
     const row_bytes = request.hidden_size * @sizeOf(f32);
-    const rc = if (all_q4_k_high_row) termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots_device(
+    const rc = if (resident_e4_prefill_m64) termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_slots_device(
+        runtime,
+        input_handle,
+        input.deviceByteOffset(),
+        residual_handle,
+        residual.deviceByteOffset(),
+        request.rows,
+        request.hidden_size,
+        request.intermediate_size,
+        @backingInt(request.activation),
+        request.gate_linear_slot,
+        request.up_linear_slot,
+        request.post_gate_rms_norm_slot orelse none,
+        request.post_down_rms_norm_slot orelse none,
+        request.eps,
+        request.down_linear_slot,
+        output_handle,
+        output.deviceByteOffset(),
+    ) else if (all_q4_k_high_row) termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots_device(
         runtime,
         input_handle,
         input.deviceByteOffset(),
@@ -30783,6 +32157,504 @@ pub fn supportsDirectPagedGatedDecoderBlockSlots(self: anytype, request: anytype
     return true;
 }
 
+/// Admission for the precomputed packed-attention tail uses the same prepared
+/// quantized slots as ordinary direct decode, without touching KV storage or
+/// preparing/uploading a runtime slot. This check runs before the packed hook
+/// mutates its transaction, so it must remain side-effect free.
+fn precomputedGatedBlockFormatForSlot(
+    self: anytype,
+    slot: usize,
+    in_dim: usize,
+    out_dim: usize,
+) ?MetalQuantFormat {
+    if (slot >= decoder_runtime_linear_slot_capacity or
+        !self.raw_linear_slots_prepared[slot] or
+        self.raw_linear_slot_kinds[slot] != .quantized or
+        self.raw_linear_slot_in_dims[slot] != in_dim or
+        self.raw_linear_slot_out_dims[slot] != out_dim) return null;
+    const storage = self.raw_linear_slot_quantized_storage[slot] orelse return null;
+    const raw_kind = quantizedRuntimeLinearKind(storage);
+    const prepared_kind = self.raw_linear_slot_runtime_prepared_kind[slot];
+    if (prepared_kind == .none or prepared_kind != raw_kind) return null;
+    return directQuantizedBlockFormatForKind(prepared_kind);
+}
+
+fn precomputedGatedBlockFormats(self: anytype, request: anytype, layer_index: usize, ple: ?MetalTensor) ?DirectQuantizedBlockFormats {
+    _ = layer_index;
+    const attention_width = std.math.mul(usize, request.num_heads, request.head_dim) catch return null;
+    const attention = precomputedGatedBlockFormatForSlot(self, request.attention_linear_slot, attention_width, request.hidden_size) orelse return null;
+    const gate = precomputedGatedBlockFormatForSlot(self, request.gate_ffn_linear_slot, request.hidden_size, request.intermediate_size) orelse return null;
+    const up = precomputedGatedBlockFormatForSlot(self, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size) orelse return null;
+    if (gate != up) return null;
+    const down = precomputedGatedBlockFormatForSlot(self, request.down_ffn_linear_slot, request.intermediate_size, request.hidden_size) orelse return null;
+    var formats: DirectQuantizedBlockFormats = .{
+        .attention = attention,
+        .ffn_gate_up = gate,
+        .ffn_down = down,
+    };
+    if (ple) |_| {
+        const ple_gate_slot = request.ple_gate_linear_slot orelse return null;
+        const ple_proj_slot = request.ple_proj_linear_slot orelse return null;
+        const ple_post_norm_slot = request.ple_post_norm_slot orelse return null;
+        if (request.ple_hidden_size == 0) return null;
+        const ple_gate = precomputedGatedBlockFormatForSlot(self, ple_gate_slot, request.hidden_size, request.ple_hidden_size) orelse return null;
+        const ple_proj = precomputedGatedBlockFormatForSlot(self, ple_proj_slot, request.ple_hidden_size, request.hidden_size) orelse return null;
+        if (ple_gate != ple_proj or
+            !decoderRuntimeRmsNormSlotPrepared(self, ple_post_norm_slot, request.hidden_size)) return null;
+        formats.ple = ple_gate;
+    }
+    return formats;
+}
+
+pub const PrecomputedGatedBlockAdmission = struct {
+    runtime: *RawMetalDecodeRuntime,
+    frame_nonce: u64,
+    layer_index: usize,
+    formats: DirectQuantizedBlockFormats,
+    resident_row1_q4_mmv: bool,
+    binding: Binding,
+
+    const Binding = struct {
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        attention_linear_slot: usize,
+        attention_pre_linear_rms_norm_slot: ?usize,
+        attention_post_linear_rms_norm_slot: ?usize,
+        ffn_layer_norm_slot: ?usize,
+        ffn_rms_norm_slot: ?usize,
+        ffn_post_gate_rms_norm_slot: ?usize,
+        ffn_post_down_rms_norm_slot: ?usize,
+        gate_ffn_linear_slot: usize,
+        up_ffn_linear_slot: usize,
+        down_ffn_linear_slot: usize,
+        activation: u8,
+        ple_gate_linear_slot: ?usize,
+        ple_proj_linear_slot: ?usize,
+        ple_post_norm_slot: ?usize,
+        ple_hidden_size: usize,
+        eps_bits: u32,
+        output_scale_bits: ?u32,
+        resident_row1_q4_mmv: bool,
+        residual_handle: ?*anyopaque,
+        residual_offset: usize,
+        output_handle: ?*anyopaque,
+        output_offset: usize,
+        ple_handle: ?*anyopaque,
+        ple_offset: usize,
+
+        fn init(request: anytype, residual: MetalTensor, ple: ?MetalTensor, output: MetalTensor) Binding {
+            return .{
+                .num_heads = request.num_heads,
+                .num_kv_heads = request.num_kv_heads,
+                .head_dim = request.head_dim,
+                .hidden_size = request.hidden_size,
+                .intermediate_size = request.intermediate_size,
+                .attention_linear_slot = request.attention_linear_slot,
+                .attention_pre_linear_rms_norm_slot = request.attention_pre_linear_rms_norm_slot,
+                .attention_post_linear_rms_norm_slot = request.attention_post_linear_rms_norm_slot,
+                .ffn_layer_norm_slot = request.ffn_layer_norm_slot,
+                .ffn_rms_norm_slot = request.ffn_rms_norm_slot,
+                .ffn_post_gate_rms_norm_slot = request.ffn_post_gate_rms_norm_slot,
+                .ffn_post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
+                .gate_ffn_linear_slot = request.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = request.up_ffn_linear_slot,
+                .down_ffn_linear_slot = request.down_ffn_linear_slot,
+                .activation = @backingInt(request.activation),
+                .ple_gate_linear_slot = request.ple_gate_linear_slot,
+                .ple_proj_linear_slot = request.ple_proj_linear_slot,
+                .ple_post_norm_slot = request.ple_post_norm_slot,
+                .ple_hidden_size = request.ple_hidden_size,
+                .eps_bits = @bitCast(request.eps),
+                .output_scale_bits = if (request.output_scale_value) |value| @bitCast(value) else null,
+                .resident_row1_q4_mmv = residentRow1Q4MmvRequested(request),
+                .residual_handle = residual.deviceHandle(),
+                .residual_offset = residual.deviceByteOffset(),
+                .output_handle = output.deviceHandle(),
+                .output_offset = output.deviceByteOffset(),
+                .ple_handle = if (ple) |value| value.deviceHandle() else null,
+                .ple_offset = if (ple) |value| value.deviceByteOffset() else 0,
+            };
+        }
+
+        fn matches(self: Binding, request: anytype, residual: MetalTensor, ple: ?MetalTensor, output: MetalTensor) bool {
+            return std.meta.eql(self, Binding.init(request, residual, ple, output));
+        }
+    };
+};
+
+pub extern fn termite_metal_decode_runtime_active_frame_nonce(runtime: ?*RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_decode_runtime_begin_resident_row1_q4_mmv(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_end_resident_row1_q4_mmv(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_active_frame_token(runtime: ?*RawMetalDecodeRuntime) ?*anyopaque;
+pub extern fn termite_metal_decode_runtime_last_completed_recent_query_capture_frame_nonce(
+    runtime: ?*RawMetalDecodeRuntime,
+    capture_domain: ?*anyopaque,
+) u64;
+pub extern fn termite_metal_decode_runtime_native_recent_query_capture_copy_calls(runtime: ?*RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_decode_runtime_native_recent_query_capture_copy_bytes(runtime: ?*RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_decode_runtime_capture_recent_query_from_active_compute(
+    runtime: ?*RawMetalDecodeRuntime,
+    capture_domain: ?*anyopaque,
+    source_handle: ?*anyopaque,
+    source_offset: usize,
+    source_bytes: usize,
+    destination_handle: ?*anyopaque,
+    destination_offset: usize,
+    capture_bytes: usize,
+    sample_rows: usize,
+    sample_stride: usize,
+    source_row_bytes: usize,
+    num_heads: usize,
+    head_dim: usize,
+) c_int;
+
+fn rejectedPrecomputedAdmission(layer_index: usize, comptime reason: []const u8) ?PrecomputedGatedBlockAdmission {
+    _ = precomputedTailSkip(layer_index, reason);
+    return null;
+}
+
+pub extern fn termite_metal_decode_runtime_preflight_precomputed_gated_tail(
+    runtime: ?*RawMetalDecodeRuntime,
+    num_heads: usize,
+    head_dim: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    residual_handle: ?*anyopaque,
+    residual_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    ple_handle: ?*anyopaque,
+    ple_offset: usize,
+    ple_hidden_size: usize,
+) c_int;
+
+fn precomputedShape(value: MetalTensor, width: usize) bool {
+    const dimension = std.math.cast(i32, width) orelse return false;
+    const bytes = std.math.mul(usize, width, @sizeOf(f32)) catch return false;
+    return value.isDevice() and value.dtype == .f32 and value.deviceByteLen() >= bytes and
+        value.ndim() == 2 and value.dim(0) == 1 and value.dim(1) == dimension;
+}
+
+fn precomputedTailSkip(layer_index: usize, comptime reason: []const u8) bool {
+    if (traceQuantBlockRequested()) std.debug.print("metal-context-precomputed-tail-skip layer={d} reason={s}\n", .{ layer_index, reason });
+    return false;
+}
+
+fn residentRow1Q4MmvRequested(request: anytype) bool {
+    const Request = switch (@typeInfo(@TypeOf(request))) {
+        .pointer => |info| info.child,
+        else => @TypeOf(request),
+    };
+    return if (@hasField(Request, "resident_row1_q4_mmv")) request.resident_row1_q4_mmv else false;
+}
+
+fn residentRow1Q4MmvAdmissionPolicy(request: anytype, formats: DirectQuantizedBlockFormats) bool {
+    const requested = residentRow1Q4MmvRequested(request);
+    return requested and request.hidden_size == 2560 and request.intermediate_size == 10240 and
+        request.activation == .gelu_new and request.ffn_post_gate_rms_norm_slot == null and
+        request.ffn_post_down_rms_norm_slot != null and std.math.isFinite(request.eps) and
+        request.eps > 0 and formats.ffn_gate_up == .q4_0 and formats.ffn_down == .q4_0;
+}
+
+test "resident row1 q4 mmv admission is exact and fail closed" {
+    const Request = struct {
+        resident_row1_q4_mmv: bool = true,
+        hidden_size: usize = 2560,
+        intermediate_size: usize = 10240,
+        activation: ops.DecoderRuntimeActivationKind = .gelu_new,
+        ffn_post_gate_rms_norm_slot: ?usize = null,
+        ffn_post_down_rms_norm_slot: ?usize = 9,
+        eps: f32 = 1.0e-6,
+    };
+    const q4 = DirectQuantizedBlockFormats{
+        .attention = .q4_0,
+        .ffn_gate_up = .q4_0,
+        .ffn_down = .q4_0,
+    };
+    var request = Request{};
+    try std.testing.expect(residentRow1Q4MmvAdmissionPolicy(&request, q4));
+    try std.testing.expect(residentRow1Q4MmvAdmissionPolicy(request, q4));
+    request.resident_row1_q4_mmv = false;
+    try std.testing.expect(!residentRow1Q4MmvAdmissionPolicy(&request, q4));
+    request = .{ .activation = .silu };
+    try std.testing.expect(!residentRow1Q4MmvAdmissionPolicy(&request, q4));
+    request = .{ .ffn_post_gate_rms_norm_slot = 3 };
+    try std.testing.expect(!residentRow1Q4MmvAdmissionPolicy(&request, q4));
+    request = .{ .ffn_post_down_rms_norm_slot = null };
+    try std.testing.expect(!residentRow1Q4MmvAdmissionPolicy(&request, q4));
+    request = .{ .eps = std.math.nan(f32) };
+    try std.testing.expect(!residentRow1Q4MmvAdmissionPolicy(&request, q4));
+    request = .{};
+    var wrong = q4;
+    wrong.ffn_down = .q6_k;
+    try std.testing.expect(!residentRow1Q4MmvAdmissionPolicy(&request, wrong));
+}
+
+pub fn admitPrecomputedGatedBlockDevice(
+    self: anytype,
+    request: anytype,
+    layer_index: usize,
+    residual: MetalTensor,
+    ple: ?MetalTensor,
+    output: ?MetalTensor,
+) ?PrecomputedGatedBlockAdmission {
+    const runtime = self.raw_decode_runtime orelse return null;
+    const destination = output orelse return rejectedPrecomputedAdmission(layer_index, "output-unavailable");
+    if (!hasActiveFrame(runtime) or hasSubmittedFrame(runtime)) return null;
+    if (request.hidden_size == 0 or request.intermediate_size == 0) return null;
+    if (request.num_heads == 0 or request.num_kv_heads == 0 or request.head_dim == 0 or
+        request.num_heads % request.num_kv_heads != 0 or request.num_heads > std.math.maxInt(u32) or
+        request.num_kv_heads > std.math.maxInt(u32) or request.head_dim > std.math.maxInt(u32)) return null;
+    const width = std.math.mul(usize, request.num_heads, request.head_dim) catch return null;
+    if (!precomputedShape(residual, request.hidden_size) or !precomputedShape(destination, request.hidden_size)) return rejectedPrecomputedAdmission(layer_index, "hidden-shape");
+    const has_ple_slots = request.ple_gate_linear_slot != null or
+        request.ple_proj_linear_slot != null or request.ple_post_norm_slot != null or
+        request.ple_hidden_size != 0;
+    if ((ple != null) != has_ple_slots) return rejectedPrecomputedAdmission(layer_index, "ple-presence");
+    if (ple != null and (request.ple_gate_linear_slot == null or
+        request.ple_proj_linear_slot == null or request.ple_post_norm_slot == null or
+        request.ple_hidden_size == 0)) return null;
+    if (ple) |value| if (!precomputedShape(value, request.ple_hidden_size)) return rejectedPrecomputedAdmission(layer_index, "ple-shape");
+    if (request.attention_pre_linear_rms_norm_slot) |slot|
+        if (!decoderRuntimeRmsNormSlotPrepared(self, slot, width)) return rejectedPrecomputedAdmission(layer_index, "attention-pre-norm");
+    if (request.attention_post_linear_rms_norm_slot) |slot|
+        if (!decoderRuntimeRmsNormSlotPrepared(self, slot, request.hidden_size)) return rejectedPrecomputedAdmission(layer_index, "attention-post-norm");
+    if (request.ffn_layer_norm_slot != null and request.ffn_rms_norm_slot != null) return null;
+    if (request.ffn_layer_norm_slot) |slot|
+        if (!decoderRuntimeLayerNormSlotPrepared(self, slot, request.hidden_size)) return null;
+    if (request.ffn_rms_norm_slot) |slot|
+        if (!decoderRuntimeRmsNormSlotPrepared(self, slot, request.hidden_size)) return rejectedPrecomputedAdmission(layer_index, "ffn-pre-norm");
+    if (request.ffn_post_gate_rms_norm_slot) |slot|
+        if (!decoderRuntimeRmsNormSlotPrepared(self, slot, request.intermediate_size)) return null;
+    if (request.ffn_post_down_rms_norm_slot) |slot|
+        if (!decoderRuntimeRmsNormSlotPrepared(self, slot, request.hidden_size)) return rejectedPrecomputedAdmission(layer_index, "ffn-post-norm");
+    if (request.output_scale_value) |value| if (!std.math.isFinite(value)) return null;
+    if (!std.math.isFinite(request.eps) or request.eps <= 0) return null;
+    const formats = precomputedGatedBlockFormats(self, request, layer_index, ple) orelse return rejectedPrecomputedAdmission(layer_index, "prepared-formats");
+    const resident_row1_q4_mmv_requested = residentRow1Q4MmvRequested(request);
+    const resident_row1_q4_mmv = residentRow1Q4MmvAdmissionPolicy(request, formats);
+    if (resident_row1_q4_mmv_requested and !resident_row1_q4_mmv)
+        return rejectedPrecomputedAdmission(layer_index, "resident-row1-q4-mmv-geometry");
+    const rc = termite_metal_decode_runtime_preflight_precomputed_gated_tail(
+        runtime,
+        request.num_heads,
+        request.head_dim,
+        request.hidden_size,
+        request.intermediate_size,
+        residual.deviceHandle(),
+        residual.deviceByteOffset(),
+        destination.deviceHandle(),
+        destination.deviceByteOffset(),
+        if (ple) |value| value.deviceHandle() else null,
+        if (ple) |value| value.deviceByteOffset() else 0,
+        if (ple != null) request.ple_hidden_size else 0,
+    );
+    if (rc != 0) {
+        if (traceQuantBlockRequested()) std.debug.print("metal-context-precomputed-tail-skip layer={d} reason=scratch-preflight rc={d}\n", .{ layer_index, rc });
+        return null;
+    }
+    const frame_nonce = termite_metal_decode_runtime_active_frame_nonce(runtime);
+    if (frame_nonce == 0 or frame_nonce == std.math.maxInt(u64)) return null;
+    return .{
+        .runtime = runtime,
+        .frame_nonce = frame_nonce,
+        .layer_index = layer_index,
+        .formats = formats,
+        .resident_row1_q4_mmv = resident_row1_q4_mmv,
+        .binding = .init(request, residual, ple, destination),
+    };
+}
+
+pub fn supportsPrecomputedGatedBlockDevice(
+    self: anytype,
+    request: anytype,
+    layer_index: usize,
+    residual: MetalTensor,
+    ple: ?MetalTensor,
+    output: ?MetalTensor,
+) bool {
+    return admitPrecomputedGatedBlockDevice(self, request, layer_index, residual, ple, output) != null;
+}
+
+/// Called only after packed attention has encoded on the active owner frame.
+/// Errors are terminal for that frame: no fallback can repeat a packed write.
+/// The caller supplies its preallocated output. Runtime scratch
+/// is pre-reserved and C rejects growth, aliasing, or an attention command plan.
+pub fn runAdmittedPrecomputedGatedBlockDevice(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    request: anytype,
+    layer_index: usize,
+    attention_output: MetalTensor,
+    residual: MetalTensor,
+    ple: ?MetalTensor,
+    destination: MetalTensor,
+    stats: anytype,
+    admission: PrecomputedGatedBlockAdmission,
+) !MetalTensor {
+    // This entry is reached only after packed attention has mutated the
+    // pending session transaction. Every error is terminal and must be
+    // visible in the request-local route receipt, including failures before
+    // the C encoder is entered.
+    errdefer stats.context_precomputed_tail_failures += 1;
+    _ = allocator; // Output and all Metal scratch are reserved before the packed hook.
+    const runtime = self.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+    if (runtime != admission.runtime or layer_index != admission.layer_index or
+        !admission.binding.matches(request, residual, ple, destination) or
+        !precomputedShape(residual, request.hidden_size) or
+        !precomputedShape(destination, request.hidden_size) or
+        (if (ple) |value| !precomputedShape(value, request.ple_hidden_size) else false) or
+        termite_metal_decode_runtime_active_frame_nonce(runtime) != admission.frame_nonce or
+        !hasActiveFrame(runtime) or hasSubmittedFrame(runtime))
+        return error.ContextFramedExecutionUnsupported;
+    const formats = admission.formats;
+    const attention_width = try std.math.mul(usize, request.num_heads, request.head_dim);
+    if (!precomputedShape(attention_output, attention_width) or attention_output.deviceByteOffset() != 0)
+        return error.InvalidAttentionShape;
+    var output = try destination.retainedCopy();
+    errdefer output.deinit();
+    const none = std.math.maxInt(usize);
+    var timing: RawAttentionGatedBlockTiming = .{};
+    const started_at = monotonicNowNs();
+    if (admission.resident_row1_q4_mmv and
+        termite_metal_decode_runtime_begin_resident_row1_q4_mmv(runtime) != 0)
+        return error.ContextFramedExecutionUnsupported;
+    const rc = termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_device_kv_device(
+        runtime,
+        @backingInt(formats.attention),
+        @backingInt(formats.ffn_gate_up),
+        @backingInt(formats.ffn_down),
+        @backingInt(formats.ple),
+        null,
+        0,
+        null,
+        0,
+        null,
+        0,
+        1,
+        1,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        0,
+        0,
+        0,
+        1,
+        request.attention_linear_slot,
+        request.attention_pre_linear_rms_norm_slot orelse none,
+        request.attention_post_linear_rms_norm_slot orelse none,
+        residual.deviceHandle(),
+        residual.deviceByteOffset(),
+        attention_width,
+        request.hidden_size,
+        request.eps,
+        request.ffn_layer_norm_slot orelse none,
+        request.ffn_rms_norm_slot orelse none,
+        request.ffn_post_gate_rms_norm_slot orelse none,
+        request.ffn_post_down_rms_norm_slot orelse none,
+        request.gate_ffn_linear_slot,
+        request.up_ffn_linear_slot,
+        request.down_ffn_linear_slot,
+        request.intermediate_size,
+        @backingInt(request.activation),
+        layer_index,
+        if (ple) |value| value.deviceHandle() else null,
+        if (ple) |value| value.deviceByteOffset() else 0,
+        request.ple_gate_linear_slot orelse none,
+        request.ple_proj_linear_slot orelse none,
+        request.ple_post_norm_slot orelse none,
+        if (ple != null) request.ple_hidden_size else 0,
+        if (request.output_scale_value != null) 1 else 0,
+        request.output_scale_value orelse 1.0,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+        .{},
+        &timing,
+        none,
+        0,
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        attention_output.deviceHandle(),
+    );
+    const selector_end_rc = if (admission.resident_row1_q4_mmv)
+        termite_metal_decode_runtime_end_resident_row1_q4_mmv(runtime)
+    else
+        0;
+    stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - started_at);
+    stats.compressed_block_attention_prefix_nanos += timing.attention_prefix_nanos;
+    stats.compressed_block_gated_ffn_residual_nanos += timing.gated_ffn_residual_nanos;
+    stats.compressed_block_command_wait_nanos += timing.command_wait_nanos;
+    stats.compressed_block_gpu_nanos += timing.gpu_nanos;
+    stats.active_decode_quant_linear_kernels += timing.quant_linear_kernels;
+    stats.active_decode_quant_attention_linear_kernels += timing.quant_attention_linear_kernels;
+    stats.active_decode_quant_ffn_down_linear_kernels += timing.quant_ffn_down_linear_kernels;
+    stats.active_decode_quant_ple_linear_kernels += timing.quant_ple_linear_kernels;
+    stats.active_decode_quant_gate_up_pair_kernels += timing.quant_gate_up_pair_kernels;
+    stats.active_decode_rms_norm_kernels += timing.rms_norm_kernels;
+    stats.active_decode_rms_norm_add_kernels += timing.rms_norm_add_kernels;
+    stats.active_decode_layer_norm_kernels += timing.layer_norm_kernels;
+    stats.active_decode_add_kernels += timing.add_kernels;
+    stats.active_decode_blit_copies += timing.blit_copies;
+    if (rc != 0 or selector_end_rc != 0 or timing.attention_f32_kernels != 0) {
+        if (traceQuantBlockRequested()) std.debug.print("metal-context-precomputed-tail-failed layer={d} rc={d} stage={d} stage_rc={d}\n", .{ layer_index, rc, timing.failure_stage, timing.failure_code });
+        return error.ContextFramedExecutionUnsupported;
+    }
+    stats.context_precomputed_tail_blocks += 1;
+    stats.quantized_gated_ffn_direct_successes += 1;
+    return output;
+}
+
+pub fn runPrecomputedGatedBlockDevice(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    request: anytype,
+    layer_index: usize,
+    attention_output: MetalTensor,
+    residual: MetalTensor,
+    ple: ?MetalTensor,
+    destination: MetalTensor,
+    stats: anytype,
+) !MetalTensor {
+    // Preserve the legacy wrapper error while charging every rejected
+    // post-hook invocation exactly once. Once admission succeeds, the admitted
+    // runner owns failure accounting for all later validation/C errors.
+    if (self.raw_decode_runtime == null) {
+        stats.context_precomputed_tail_failures += 1;
+        return error.MetalRuntimeUnavailable;
+    }
+    const admission = admitPrecomputedGatedBlockDevice(
+        self,
+        request,
+        layer_index,
+        residual,
+        ple,
+        destination,
+    ) orelse {
+        stats.context_precomputed_tail_failures += 1;
+        return error.ContextFramedExecutionUnsupported;
+    };
+    return runAdmittedPrecomputedGatedBlockDevice(
+        self,
+        allocator,
+        request,
+        layer_index,
+        attention_output,
+        residual,
+        ple,
+        destination,
+        stats,
+        admission,
+    );
+}
+
 fn traceQuantBlockRequested() bool {
     return getenvBool("TERMITE_METAL_TRACE_QUANT_BLOCK") or
         getenvBool("TERMITE_METAL_TRACE_Q80_BLOCK");
@@ -30872,15 +32744,16 @@ inline fn encodeQuantizedAttentionBlock(
         output.deviceByteOffset(),
         raw_planned_layer_contract,
         timing,
-        (if (paged) paged_layer.slot else none),
-        (if (paged) paged_layer.format else 0),
-        (if (paged) block_token_offsets.ptr else null),
-        (if (paged) block_token_offsets.len else 0),
-        (if (paged) @intCast(paged_layer.page_size_tokens) else 0),
-        (if (paged) paged_layer.key_row_bytes else 0),
-        (if (paged) paged_layer.base_key_row_bytes else 0),
-        (if (paged) paged_layer.v_row_stride else 0),
-        (if (paged) suffix_tokens else 0),
+        if (paged) paged_layer.slot else none,
+        if (paged) paged_layer.format else 0,
+        if (paged) block_token_offsets.ptr else null,
+        if (paged) block_token_offsets.len else 0,
+        if (paged) @intCast(paged_layer.page_size_tokens) else 0,
+        if (paged) paged_layer.key_row_bytes else 0,
+        if (paged) paged_layer.base_key_row_bytes else 0,
+        if (paged) paged_layer.v_row_stride else 0,
+        if (paged) suffix_tokens else 0,
+        null,
     );
 }
 
@@ -31216,7 +33089,147 @@ fn runAttentionF32GatedDecoderBlockQuantizedDeviceInto(
     output_mt: MetalTensor,
     stats: anytype,
 ) !bool {
-    return runAttentionF32QuantizedBlock(false, self, request, q_mt, k_full_mt, v_full_mt, residual_mt, output_mt, stats);
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (request.query_sequence_len == 0) return false;
+    const attention_input_size = request.num_heads * request.head_dim;
+    const direct_block_format = directQuantizedBlockFormatForRequest(self, request) orelse return false;
+    if (q_mt.ndim() != 2 or k_full_mt.ndim() != 2 or v_full_mt.ndim() != 2 or residual_mt.ndim() != 2 or output_mt.ndim() != 2) return false;
+    const rows = request.query_sequence_len;
+    if (@as(usize, @intCast(q_mt.dim(0))) != rows or
+        @as(usize, @intCast(k_full_mt.dim(0))) != request.kv_tokens or
+        @as(usize, @intCast(v_full_mt.dim(0))) != request.kv_tokens or
+        @as(usize, @intCast(residual_mt.dim(0))) != rows or
+        @as(usize, @intCast(output_mt.dim(0))) != rows)
+    {
+        return false;
+    }
+    if (@as(usize, @intCast(q_mt.dim(1))) != attention_input_size or
+        @as(usize, @intCast(k_full_mt.dim(1))) != request.num_kv_heads * request.head_dim or
+        @as(usize, @intCast(v_full_mt.dim(1))) != request.num_kv_heads * request.head_dim or
+        @as(usize, @intCast(residual_mt.dim(1))) != request.hidden_size or
+        @as(usize, @intCast(output_mt.dim(1))) != request.hidden_size)
+    {
+        return false;
+    }
+    if (!q_mt.isDevice() or !k_full_mt.isDevice() or !v_full_mt.isDevice() or !residual_mt.isDevice() or !output_mt.isDevice()) return false;
+    const ple_mt_opt: ?MetalTensor = request.ple;
+    if (ple_mt_opt) |ple_mt| {
+        const ple_post_norm_slot = request.ple_post_norm_slot orelse return false;
+        if (request.ple_hidden_size == 0) return false;
+        if (ple_mt.ndim() != 2 or @as(usize, @intCast(ple_mt.dim(0))) != rows or @as(usize, @intCast(ple_mt.dim(1))) != request.ple_hidden_size) return false;
+        if (!ple_mt.isDevice()) return false;
+        if (ple_post_norm_slot >= decoder_runtime_rms_norm_slot_capacity) return false;
+        if (!self.raw_rms_norm_slots_prepared[ple_post_norm_slot]) return false;
+        if (self.raw_rms_norm_slot_hidden_sizes[ple_post_norm_slot] != request.hidden_size) return false;
+    }
+    const output_scale_value_opt: ?f32 = if (@hasField(@TypeOf(request), "output_scale_value")) request.output_scale_value else null;
+
+    const none = std.math.maxInt(usize);
+    const planned_layer_contract: ops.PlannedLayerContract = if (@hasField(@TypeOf(request), "planned_layer_contract")) request.planned_layer_contract else .{};
+    const raw_planned_layer_contract = RawPlannedLayerContract.fromContract(planned_layer_contract);
+    var timing: RawAttentionGatedBlockTiming = .{};
+    const started_at = monotonicNowNs();
+    const rc = termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_device_kv_device(
+        runtime,
+        @backingInt(direct_block_format.attention),
+        @backingInt(direct_block_format.ffn_gate_up),
+        @backingInt(direct_block_format.ffn_down),
+        @backingInt(direct_block_format.ple),
+        q_mt.deviceHandle(),
+        q_mt.deviceByteOffset(),
+        k_full_mt.deviceHandle(),
+        k_full_mt.deviceByteOffset(),
+        v_full_mt.deviceHandle(),
+        v_full_mt.deviceByteOffset(),
+        rows,
+        request.kv_tokens,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        request.query_position_offset,
+        request.kv_position_offset,
+        request.sliding_window,
+        request.total_sequence_len,
+        request.attention_linear_slot,
+        request.attention_pre_linear_rms_norm_slot orelse none,
+        request.attention_post_linear_rms_norm_slot orelse none,
+        residual_mt.deviceHandle(),
+        residual_mt.deviceByteOffset(),
+        attention_input_size,
+        request.hidden_size,
+        request.eps,
+        request.ffn_layer_norm_slot orelse none,
+        request.ffn_rms_norm_slot orelse none,
+        request.ffn_post_gate_rms_norm_slot orelse none,
+        request.ffn_post_down_rms_norm_slot orelse none,
+        request.gate_ffn_linear_slot,
+        request.up_ffn_linear_slot,
+        request.down_ffn_linear_slot,
+        request.intermediate_size,
+        @backingInt(request.activation),
+        request.layer_index,
+        if (ple_mt_opt) |ple_mt| ple_mt.deviceHandle() else null,
+        if (ple_mt_opt) |ple_mt| ple_mt.deviceByteOffset() else 0,
+        request.ple_gate_linear_slot orelse none,
+        request.ple_proj_linear_slot orelse none,
+        request.ple_post_norm_slot orelse none,
+        if (ple_mt_opt != null) request.ple_hidden_size else 0,
+        if (output_scale_value_opt != null) 1 else 0,
+        output_scale_value_opt orelse 1.0,
+        output_mt.deviceHandle(),
+        output_mt.deviceByteOffset(),
+        raw_planned_layer_contract,
+        &timing,
+        none,
+        0,
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        null,
+    );
+    stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - started_at);
+    stats.compressed_block_attention_span_nanos += timing.attention_span_nanos;
+    stats.compressed_block_attention_prefix_nanos += timing.attention_prefix_nanos;
+    stats.compressed_block_gated_ffn_residual_nanos += timing.gated_ffn_residual_nanos;
+    stats.compressed_block_command_wait_nanos += timing.command_wait_nanos;
+    stats.compressed_block_gpu_nanos += timing.gpu_nanos;
+    stats.active_decode_attention_f32_kernels += timing.attention_f32_kernels;
+    stats.active_decode_quant_linear_kernels += timing.quant_linear_kernels;
+    stats.active_decode_quant_attention_linear_kernels += timing.quant_attention_linear_kernels;
+    stats.active_decode_quant_ffn_down_linear_kernels += timing.quant_ffn_down_linear_kernels;
+    stats.active_decode_quant_ple_linear_kernels += timing.quant_ple_linear_kernels;
+    stats.active_decode_quant_gate_up_pair_kernels += timing.quant_gate_up_pair_kernels;
+    stats.active_decode_rms_norm_kernels += timing.rms_norm_kernels;
+    stats.active_decode_rms_norm_add_kernels += timing.rms_norm_add_kernels;
+    stats.active_decode_layer_norm_kernels += timing.layer_norm_kernels;
+    stats.active_decode_add_kernels += timing.add_kernels;
+    stats.active_decode_blit_copies += timing.blit_copies;
+    if (rc != 0) {
+        if (traceQuantBlockRequested()) {
+            std.debug.print(
+                "metal-f32-quant-block-into-fail layer={d} rows={d} rc={d} stage={d} stage_rc={d} graph_plan_count={d} graph_plan_slots={d}\n",
+                .{
+                    request.layer_index,
+                    rows,
+                    rc,
+                    timing.failure_stage,
+                    timing.failure_code,
+                    runtimeMemorySnapshot(runtime).graph_plan_count,
+                    runtimeMemorySnapshot(runtime).graph_plan_slots,
+                },
+            );
+        }
+        stats.f32_kv_quant_direct_block_failures += 1;
+        return false;
+    }
+    stats.f32_kv_quant_direct_block_successes += 1;
+    stats.quantized_gated_ffn_direct_successes += 1;
+    return true;
 }
 
 pub fn runAttentionF32GatedDecoderBlockDeviceInto(
@@ -34543,6 +36556,45 @@ test "metal native decoderRuntimeApplyLinear iq2_xs matches trivial reference" {
     try std.testing.expectApproxEqAbs(@as(f32, 32.0), actual[0], 1e-4);
 }
 
+test "context strict GPU argmax sequence matches CPU oracle on 256 synthetic tensors" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const previous = try setQualificationArgmaxPolicy(runtime, .{ .require_finite = true, .softcap = 30 });
+    defer _ = setQualificationArgmaxPolicy(runtime, previous) catch {};
+
+    var cpu_tokens: [256]u32 = undefined;
+    var gpu_tokens: [256]u32 = undefined;
+    for (0..256) |step| {
+        var logits: [4097]f32 = undefined;
+        for (&logits, 0..) |*value, token| value.* = @floatFromInt((token * 17 + step * 13) % 997);
+        logits[7] = 1e20;
+        logits[19] = 2e20; // final softcap makes a tie; lowest ID must win
+        var expected: usize = 0;
+        for (logits, 0..) |raw, token| {
+            if (!std.math.isFinite(raw)) return error.NonFiniteStudyLogits;
+            const value = 30 * std.math.tanh(raw / 30);
+            const best = 30 * std.math.tanh(logits[expected] / 30);
+            if (value > best) expected = token;
+        }
+        var tensor = try testDeviceTensorFromSlice(runtime, &logits, &[_]i32{ 1, @intCast(logits.len) });
+        defer tensor.deinit();
+        const actual = (try argmaxLogitsDevice(&provider, tensor, logits.len)) orelse return error.UnexpectedNull;
+        cpu_tokens[step] = @intCast(expected);
+        gpu_tokens[step] = @intCast(actual);
+    }
+    try std.testing.expectEqualSlices(u32, &cpu_tokens, &gpu_tokens);
+
+    const poisoned = [_]f32{ 0, std.math.nan(f32), 1 };
+    var tensor = try testDeviceTensorFromSlice(runtime, &poisoned, &[_]i32{ 1, poisoned.len });
+    defer tensor.deinit();
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(u32)), (try argmaxLogitsDevice(&provider, tensor, poisoned.len)) orelse return error.UnexpectedNull);
+}
+
 // Linked only by the Metal unit-test build; production has no failure switch.
 extern fn termite_metal_test_force_host_output_copy(enabled: c_int) void;
 
@@ -36559,6 +38611,70 @@ test "metal native decoderRuntimeApplyLinear q8_0 device rows match reference" {
     }
 }
 
+test "attention_match Metal checkpoint graph trim preserves hidden state and queued work" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    defer {
+        if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+        if (hasSubmittedFrame(runtime)) waitFrame(runtime) catch {};
+    }
+    try reserveHiddenState(runtime, 2, 4);
+    const front = hiddenStateBuffer(runtime, .front) orelse return error.UnexpectedNull;
+    defer termite_metal_buffer_release(front);
+    const seed = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var owned = try testDeviceTensorFromSlice(runtime, &seed, &.{ 2, 4 });
+    defer owned.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_copy(runtime, owned.deviceHandle(), 0, front, 0, @sizeOf(@TypeOf(seed))));
+    try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(&provider, 4, 2, 1, 8, 16, 32, 64));
+    const before = runtimeMemorySnapshot(runtime);
+    try std.testing.expect(before.graph_plan_bytes > 0);
+
+    var lease: ?*anyopaque = try acquireScratch(runtime, 4096);
+    defer if (lease) |handle| releaseScratch(runtime, handle);
+    var released: usize = 99;
+    try std.testing.expectEqual(@as(c_int, -1), termite_metal_decode_runtime_trim_checkpoint_graph_workspace(runtime, &released));
+    try std.testing.expectEqual(@as(usize, 0), released);
+    try std.testing.expectEqual(before.graph_plan_bytes, runtimeMemorySnapshot(runtime).graph_plan_bytes);
+    releaseScratch(runtime, lease.?);
+    lease = null;
+    try beginFrame(runtime);
+    try std.testing.expect(decoderRuntimeActiveLayerProjectionScratchHandle(&provider, 0, 4, 16) != null);
+    try std.testing.expectEqual(@as(c_int, -1), termite_metal_decode_runtime_trim_checkpoint_graph_workspace(runtime, &released));
+    try std.testing.expectEqual(@as(usize, 0), released);
+    try submitFrame(runtime);
+    try std.testing.expectEqual(@as(c_int, -1), termite_metal_decode_runtime_trim_checkpoint_graph_workspace(runtime, &released));
+    try std.testing.expectEqual(before.graph_plan_bytes, runtimeMemorySnapshot(runtime).graph_plan_bytes);
+    try waitFrame(runtime);
+
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_trim_checkpoint_graph_workspace(runtime, &released));
+    try std.testing.expectEqual(before.graph_plan_bytes, @as(u64, @intCast(released)));
+    try std.testing.expectEqual(@as(u64, 0), runtimeMemorySnapshot(runtime).graph_plan_bytes);
+    const retained_front = hiddenStateBuffer(runtime, .front) orelse return error.UnexpectedNull;
+    defer termite_metal_buffer_release(retained_front);
+    try std.testing.expectEqual(front, retained_front);
+    try std.testing.expectEqual(@as(usize, @sizeOf(@TypeOf(seed))), hiddenStateCapacity(runtime));
+    var observed: [seed.len]f32 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, retained_front, 0, @ptrCast(&observed), @sizeOf(@TypeOf(seed))));
+    try std.testing.expectEqualSlices(f32, &seed, &observed);
+
+    // Direct-hidden borrowing is a non-allocating readiness check. Projection
+    // borrowing may rebuild its cache, so it cannot test stale-alias retirement.
+    try beginFrame(runtime);
+    var direct_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(@as(c_int, -3), termite_metal_decode_runtime_borrow_active_direct_hidden_scratch_device(runtime, 0, 4 * 16 * @sizeOf(f32), &direct_handle));
+    try std.testing.expect(direct_handle == null);
+    try cancelFrame(runtime);
+    try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(&provider, 2, 2, 1, 8, 16, 32, 64));
+    try beginFrame(runtime);
+    try std.testing.expect(decoderRuntimeActiveLayerProjectionScratchHandle(&provider, 0, 2, 16) != null);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_borrow_active_direct_hidden_scratch_device(runtime, 0, 2 * 16 * @sizeOf(f32), &direct_handle));
+    try std.testing.expect(direct_handle != null);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+}
+
 test "metal native qwen embedding workspace quota and frame retirement" {
     if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
     var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
@@ -37820,7 +39936,14 @@ test "metal native q4_k gated ffn keeps planned frame coalesced" {
         .retain_dense_fallback = false,
     }, &prep_stats));
 
-    const norm_weight_data = @as([hidden_size]f32, @splat(1.0));
+    var norm_weight_data: [hidden_size]f32 = undefined;
+    for (&norm_weight_data, 0..) |*value, i| {
+        // Non-uniform weights make omission of Gemma's mandatory
+        // post_feedforward_layernorm observable.  An all-ones fixture only
+        // proved the helper's null-norm fast path.
+        const signed = @as(i32, @intCast(i % 23)) - 11;
+        value.* = 1.0 + @as(f32, @floatFromInt(signed)) / 64.0;
+    }
     var norm_weight = try MetalTensor.ownedCloneFrom(&norm_weight_data, &[_]i32{@intCast(hidden_size)});
     defer norm_weight.deinit();
     try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{
@@ -37932,13 +40055,29 @@ test "metal native q4_k gated ffn keeps planned frame coalesced" {
 }
 
 test "metal native q4_0 gated ffn device path matches decomposed" {
-    try testQ4GatedFfnRows(1, false, 64, 64);
+    try testQ4GatedFfnRows(1, false, 64, 64, false, false);
+}
+
+test "metal native resident q4_0 active frame null subnorm matches decomposed" {
+    const disable_name = "TERMITE_METAL_DISABLE_GATED_FFN_RESIDUAL_SINGLE_ROW";
+    const old = if (std.c.getenv(disable_name)) |value|
+        try std.testing.allocator.dupeSentinel(u8, std.mem.span(value), 0)
+    else
+        null;
+    defer {
+        if (old) |value| {
+            _ = setenv(disable_name, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else _ = unsetenv(disable_name);
+    }
+    _ = unsetenv(disable_name);
+    try testQ4GatedFfnRows(1, true, 64, 64, true, false);
 }
 
 test "metal native q4_0 multirow gated ffn matches decomposed" {
-    try testQ4GatedFfnRows(2, false, 64, 64);
-    try testQ4GatedFfnRows(3, false, 64, 64);
-    try testQ4GatedFfnRows(4, false, 64, 64);
+    try testQ4GatedFfnRows(2, false, 64, 64, false, false);
+    try testQ4GatedFfnRows(3, false, 64, 64, false, false);
+    try testQ4GatedFfnRows(4, false, 64, 64, false, false);
 }
 
 test "metal native q4_0 batch invariant linear and fused ffn are bitwise singleton" {
@@ -37955,15 +40094,86 @@ test "metal native q4_0 batch invariant linear and fused ffn are bitwise singlet
         } else _ = unsetenv(name);
     }
     try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
-    try testQ4GatedFfnRows(2, true, 64, 64);
-    try testQ4GatedFfnRows(3, true, 1536, 6144);
-    try testQ4GatedFfnRows(4, true, 1536, 12288);
-    try testQ4GatedFfnRows(8, true, 128, 96);
+    try testQ4GatedFfnRows(2, true, 64, 64, false, false);
+    try testQ4GatedFfnRows(3, true, 1536, 6144, false, false);
+    try testQ4GatedFfnRows(4, true, 1536, 12288, false, false);
+    try testQ4GatedFfnRows(8, true, 128, 96, false, false);
     try testQ4QkvRows(3);
     try testQ4QkvRows(4);
 }
 
-fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime hidden_size: usize, comptime intermediate_size: usize) !void {
+fn roundSliceToF16(values: []f32) void {
+    for (values) |*value| {
+        const half: f16 = @floatCast(value.*);
+        value.* = @floatCast(half);
+    }
+}
+
+/// Independent CPU reference for the E4 fused-half Metal policy. The Metal
+/// pair shader converts both its F32 input and dequantized Q4_0 weights to F16
+/// before F32 accumulation, stores the GELU-new product as F16, then applies
+/// the same F16-weight/F16-input boundary to the down projection. Keep this
+/// separate from the prepared Metal linear path so the fixture can detect a
+/// shared GPU implementation error rather than compare the route with itself.
+fn residentE4FusedHalfCpuOracle(
+    allocator: std.mem.Allocator,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    input: []const f32,
+    residual: []const f32,
+    norm_weight: []const f32,
+    gate_raw: []const u8,
+    up_raw: []const u8,
+    down_raw: []const u8,
+) ![]f32 {
+    if (!native.useBlas()) return error.AccelerateRequired;
+    if (input.len != rows * hidden_size or residual.len != input.len or norm_weight.len != hidden_size)
+        return error.InvalidShape;
+
+    const input_half = try allocator.dupe(f32, input);
+    defer allocator.free(input_half);
+    roundSliceToF16(input_half);
+
+    const weight_len = hidden_size * intermediate_size;
+    const weight_half = try allocator.alloc(f32, weight_len);
+    defer allocator.free(weight_half);
+    const gate_result = try allocator.alloc(f32, rows * intermediate_size);
+    defer allocator.free(gate_result);
+    const up_result = try allocator.alloc(f32, rows * intermediate_size);
+    defer allocator.free(up_result);
+
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, gate_raw, weight_half);
+    roundSliceToF16(weight_half);
+    native.sgemmTransBSync(rows, intermediate_size, hidden_size, 1.0, input_half, weight_half, 0.0, gate_result);
+
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, up_raw, weight_half);
+    roundSliceToF16(weight_half);
+    native.sgemmTransBSync(rows, intermediate_size, hidden_size, 1.0, input_half, weight_half, 0.0, up_result);
+
+    applyActivationHost(gate_result, .gelu_new);
+    for (gate_result, up_result) |*gate, up| gate.* *= up;
+    roundSliceToF16(gate_result);
+
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, down_raw, weight_half);
+    roundSliceToF16(weight_half);
+    const output = try allocator.alloc(f32, rows * hidden_size);
+    errdefer allocator.free(output);
+    native.sgemmTransBSync(rows, hidden_size, intermediate_size, 1.0, gate_result, weight_half, 0.0, output);
+
+    for (0..rows) |row| {
+        const values = output[row * hidden_size ..][0..hidden_size];
+        var sum_squares: f32 = 0.0;
+        for (values) |value| sum_squares += value * value;
+        const scale = 1.0 / @sqrt(sum_squares / @as(f32, @floatFromInt(hidden_size)) + 1e-5);
+        for (values, norm_weight, residual[row * hidden_size ..][0..hidden_size]) |*value, weight, skip| {
+            value.* = value.* * scale * weight + skip;
+        }
+    }
+    return output;
+}
+
+fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime hidden_size: usize, comptime intermediate_size: usize, comptime null_subnorm: bool, comptime resident_row1: bool) !void {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -37971,6 +40181,12 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
     var provider = try metal_native_provider.MetalNativeProvider.create();
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    if (resident_row1) {
+        try std.testing.expect(rows == 1 and hidden_size == 2560 and intermediate_size == 10240);
+        try std.testing.expect(configureDecoderRuntimeModelGeometry(runtime, .gemma4_e4b_dense42));
+    }
+    const e4_fused_half = null_subnorm and rows >= 511 and hidden_size == 2560 and intermediate_size == 10240;
+    if (e4_fused_half) try std.testing.expect(configureDecoderRuntimeModelGeometry(runtime, .gemma4_e4b_dense42));
 
     const block_values: usize = 32;
     const block_bytes: usize = 18;
@@ -38090,7 +40306,11 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
         .retain_dense_fallback = false,
     }, &prep_stats));
 
-    const norm_weight_data = @as([hidden_size]f32, @splat(1.0));
+    var norm_weight_data: [hidden_size]f32 = undefined;
+    for (&norm_weight_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast(i % 23)) - 11;
+        value.* = 1.0 + @as(f32, @floatFromInt(signed)) / 64.0;
+    }
     var norm_weight = try MetalTensor.ownedCloneFrom(&norm_weight_data, &[_]i32{@intCast(hidden_size)});
     defer norm_weight.deinit();
     try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{
@@ -38098,12 +40318,20 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
         .slot = 12,
         .hidden_size = hidden_size,
     }));
+    try std.testing.expect(decoderRuntimeReserveGatedFfnScratch(&provider, rows, hidden_size, intermediate_size));
 
     var input_data: [rows * hidden_size]f32 = undefined;
     var residual_data: [rows * hidden_size]f32 = undefined;
     for (&input_data, 0..) |*value, i| {
         const signed = @as(i32, @intCast((i * 17 + 7) % 97)) - 48;
         value.* = @as(f32, @floatFromInt(signed)) / 79.0;
+    }
+    if (null_subnorm) {
+        input_data[0] = -0.0;
+        input_data[1] = std.math.floatMin(f32);
+        input_data[2] = -std.math.floatMin(f32);
+        input_data[3] = 16.0;
+        input_data[4] = -16.0;
     }
     for (&residual_data, 0..) |*value, i| {
         const signed = @as(i32, @intCast((i * 31 + 11) % 101)) - 50;
@@ -38115,6 +40343,120 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
     defer residual.deinit();
 
     var stats: ops.NativeQuantTimingStats = .{};
+    if (e4_fused_half) {
+        // A fully prepared typed 511/512 request in an ordinary frame must
+        // decline before the C backend. This proves frame-regime rollback
+        // does not create attempts, hits, or fallbacks before the qualified
+        // PREFILL invocation below.
+        const before_decline = try e4FusedHalfStats(runtime);
+        try beginFrame(runtime);
+        var declined = try tryDeviceQuantizedGatedFfnResidual(&provider, .{
+            .gate_linear_slot = 60,
+            .up_linear_slot = 61,
+            .down_linear_slot = 62,
+            .rows = rows,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+            .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
+            .eps = 1e-5,
+            .post_gate_rms_norm_slot = null,
+            .post_down_rms_norm_slot = @as(?usize, 12),
+            .resident_e4_prefill_m64 = true,
+        }, input, residual, &stats);
+        if (declined) |*unexpected| unexpected.deinit();
+        try std.testing.expect(declined == null);
+        const after_decline = try e4FusedHalfStats(runtime);
+        try std.testing.expectEqual(before_decline.attempts, after_decline.attempts);
+        try std.testing.expectEqual(before_decline.hits, after_decline.hits);
+        try std.testing.expectEqual(before_decline.fallbacks, after_decline.fallbacks);
+        try std.testing.expectEqual(before_decline.pair_dispatches, after_decline.pair_dispatches);
+        try std.testing.expectEqual(before_decline.down_dispatches, after_decline.down_dispatches);
+        try std.testing.expectEqual(before_decline.fatal_failures, after_decline.fatal_failures);
+        try cancelFrame(runtime);
+        try std.testing.expect(!hasActiveFrame(runtime) and !hasSubmittedFrame(runtime));
+
+        // The actual 8128-row plan's 448-row tail also declines with a real
+        // PREFILL frame and correctly shaped device tensors, before any C
+        // attempt/fallback is recorded.
+        const tail_rows: usize = 448;
+        const tail_values = tail_rows * hidden_size;
+        const tail_input_data = try std.testing.allocator.dupe(f32, input_data[0..tail_values]);
+        defer std.testing.allocator.free(tail_input_data);
+        const tail_residual_data = try std.testing.allocator.dupe(f32, residual_data[0..tail_values]);
+        defer std.testing.allocator.free(tail_residual_data);
+        var tail_input = try testDeviceTensorFromSlice(runtime, tail_input_data, &[_]i32{ @intCast(tail_rows), @intCast(hidden_size) });
+        defer tail_input.deinit();
+        var tail_residual = try testDeviceTensorFromSlice(runtime, tail_residual_data, &[_]i32{ @intCast(tail_rows), @intCast(hidden_size) });
+        defer tail_residual.deinit();
+        const before_tail = try e4FusedHalfStats(runtime);
+        try beginFrame(runtime);
+        try setActiveFrameRegime(runtime, .prefill);
+        var tail_declined = try tryDeviceQuantizedGatedFfnResidual(&provider, .{
+            .gate_linear_slot = 60,
+            .up_linear_slot = 61,
+            .down_linear_slot = 62,
+            .rows = tail_rows,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+            .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
+            .eps = 1e-5,
+            .post_gate_rms_norm_slot = null,
+            .post_down_rms_norm_slot = @as(?usize, 12),
+            .resident_e4_prefill_m64 = true,
+        }, tail_input, tail_residual, &stats);
+        if (tail_declined) |*unexpected| unexpected.deinit();
+        try std.testing.expect(tail_declined == null);
+        const after_tail = try e4FusedHalfStats(runtime);
+        try std.testing.expectEqual(before_tail.attempts, after_tail.attempts);
+        try std.testing.expectEqual(before_tail.hits, after_tail.hits);
+        try std.testing.expectEqual(before_tail.fallbacks, after_tail.fallbacks);
+        try std.testing.expectEqual(before_tail.pair_dispatches, after_tail.pair_dispatches);
+        try std.testing.expectEqual(before_tail.down_dispatches, after_tail.down_dispatches);
+        try std.testing.expectEqual(before_tail.fatal_failures, after_tail.fatal_failures);
+        try cancelFrame(runtime);
+        try std.testing.expect(!hasActiveFrame(runtime) and !hasSubmittedFrame(runtime));
+    }
+    if (null_subnorm) {
+        try std.testing.expect((try tryDeviceQuantizedGatedFfnResidual(&provider, .{
+            .gate_linear_slot = 60,
+            .up_linear_slot = 61,
+            .down_linear_slot = 62,
+            .rows = 2,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+            .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
+            .eps = 1e-5,
+            .post_gate_rms_norm_slot = null,
+            .post_down_rms_norm_slot = if (e4_fused_half) @as(?usize, 12) else null,
+            .resident_e4_prefill_m64 = e4_fused_half,
+        }, input, residual, &stats)) == null);
+        // Cancellation before any encode leaves no frame owner behind.
+        try beginFrame(runtime);
+        if (e4_fused_half) try setActiveFrameRegime(runtime, .prefill);
+        try cancelFrame(runtime);
+        try std.testing.expect(!hasActiveFrame(runtime) and !hasSubmittedFrame(runtime));
+
+        // Cancellation after the fused encode must release its output and all
+        // frame-retained inputs without publishing the command buffer.
+        try beginFrame(runtime);
+        if (e4_fused_half) try setActiveFrameRegime(runtime, .prefill);
+        var cancelled = (try tryDeviceQuantizedGatedFfnResidual(&provider, .{
+            .gate_linear_slot = 60,
+            .up_linear_slot = 61,
+            .down_linear_slot = 62,
+            .rows = rows,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+            .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
+            .eps = 1e-5,
+            .post_gate_rms_norm_slot = null,
+            .post_down_rms_norm_slot = if (e4_fused_half) @as(?usize, 12) else null,
+            .resident_e4_prefill_m64 = e4_fused_half,
+        }, input, residual, &stats)) orelse return error.GatedFfnDirectNull;
+        cancelled.deinit();
+        try cancelFrame(runtime);
+        try std.testing.expect(!hasActiveFrame(runtime) and !hasSubmittedFrame(runtime));
+    }
     var gate_up = (try decoderRuntimeApplyLinearPair(&provider, .{
         .slot_a = 60,
         .slot_b = 61,
@@ -38132,9 +40474,26 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
     defer activated.deinit();
     var gated = (try decoderRuntimeApplyMultiply(&provider, activated, gate_up.second, intermediate_size)) orelse return error.GatedFfnMultiplyNull;
     defer gated.deinit();
+    var rounded_gated: ?MetalTensor = null;
+    defer if (rounded_gated) |*tensor| tensor.deinit();
+    const down_input = if (e4_fused_half) blk: {
+        // The qualified E4 pair kernel stores its activation-product output as
+        // IEEE F16. Reproduce that policy boundary explicitly before invoking
+        // the independent prepared Q4 down projection; comparing against the
+        // unrounded F32 intermediate is not a faithful oracle.
+        const gated_values = try tensorHostSlice(&gated);
+        const rounded_values = try std.testing.allocator.alloc(f32, gated_values.len);
+        defer std.testing.allocator.free(rounded_values);
+        for (rounded_values, gated_values) |*dst, src| {
+            const half: f16 = @floatCast(src);
+            dst.* = @floatCast(half);
+        }
+        rounded_gated = try testDeviceTensorFromSlice(runtime, rounded_values, &[_]i32{ @intCast(rows), @intCast(intermediate_size) });
+        break :blk rounded_gated.?;
+    } else gated;
     var projected = (try decoderRuntimeApplyLinear(&provider, .{
         .slot = 62,
-        .input = gated,
+        .input = down_input,
         .in_dim = intermediate_size,
         .out_dim = hidden_size,
     })) orelse return error.GatedFfnDownLinearNull;
@@ -38147,7 +40506,7 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
     }, &stats)) orelse return error.GatedFfnNormNull;
     defer normed.deinit();
     var expected_tensor = (try decoderRuntimeApplyAdd(&provider, .{
-        .lhs = normed,
+        .lhs = if (null_subnorm and !e4_fused_half and !resident_row1) projected else normed,
         .rhs = residual,
         .dim = hidden_size,
     }, &stats)) orelse return error.GatedFfnAddNull;
@@ -38156,7 +40515,7 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
     var output_target: ?MetalTensor = null;
     defer if (output_target) |*tensor| tensor.deinit();
     if (invariant) output_target = try MetalTensor.deviceAllocate(runtime, rows * hidden_size * @sizeOf(f32), .private, &.{ rows, hidden_size });
-    if (invariant) {
+    if (invariant and !e4_fused_half) {
         const tail_dim = intermediate_size - 1;
         const tail_shape = [_]i64{ tail_dim, hidden_size };
         const tail_storage = QuantizedStorage{
@@ -38254,6 +40613,33 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
         try beginFrame(runtime);
     }
     const before_direct = runtimeMemorySnapshot(runtime);
+    if (resident_row1) {
+        // Cancellation is the asynchronous cleanup boundary: it must clear a
+        // selector even when its owner never reaches the normal end call.
+        try beginFrame(runtime);
+        try setActiveFrameRegime(runtime, .decode);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_begin_resident_row1_q4_mmv(runtime));
+        try cancelFrame(runtime);
+        try std.testing.expect(termite_metal_decode_runtime_end_resident_row1_q4_mmv(runtime) != 0);
+        try std.testing.expect(!hasActiveFrame(runtime) and !hasSubmittedFrame(runtime));
+    }
+    if (e4_fused_half) {
+        try beginFrame(runtime);
+        try setActiveFrameRegime(runtime, .prefill);
+        try std.testing.expect(e4FusedHalfEligible(runtime, .{
+            .rows = rows,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+            .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
+            .post_gate_rms_norm_slot = @as(?usize, null),
+        }));
+    }
+    if (resident_row1) {
+        try beginFrame(runtime);
+        try setActiveFrameRegime(runtime, .decode);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_begin_resident_row1_q4_mmv(runtime));
+    }
+    errdefer if (resident_row1 and hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
     var direct = (try tryDeviceQuantizedGatedFfnResidual(&provider, .{
         .output = output_target,
         .gate_linear_slot = 60,
@@ -38266,15 +40652,27 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
         .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
         .eps = 1e-5,
         .post_gate_rms_norm_slot = null,
-        .post_down_rms_norm_slot = @as(?usize, 12),
+        .post_down_rms_norm_slot = if (null_subnorm and !e4_fused_half and !resident_row1) null else @as(?usize, 12),
+        .resident_e4_prefill_m64 = e4_fused_half,
     }, input, residual, &stats)) orelse return error.GatedFfnDirectNull;
     defer direct.deinit();
+    if (resident_row1) {
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_end_resident_row1_q4_mmv(runtime));
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+        try std.testing.expect(!hasActiveFrame(runtime) and !hasSubmittedFrame(runtime));
+    }
     if (invariant) try std.testing.expectEqual(output_target.?.deviceHandle(), direct.deviceHandle());
-    if (invariant) {
+    if (invariant or e4_fused_half) {
         try submitFrame(runtime);
         try waitFrame(runtime);
     }
     const after_direct = runtimeMemorySnapshot(runtime);
+    if (e4_fused_half) {
+        const fused = try e4FusedHalfStats(runtime);
+        try std.testing.expect(fused.hits >= 1 and fused.pair_dispatches >= 1 and fused.down_dispatches >= 1);
+        try std.testing.expectEqual(@as(u64, 0), fused.fatal_failures);
+    }
     if (invariant and getenvFlagEnabled("TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS") and !q4_0LinearRmsAddF16ProjectEnabled()) {
         if (q4_0LinearRmsAddSumsqDisabled()) {
             try std.testing.expectEqual(before_direct.q4_0_linear_reduce + 1, after_direct.q4_0_linear_reduce);
@@ -38283,7 +40681,7 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
             try std.testing.expectEqual(before_direct.rms_norm_add_sumsq + 1, after_direct.rms_norm_add_sumsq);
         }
     }
-    if (invariant) {
+    if (invariant and !e4_fused_half) {
         // One fused gate/up dispatch for the entire cohort, not rows singleton
         // dispatches disguised as batching. The tail may use the invariant cohort route.
         if (after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce)
@@ -38307,7 +40705,7 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
                 .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
                 .eps = 1e-5,
                 .post_gate_rms_norm_slot = null,
-                .post_down_rms_norm_slot = @as(?usize, 12),
+                .post_down_rms_norm_slot = if (null_subnorm) null else @as(?usize, 12),
             }, single_input, single_residual, &stats)) orelse return error.UnexpectedNull;
             defer single.deinit();
             try submitFrame(runtime);
@@ -38341,19 +40739,152 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
         }
     }
 
-    var expected_mut = try expected_tensor.readView();
-    defer expected_mut.deinit();
-    var direct_mut = try direct.readView();
-    defer direct_mut.deinit();
-    const expected = try tensorHostSlice(&expected_mut);
+    var direct_mut = direct;
+    var cpu_expected: ?[]f32 = null;
+    defer if (cpu_expected) |values| std.testing.allocator.free(values);
+    var expected_mut = expected_tensor;
+    const expected = if (e4_fused_half) blk: {
+        cpu_expected = try residentE4FusedHalfCpuOracle(
+            std.testing.allocator,
+            rows,
+            hidden_size,
+            intermediate_size,
+            &input_data,
+            &residual_data,
+            &norm_weight_data,
+            gate_raw,
+            up_raw,
+            down_raw,
+        );
+        break :blk cpu_expected.?;
+    } else try tensorHostSlice(&expected_mut);
     const actual = try tensorHostSlice(&direct_mut);
     try std.testing.expectEqual(expected.len, actual.len);
+    var max_abs: f32 = 0;
+    var max_rel: f32 = 0;
+    var max_index: usize = 0;
+    var squared_error: f64 = 0;
+    var expected_squared: f64 = 0;
+    var above_1e3: usize = 0;
+    var above_5e3: usize = 0;
+    var above_1e2: usize = 0;
+    var nonfinite: usize = 0;
     for (expected, actual, 0..) |exp, got, i| {
-        if (!std.math.approxEqAbs(f32, exp, got, 1e-2)) {
-            std.debug.print("q4_0 gated ffn device mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
-            return error.TestUnexpectedResult;
+        if (!std.math.isFinite(exp) or !std.math.isFinite(got)) {
+            nonfinite += 1;
+            continue;
         }
+        const abs_error = @abs(exp - got);
+        const rel_error = abs_error / @max(@abs(exp), 1e-6);
+        if (abs_error > max_abs) {
+            max_abs = abs_error;
+            max_rel = rel_error;
+            max_index = i;
+        }
+        const widened: f64 = @floatCast(abs_error);
+        const widened_expected: f64 = @floatCast(exp);
+        squared_error += widened * widened;
+        expected_squared += widened_expected * widened_expected;
+        if (abs_error > 1e-3) above_1e3 += 1;
+        if (abs_error > 5e-3) above_5e3 += 1;
+        if (abs_error > 1e-2) above_1e2 += 1;
     }
+    const rms = @sqrt(squared_error / @as(f64, @floatFromInt(expected.len)));
+    const reference_rms = @sqrt(expected_squared / @as(f64, @floatFromInt(expected.len)));
+    if (e4_fused_half) std.debug.print("e4-fused-half-error rows={d} count={d} nonfinite={d} max_abs={d:.9} max_rel={d:.9} max_index={d} expected={d:.9} actual={d:.9} rms={d:.9} reference_rms={d:.9} above_1e3={d} above_5e3={d} above_1e2={d}\n", .{ rows, expected.len, nonfinite, max_abs, max_rel, max_index, expected[max_index], actual[max_index], rms, reference_rms, above_1e3, above_5e3, above_1e2 });
+    if (nonfinite != 0 or max_abs > 1e-2) return error.TestUnexpectedResult;
+}
+
+test "metal resident E4 row1 Q4 MMV selector matches decomposed and cleans frame" {
+    // The first fixture is the legacy selector-off baseline; the second uses
+    // the authenticated frame-local selector. Both execute real Metal Q4_0
+    // gate/up, GELU-new, down, RMS and residual-add kernels and compare every
+    // output element with the independently decomposed route in this harness.
+    try testQ4GatedFfnRows(1, false, 2560, 10240, false, false);
+    try testQ4GatedFfnRows(1, false, 2560, 10240, false, true);
+}
+
+test "resident E4 M64 admission is typed and rejects rollback matrix" {
+    const good = .{
+        .resident_e4_prefill_m64 = true,
+        .rows = @as(usize, 512),
+        .hidden_size = @as(usize, 2560),
+        .intermediate_size = @as(usize, 10240),
+        .activation = ops.DecoderRuntimeActivationKind.gelu_new,
+        .post_gate_rms_norm_slot = @as(?usize, null),
+        .post_down_rms_norm_slot = @as(?usize, 12),
+    };
+    try std.testing.expect(residentE4PrefillM64Admission(good, true));
+    try std.testing.expect(!residentE4PrefillM64Admission(.{ .resident_e4_prefill_m64 = false, .rows = @as(usize, 512), .hidden_size = @as(usize, 2560), .intermediate_size = @as(usize, 10240), .activation = ops.DecoderRuntimeActivationKind.gelu_new, .post_gate_rms_norm_slot = @as(?usize, null), .post_down_rms_norm_slot = @as(?usize, 12) }, true));
+    try std.testing.expect(!residentE4PrefillM64Admission(.{ .resident_e4_prefill_m64 = true, .rows = @as(usize, 510), .hidden_size = @as(usize, 2560), .intermediate_size = @as(usize, 10240), .activation = ops.DecoderRuntimeActivationKind.gelu_new, .post_gate_rms_norm_slot = @as(?usize, null), .post_down_rms_norm_slot = @as(?usize, 12) }, true));
+    try std.testing.expect(!residentE4PrefillM64Admission(.{ .resident_e4_prefill_m64 = true, .rows = @as(usize, 512), .hidden_size = @as(usize, 2560), .intermediate_size = @as(usize, 10240), .activation = ops.DecoderRuntimeActivationKind.silu, .post_gate_rms_norm_slot = @as(?usize, null), .post_down_rms_norm_slot = @as(?usize, 12) }, true));
+    try std.testing.expect(!residentE4PrefillM64Admission(.{ .resident_e4_prefill_m64 = true, .rows = @as(usize, 512), .hidden_size = @as(usize, 2560), .intermediate_size = @as(usize, 10240), .activation = ops.DecoderRuntimeActivationKind.gelu_new, .post_gate_rms_norm_slot = @as(?usize, 13), .post_down_rms_norm_slot = @as(?usize, 12) }, true));
+    try std.testing.expect(!residentE4PrefillM64Admission(good, false));
+    try std.testing.expect(!residentE4PrefillM64Admission(.{ .rows = @as(usize, 512) }, true));
+}
+
+test "resident E4 M64 typed requests decline unqualified backend geometry" {
+    const short_tail = .{
+        .resident_e4_prefill_m64 = true,
+        .rows = @as(usize, 448),
+        .hidden_size = @as(usize, 2560),
+        .intermediate_size = @as(usize, 10240),
+        .activation = ops.DecoderRuntimeActivationKind.gelu_new,
+        .post_gate_rms_norm_slot = @as(?usize, null),
+        .post_down_rms_norm_slot = @as(?usize, 12),
+    };
+    try std.testing.expect(!residentE4PrefillM64Admission(short_tail, true));
+    try std.testing.expect(!residentE4PrefillM64Admission(.{
+        .resident_e4_prefill_m64 = true,
+        .rows = @as(usize, 512),
+        .hidden_size = @as(usize, 2560),
+        .intermediate_size = @as(usize, 10240),
+        .activation = ops.DecoderRuntimeActivationKind.gelu_new,
+        .post_gate_rms_norm_slot = @as(?usize, null),
+        .post_down_rms_norm_slot = @as(?usize, 12),
+    }, false));
+}
+
+test "metal E4 Q4 fused half M64 prefill applies weighted Gemma post FFN norm before residual" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const names = [_][*:0]const u8{ "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM", "TERMITE_METAL_ENABLE_GEMMA4_Q4_PAIR_M64N32_NK64", "TERMITE_METAL_ENABLE_GEMMA4_E4B_FUSED_HALF_FFN" };
+    var old: [names.len]?[:0]u8 = @splat(null);
+    for (names, 0..) |name, i| {
+        if (std.c.getenv(name)) |v| old[i] = try std.testing.allocator.dupeSentinel(u8, std.mem.span(v), 0);
+        try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
+    }
+    defer for (names, 0..) |name, i| {
+        if (old[i]) |v| {
+            _ = setenv(name, v.ptr, 1);
+            std.testing.allocator.free(v);
+        } else _ = unsetenv(name);
+    };
+    const disables = [_][*:0]const u8{
+        "TERMITE_METAL_DISABLE_GEMMA4_Q4_PAIR_M64N32_NK64",
+        "TERMITE_METAL_DISABLE_GEMMA4_E4B_FUSED_HALF_FFN",
+        "TERMITE_METAL_DISABLE_GEMMA4_BATCHED_Q4_FFN",
+    };
+    var old_disables: [disables.len]?[:0]u8 = @splat(null);
+    for (disables, 0..) |name, i| {
+        if (std.c.getenv(name)) |value| old_disables[i] = try std.testing.allocator.dupeSentinel(u8, std.mem.span(value), 0);
+        _ = unsetenv(name);
+    }
+    defer for (disables, 0..) |name, i| {
+        if (old_disables[i]) |value| {
+            _ = setenv(name, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else _ = unsetenv(name);
+    };
+    // Collect both distributions even when the first numerical gate fails;
+    // every fixture owns and unwinds its Metal and host allocations.
+    var first_error: ?anyerror = null;
+    testQ4GatedFfnRows(511, false, 2560, 10240, true, false) catch |err| {
+        first_error = err;
+    };
+    testQ4GatedFfnRows(512, false, 2560, 10240, true, false) catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    if (first_error) |err| return err;
 }
 
 test "metal native q4_0 gate up q6_k down device path matches decomposed" {
@@ -46005,6 +48536,142 @@ test "metal native decoder runtime dense linear and rms-linear preserve device t
     try std.testing.expect(token_id < out_dim);
 }
 
+test "context strict device argmax rejects every nonfinite logit and preserves lowest ties" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.UnexpectedNull;
+    const strict = QualificationArgmaxPolicy{ .require_finite = true };
+    try std.testing.expectError(error.StrictArgmaxUnsupported, setQualificationArgmaxPolicy(null, strict));
+    const old = try setQualificationArgmaxPolicy(runtime, strict);
+    defer _ = setQualificationArgmaxPolicy(runtime, old) catch {};
+    try std.testing.expectEqual(QualificationArgmaxPolicy{}, old);
+    try std.testing.expectEqual(strict, try setQualificationArgmaxPolicy(runtime, strict));
+
+    // Include scalar, exact parallel boundary, and a partial block with only
+    // one active lane. Inactive lanes must not look like non-finite inputs.
+    for ([_]usize{ 17, 2048, 4097 }) |out_dim| {
+        const logits = try std.testing.allocator.alloc(f32, out_dim);
+        defer std.testing.allocator.free(logits);
+        @memset(logits, -100.0);
+        logits[1] = 11.0;
+        logits[out_dim - 1] = 11.0;
+        var finite = try testDeviceTensorFromSlice(runtime, logits, &[_]i32{ 1, @intCast(out_dim) });
+        defer finite.deinit();
+        try std.testing.expectEqual(@as(usize, 1), (try argmaxLogitsDevice(&provider, finite, out_dim)) orelse return error.UnexpectedNull);
+        try std.testing.expectEqual(@as(usize, out_dim - 1), (try argmaxLogitsSuppressDevice(&provider, finite, out_dim, &.{1})) orelse return error.UnexpectedNull);
+
+        for ([_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |bad| {
+            for ([_]usize{ 0, out_dim / 2, out_dim - 1 }) |index| {
+                const saved = logits[index];
+                logits[index] = bad;
+                var nonfinite = try testDeviceTensorFromSlice(runtime, logits, &[_]i32{ 1, @intCast(out_dim) });
+                defer nonfinite.deinit();
+                try std.testing.expectEqual(@as(usize, std.math.maxInt(u32)), (try argmaxLogitsDevice(&provider, nonfinite, out_dim)) orelse return error.UnexpectedNull);
+                logits[index] = saved;
+            }
+        }
+    }
+
+    // An entirely suppressed first block is empty, not non-finite; a later
+    // valid block still wins. All-suppressed rows retain the strict sentinel.
+    const block_dim: usize = 2048;
+    const block_logits = try std.testing.allocator.alloc(f32, block_dim);
+    defer std.testing.allocator.free(block_logits);
+    @memset(block_logits, -10);
+    block_logits[1500] = 9;
+    const first_block = try std.testing.allocator.alloc(i32, 1024);
+    defer std.testing.allocator.free(first_block);
+    for (first_block, 0..) |*token, index| token.* = @intCast(index);
+    var block_tensor = try testDeviceTensorFromSlice(runtime, block_logits, &.{ 1, block_dim });
+    defer block_tensor.deinit();
+    try std.testing.expectEqual(@as(usize, 1500), (try argmaxLogitsSuppressDevice(&provider, block_tensor, block_dim, first_block)) orelse return error.UnexpectedNull);
+    const all_tokens = try std.testing.allocator.alloc(i32, block_dim);
+    defer std.testing.allocator.free(all_tokens);
+    for (all_tokens, 0..) |*token, index| token.* = @intCast(index);
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(u32)), (try argmaxLogitsSuppressDevice(&provider, block_tensor, block_dim, all_tokens)) orelse return error.UnexpectedNull);
+
+    block_logits[7] = std.math.inf(f32);
+    var suppressed_nonfinite = try testDeviceTensorFromSlice(runtime, block_logits, &.{ 1, block_dim });
+    defer suppressed_nonfinite.deinit();
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(u32)), (try argmaxLogitsSuppressDevice(&provider, suppressed_nonfinite, block_dim, &.{7})) orelse return error.UnexpectedNull);
+
+    try std.testing.expectEqual(strict, try setQualificationArgmaxPolicy(runtime, .{}));
+    // Normal inference still accepts masked -Inf and suppression afterwards.
+    const ordinary = [_]f32{ -std.math.inf(f32), 3.0, 2.0 };
+    var ordinary_tensor = try testDeviceTensorFromSlice(runtime, &ordinary, &.{ 1, ordinary.len });
+    defer ordinary_tensor.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try argmaxLogitsDevice(&provider, ordinary_tensor, ordinary.len)) orelse return error.UnexpectedNull);
+    try std.testing.expectEqual(@as(usize, 2), (try argmaxLogitsSuppressDevice(&provider, ordinary_tensor, ordinary.len, &.{1})) orelse return error.UnexpectedNull);
+}
+
+test "context strict device argmax matches final softcap saturation and finite semantics" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.UnexpectedNull;
+    const capped = QualificationArgmaxPolicy{ .require_finite = true, .softcap = 30 };
+    const old = try setQualificationArgmaxPolicy(runtime, capped);
+    defer _ = setQualificationArgmaxPolicy(runtime, old) catch {};
+    for ([_]QualificationArgmaxPolicy{
+        .{ .require_finite = true, .softcap = std.math.nan(f32) },
+        .{ .require_finite = true, .softcap = std.math.inf(f32) },
+        .{ .require_finite = true, .softcap = -1 },
+        .{ .require_finite = false, .softcap = 30 },
+    }) |invalid| {
+        try std.testing.expectError(error.StrictArgmaxUnsupported, setQualificationArgmaxPolicy(runtime, invalid));
+        try std.testing.expectEqual(capped, try setQualificationArgmaxPolicy(runtime, capped));
+    }
+
+    for ([_]usize{ 17, 4097 }) |out_dim| {
+        const logits = try std.testing.allocator.alloc(f32, out_dim);
+        defer std.testing.allocator.free(logits);
+        for ([_][2]f32{
+            .{ 1e20, 2e20 }, // Saturation changes the raw winner to a lowest-ID tie.
+            .{ -1e20, -std.math.inf(f32) },
+            .{ std.math.inf(f32), 1e20 }, // Raw +/-Inf must fail before softcap.
+            .{ 300, 330 }, // The f32 tanh saturation boundary at scaled 10.
+            .{ -300, -330 },
+            .{ 1.0, 2.0 },
+            .{ -0.0, 0.0 },
+            .{ std.math.nan(f32), 2.0 },
+            .{ 2.0, std.math.nan(f32) },
+        }) |pair| {
+            @memset(logits, -1e20);
+            logits[0] = pair[0];
+            logits[out_dim - 1] = pair[1];
+            var expected: usize = 0;
+            var best = -std.math.inf(f32);
+            for (logits, 0..) |raw, index| {
+                // Identical order to gpt.applyFinalLogitSoftcap + study.greedy.
+                if (!std.math.isFinite(raw)) {
+                    expected = std.math.maxInt(u32);
+                    break;
+                }
+                const value = std.math.tanh(raw / capped.softcap) * capped.softcap;
+                if (value > best) {
+                    best = value;
+                    expected = index;
+                }
+            }
+            var tensor = try testDeviceTensorFromSlice(runtime, logits, &.{ 1, @intCast(out_dim) });
+            defer tensor.deinit();
+            const actual = (try argmaxLogitsDevice(&provider, tensor, out_dim)) orelse return error.UnexpectedNull;
+            std.testing.expectEqual(expected, actual) catch |err| {
+                std.debug.print("context_softcap_argmax_mismatch: dim={d} input_bits={x},{x} expected={d} actual={d}\n", .{ out_dim, @as(u32, @bitCast(pair[0])), @as(u32, @bitCast(pair[1])), expected, actual });
+                return err;
+            };
+        }
+    }
+    try std.testing.expectEqual(capped, try setQualificationArgmaxPolicy(runtime, .{}));
+}
+
 test "metal native decoder runtime argmax suppress stays device resident" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -49946,6 +52613,50 @@ test "embeddinggemma2 Metal video transfer telemetry counts real shared/private 
     try std.testing.expect(after[8] > before[8]);
 }
 
+test "recent prefill query capture copies bitwise only on exact active frame and nonce" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const input = [_]u32{ 0x3f800001, 0x80000000, 0x7f7fffff, 0x00000001 };
+    var output: [input.len]u32 = @splat(0);
+    var source = try MetalTensor.deviceAllocate(runtime, @sizeOf(@TypeOf(input)), .shared, &.{input.len});
+    defer source.deinit();
+    var destination = try MetalTensor.deviceAllocate(runtime, @sizeOf(@TypeOf(input)), .shared, &.{input.len});
+    defer destination.deinit();
+    const capture_domain: *anyopaque = @ptrFromInt(32);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_upload(runtime, source.deviceHandle(), 0, &input, @sizeOf(@TypeOf(input))));
+    try std.testing.expect(termite_metal_buffer_copy_on_active_frame(runtime, capture_domain, null, 1, source.deviceHandle(), 0, destination.deviceHandle(), 0, @sizeOf(@TypeOf(input))) != 0);
+    try beginFrame(runtime);
+    const nonce = termite_metal_decode_runtime_active_frame_nonce(runtime);
+    const token = termite_metal_decode_runtime_active_frame_token(runtime) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(nonce != 0);
+    try std.testing.expect(termite_metal_buffer_copy_on_active_frame(runtime, capture_domain, token, nonce + 1, source.deviceHandle(), 0, destination.deviceHandle(), 0, @sizeOf(@TypeOf(input))) != 0);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_copy_on_active_frame(runtime, capture_domain, token, nonce, source.deviceHandle(), 0, destination.deviceHandle(), 0, @sizeOf(@TypeOf(input))));
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    try std.testing.expectEqual(nonce, termite_metal_decode_runtime_last_completed_recent_query_capture_frame_nonce(runtime, capture_domain));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, destination.deviceHandle(), 0, &output, @sizeOf(@TypeOf(output))));
+    try std.testing.expectEqualSlices(u32, &input, &output);
+
+    // An unrelated completed frame must not overwrite the capture-domain
+    // certificate used to chain consumers across planned prefill flushes.
+    try beginFrame(runtime);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_copy(runtime, source.deviceHandle(), 0, destination.deviceHandle(), 0, @sizeOf(@TypeOf(input))));
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    try std.testing.expectEqual(nonce, termite_metal_decode_runtime_last_completed_recent_query_capture_frame_nonce(runtime, capture_domain));
+    try std.testing.expectEqual(@as(u64, 0), termite_metal_decode_runtime_last_completed_recent_query_capture_frame_nonce(runtime, @ptrFromInt(48)));
+
+    try beginFrame(runtime);
+    const cancelled_nonce = termite_metal_decode_runtime_active_frame_nonce(runtime);
+    const cancelled_token = termite_metal_decode_runtime_active_frame_token(runtime) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_copy_on_active_frame(runtime, capture_domain, cancelled_token, cancelled_nonce, source.deviceHandle(), 0, destination.deviceHandle(), 0, @sizeOf(@TypeOf(input))));
+    try cancelFrame(runtime);
+    try std.testing.expect(termite_metal_buffer_copy_on_active_frame(runtime, capture_domain, cancelled_token, cancelled_nonce, source.deviceHandle(), 0, destination.deviceHandle(), 0, @sizeOf(@TypeOf(input))) != 0);
+    try std.testing.expectEqual(nonce, termite_metal_decode_runtime_last_completed_recent_query_capture_frame_nonce(runtime, capture_domain));
+}
+
 extern fn termite_metal_buffer_observation_check() c_int;
 test "embeddinggemma2 Metal video buffer telemetry measures retained private shared and aliased allocations" {
     if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
@@ -50469,38 +53180,573 @@ pub extern fn antfly_metal_rotary_table(runtime: ?*RawMetalDecodeRuntime, output
 
 pub extern fn antfly_metal_video_position(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, rows: u32, grid_x: u32, grid_y: u32, axis: u32) c_int;
 
-test "compressed Metal formats preserve native tags odd rows and enum storage" {
-    try std.testing.expectEqual(@sizeOf(enum { polar4, turbo3 }), @sizeOf(CompressedKeyFormat));
-    try std.testing.expectEqual(@as(u32, 0), CompressedKeyFormat.polar4.nativeTag());
-    try std.testing.expectEqual(@as(u32, 1), CompressedKeyFormat.turbo3.nativeTag());
-    try std.testing.expectEqual(@as(usize, 8), CompressedKeyFormat.polar4.keyRowBytes(5, 3));
-    try std.testing.expectEqual(@as(usize, 6), CompressedKeyFormat.turbo3.keyRowBytes(5, 3));
-    try std.testing.expectEqual(@as(usize, 0), CompressedKeyFormat.polar4.keyRowBytes(0, 3));
-    try std.testing.expectEqual(@as(usize, 0), CompressedKeyFormat.turbo3.keyRowBytes(5, 0));
+test "context metal runtime: preallocated direct hidden output survives consume then reuse" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.MetalRuntimeUnavailable;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    const provider = .{ .raw_decode_runtime = @as(?*RawMetalDecodeRuntime, runtime) };
+    // Observed E2B global geometry plus the D256 multi-KV GQA lane used by
+    // the production Gemma4 layout family. Installed E4B still binds its
+    // exact loaded geometry in the model probe.
+    const geometries = [_]struct { query_heads: usize, kv_heads: usize, head_dim: usize, hidden: usize }{
+        .{ .query_heads = 8, .kv_heads = 1, .head_dim = 512, .hidden = 1536 },
+        .{ .query_heads = 8, .kv_heads = 4, .head_dim = 256, .hidden = 2560 },
+    };
+    for (geometries) |geometry| {
+        const width = geometry.query_heads * geometry.head_dim;
+        const lhs_values = try std.testing.allocator.alloc(f32, width);
+        defer std.testing.allocator.free(lhs_values);
+        const rhs_values = try std.testing.allocator.alloc(f32, width);
+        defer std.testing.allocator.free(rhs_values);
+        for (lhs_values, rhs_values, 0..) |*lhs, *rhs, i| {
+            lhs.* = @as(f32, @floatFromInt(i % 31)) * 0.03125;
+            rhs.* = @as(f32, @floatFromInt(i % 17)) * 0.0625;
+        }
+        var lhs = try testDeviceTensorFromSlice(runtime, lhs_values, &.{ 1, @intCast(width) });
+        defer lhs.deinit();
+        var rhs = try testDeviceTensorFromSlice(runtime, rhs_values, &.{ 1, @intCast(width) });
+        defer rhs.deinit();
+
+        try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(
+            provider,
+            1,
+            geometry.query_heads,
+            geometry.kv_heads,
+            geometry.head_dim,
+            geometry.hidden,
+            geometry.hidden,
+            0,
+        ));
+        // Borrow is eligibility-only: no frame and an oversized request both
+        // fail without growing the pre-reserved buffers.
+        const reserved_memory = runtimeMemorySnapshot(runtime);
+        var inactive_borrow = try decoderRuntimeBorrowActiveDirectHiddenScratch(provider, std.testing.allocator, 0, 1, width);
+        defer if (inactive_borrow) |*tensor| tensor.deinit();
+        try std.testing.expect(inactive_borrow == null);
+        try beginFrame(runtime);
+        errdefer cancelFrame(runtime) catch {};
+        var first = (try decoderRuntimeBorrowActiveDirectHiddenScratch(provider, std.testing.allocator, 0, 1, width)) orelse return error.UnexpectedNull;
+        defer first.deinit();
+        // Graph-plan buffers may retain growth headroom. Request beyond the
+        // actual allocation rather than assuming logical width is capacity.
+        const allocated_bytes = termite_metal_buffer_allocated_bytes(first.deviceHandle());
+        try std.testing.expect(allocated_bytes >= width * @sizeOf(f32));
+        const oversized_cols = @as(usize, @intCast(allocated_bytes / @sizeOf(f32))) + 1;
+        var oversized_borrow = try decoderRuntimeBorrowActiveDirectHiddenScratch(
+            provider,
+            std.testing.allocator,
+            0,
+            1,
+            oversized_cols,
+        );
+        defer if (oversized_borrow) |*tensor| tensor.deinit();
+        if (oversized_borrow != null) {
+            std.debug.print("direct hidden oversized borrow unexpectedly succeeded geometry={}x{} requested_cols={}\n", .{ geometry.query_heads, geometry.head_dim, oversized_cols });
+            return error.TestUnexpectedResult;
+        }
+        const rejected_memory = runtimeMemorySnapshot(runtime);
+        try std.testing.expectEqual(reserved_memory.scratch_bytes, rejected_memory.scratch_bytes);
+        try beginPlannedComputeScope(runtime, @backingInt(ComputeSource.attention), .attention);
+        var consumed = (try decoderRuntimeBorrowActiveDirectHiddenScratch(provider, std.testing.allocator, 1, 1, width)) orelse return error.UnexpectedNull;
+        defer consumed.deinit();
+        try std.testing.expect(first.deviceHandle() != lhs.deviceHandle());
+        try std.testing.expect(first.deviceHandle() != rhs.deviceHandle());
+        if (!try decoderRuntimeApplyAddInto(provider, lhs, rhs, first, width)) {
+            std.debug.print("direct hidden first producer failed width={}\n", .{width});
+            return error.TestUnexpectedResult;
+        }
+        // Models attention-output projection consuming the borrowed output.
+        if (!try decoderRuntimeApplyAddInto(provider, first, rhs, consumed, width)) {
+            std.debug.print("direct hidden consumer failed width={}\n", .{width});
+            return error.TestUnexpectedResult;
+        }
+        // Models the next layer reusing the same physical attention output.
+        if (!try decoderRuntimeApplyAddInto(provider, consumed, rhs, first, width)) {
+            std.debug.print("direct hidden reuse producer failed width={}\n", .{width});
+            return error.TestUnexpectedResult;
+        }
+        try endPlannedComputeScope(runtime);
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+
+        const actual = try first.toHostSlice();
+        for (actual, lhs_values, rhs_values, 0..) |got, left, right, index| {
+            const expected = left + 3.0 * right;
+            if (!std.math.approxEqAbs(f32, expected, got, 0.00001)) {
+                std.debug.print("direct hidden reuse mismatch geometry={}x{} index={} expected={d} actual={d}\n", .{ geometry.query_heads, geometry.head_dim, index, expected, got });
+                return error.TestUnexpectedResult;
+            }
+        }
+        const snapshot = runtimeMemorySnapshot(runtime);
+        if (snapshot.last_frame_planned_barrier_count < 2) {
+            std.debug.print("direct hidden reuse missing barriers geometry={}x{} barriers={}\n", .{ geometry.query_heads, geometry.head_dim, snapshot.last_frame_planned_barrier_count });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // Reserving a smaller heterogeneous layer after a larger one must not
+    // shrink the capacity recorded for persistent graph-plan slots.
+    try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(provider, 1, 8, 1, 512, 1536, 1536, 0));
+    const large_memory = runtimeMemorySnapshot(runtime);
+    try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(provider, 1, 8, 4, 256, 1536, 1536, 0));
+    const small_memory = runtimeMemorySnapshot(runtime);
+    // Total scratch also includes KV projection slots. The second geometry
+    // increases KV width from 512 to 1024 even though its direct-hidden width
+    // is smaller, so equality of the aggregate is not a direct-capacity
+    // invariant. Persistent scratch must not shrink; the following borrow is
+    // the exact proof that the prior 4096-column direct capacity survived.
+    try std.testing.expect(small_memory.scratch_bytes >= large_memory.scratch_bytes);
+    try beginFrame(runtime);
+    var large_after_small = (try decoderRuntimeBorrowActiveDirectHiddenScratch(
+        provider,
+        std.testing.allocator,
+        0,
+        1,
+        8 * 512,
+    )) orelse return error.UnexpectedNull;
+    large_after_small.deinit();
+    try cancelFrame(runtime);
 }
 
-test "metal compressed span source borrows supplied device rows without retiring their owner" {
-    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
-    const provider_mod = @import("metal_native_provider.zig");
-    var provider = try provider_mod.MetalNativeProvider.create();
+test "context metal runtime: precomputed attention tail matches mixed q4 q8 full block" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
-    var k = try testDeviceTensorFromSlice(runtime, &.{ 1, 2 }, &.{ 1, 2 });
+    const allocator = std.testing.allocator;
+
+    const hidden: usize = 64;
+    const intermediate: usize = 64;
+    const heads: usize = 2;
+    const kv_heads: usize = 1;
+    const head_dim: usize = 32;
+    const attention_width = heads * head_dim;
+    const kv_width = kv_heads * head_dim;
+    const eps: f32 = 1e-5;
+
+    const Fill = struct {
+        fn matrix(a: std.mem.Allocator, rows: usize, cols: usize, seed: usize) ![]f32 {
+            const values = try a.alloc(f32, rows * cols);
+            for (values, 0..) |*value, index| {
+                const row = index / cols;
+                const col = index % cols;
+                const signed = @as(i32, @intCast((row * 17 + col * 11 + seed * 7) % 37)) - 18;
+                value.* = @as(f32, @floatFromInt(signed)) / 97.0;
+            }
+            return values;
+        }
+
+        fn prepare(
+            p: anytype,
+            slot: usize,
+            storage: *const QuantizedStorage,
+            in_dim: usize,
+            out_dim: usize,
+            bias_len: usize,
+            stats: *ops.NativeQuantTimingStats,
+        ) !void {
+            const bias_values = try std.testing.allocator.alloc(f32, bias_len);
+            defer std.testing.allocator.free(bias_values);
+            @memset(bias_values, 0);
+            var bias = try MetalTensor.ownedCloneFrom(bias_values, &.{@intCast(bias_len)});
+            defer bias.deinit();
+            var dummy_value = [_]f32{0};
+            const dummy = MetalTensor.borrowed(&dummy_value, 1, &.{0});
+            try std.testing.expect(try decoderRuntimePrepareLinear(p, .{
+                .slot = slot,
+                .weight = dummy,
+                .bias = bias,
+                .quantized_storage = @as(?*const QuantizedStorage, storage),
+                .in_dim = in_dim,
+                .out_dim = out_dim,
+                .retain_dense_fallback = false,
+            }, stats));
+        }
+    };
+
+    const attention_dense = try Fill.matrix(allocator, hidden, attention_width, 1);
+    defer allocator.free(attention_dense);
+    const gate_dense = try Fill.matrix(allocator, intermediate, hidden, 2);
+    defer allocator.free(gate_dense);
+    const up_dense = try Fill.matrix(allocator, intermediate, hidden, 3);
+    defer allocator.free(up_dense);
+    const down_dense = try Fill.matrix(allocator, hidden, intermediate, 4);
+    defer allocator.free(down_dense);
+    const ple_hidden: usize = 32;
+    const ple_gate_dense = try Fill.matrix(allocator, ple_hidden, hidden, 5);
+    defer allocator.free(ple_gate_dense);
+    const ple_proj_dense = try Fill.matrix(allocator, hidden, ple_hidden, 6);
+    defer allocator.free(ple_proj_dense);
+    const attention_q4 = try quant_codec.quantizeQ4_0FromF32(allocator, attention_dense);
+    defer allocator.free(attention_q4);
+    const gate_q8 = try quant_codec.quantizeQ8_0FromF32(allocator, gate_dense);
+    defer allocator.free(gate_q8);
+    const up_q8 = try quant_codec.quantizeQ8_0FromF32(allocator, up_dense);
+    defer allocator.free(up_q8);
+    const down_q8 = try quant_codec.quantizeQ8_0FromF32(allocator, down_dense);
+    defer allocator.free(down_q8);
+    const ple_gate_q8 = try quant_codec.quantizeQ8_0FromF32(allocator, ple_gate_dense);
+    defer allocator.free(ple_gate_q8);
+    const ple_proj_q8 = try quant_codec.quantizeQ8_0FromF32(allocator, ple_proj_dense);
+    defer allocator.free(ple_proj_q8);
+
+    // Keep source storage descriptors and shape backing alive for the entire
+    // test. The provider owns its prepared copies, but eligibility consults
+    // the retained per-slot storage metadata after preparation.
+    const attention_shape = [_]i64{ hidden, attention_width };
+    const ffn_shape = [_]i64{ intermediate, hidden };
+    const down_shape = [_]i64{ hidden, intermediate };
+    const ple_gate_shape = [_]i64{ ple_hidden, hidden };
+    const ple_proj_shape = [_]i64{ hidden, ple_hidden };
+    const attention_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q4_0 }, .raw_bytes = attention_q4, .shape = &attention_shape, .raw_owned = false, .allocator = allocator };
+    const gate_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = gate_q8, .shape = &ffn_shape, .raw_owned = false, .allocator = allocator };
+    const up_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = up_q8, .shape = &ffn_shape, .raw_owned = false, .allocator = allocator };
+    const down_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = down_q8, .shape = &down_shape, .raw_owned = false, .allocator = allocator };
+    const ple_gate_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = ple_gate_q8, .shape = &ple_gate_shape, .raw_owned = false, .allocator = allocator };
+    const ple_proj_storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = ple_proj_q8, .shape = &ple_proj_shape, .raw_owned = false, .allocator = allocator };
+
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    try Fill.prepare(&provider, 0, &attention_storage, attention_width, hidden, hidden, &prep_stats);
+    try Fill.prepare(&provider, 1, &gate_storage, hidden, intermediate, intermediate, &prep_stats);
+    try Fill.prepare(&provider, 2, &up_storage, hidden, intermediate, intermediate, &prep_stats);
+    try Fill.prepare(&provider, 3, &down_storage, intermediate, hidden, hidden, &prep_stats);
+    try Fill.prepare(&provider, 4, &ple_gate_storage, hidden, ple_hidden, ple_hidden, &prep_stats);
+    try Fill.prepare(&provider, 5, &ple_proj_storage, ple_hidden, hidden, hidden, &prep_stats);
+
+    var norm_values: [hidden]f32 = undefined;
+    for (&norm_values, 0..) |*value, index| value.* = 0.75 + @as(f32, @floatFromInt(index % 5)) * 0.03125;
+    var norm = try MetalTensor.ownedCloneFrom(&norm_values, &.{hidden});
+    defer norm.deinit();
+    for (0..4) |slot| try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{
+        .slot = slot,
+        .weight = norm,
+        .hidden_size = hidden,
+    }));
+
+    var q_values: [attention_width]f32 = undefined;
+    var k_values: [kv_width]f32 = undefined;
+    var v_values: [kv_width]f32 = undefined;
+    var attention_values: [attention_width]f32 = undefined;
+    var zero_values: [attention_width]f32 = @splat(0);
+    var residual_values: [hidden]f32 = undefined;
+    var ple_values: [ple_hidden]f32 = undefined;
+    for (&q_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 13)) - 6)) * 0.0625;
+    for (&k_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 11)) - 5)) * 0.05;
+    for (&v_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8)) * 0.04;
+    for (&attention_values, 0..) |*value, index| value.* = v_values[index % kv_width];
+    for (&residual_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) * 0.025;
+    for (&ple_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 7)) - 3)) * 0.03125;
+
+    var q = try testDeviceTensorFromSlice(runtime, &q_values, &.{ 1, attention_width });
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(runtime, &k_values, &.{ 1, kv_width });
     defer k.deinit();
-    var v = try testDeviceTensorFromSlice(runtime, &.{ 3, 4 }, &.{ 1, 2 });
+    var v = try testDeviceTensorFromSlice(runtime, &v_values, &.{ 1, kv_width });
     defer v.deinit();
-    const before = metal_tensor.memoryStatsSnapshot();
-    var source = try CompressedAttentionSpanSource.init(.{ .full_k = @as(?MetalTensor, k), .full_v = @as(?MetalTensor, v), .query_sequence_len = 1, .kv_tokens = 1, .num_kv_heads = 1, .head_dim = 2 });
-    try std.testing.expect(source.owned == null);
-    try std.testing.expectEqual(k.deviceHandle(), source.full_k.?.deviceHandle());
-    try std.testing.expectEqual(v.deviceHandle(), source.full_v.?.deviceHandle());
-    source.deinit();
-    const after = metal_tensor.memoryStatsSnapshot();
-    try std.testing.expectEqual(before.device_owned_buffers_created, after.device_owned_buffers_created);
-    try std.testing.expectEqual(before.device_owned_buffers_released, after.device_owned_buffers_released);
-    try std.testing.expectEqual(before.device_owned_live_bytes, after.device_owned_live_bytes);
-    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, try tensorHostSlice(&k));
-    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, try tensorHostSlice(&v));
+    var attention_source = try testDeviceTensorFromSlice(runtime, &attention_values, &.{ 1, attention_width });
+    defer attention_source.deinit();
+    var zeros = try testDeviceTensorFromSlice(runtime, &zero_values, &.{ 1, attention_width });
+    defer zeros.deinit();
+    var residual = try testDeviceTensorFromSlice(runtime, &residual_values, &.{ 1, hidden });
+    defer residual.deinit();
+    var ple = try testDeviceTensorFromSlice(runtime, &ple_values, &.{ 1, ple_hidden });
+    defer ple.deinit();
+
+    const Request = struct {
+        query_sequence_len: usize,
+        kv_tokens: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        query_position_offset: usize,
+        kv_position_offset: usize,
+        sliding_window: usize,
+        total_sequence_len: usize,
+        attention_linear_slot: usize,
+        attention_pre_linear_rms_norm_slot: ?usize,
+        attention_post_linear_rms_norm_slot: ?usize,
+        hidden_size: usize,
+        eps: f32,
+        ffn_layer_norm_slot: ?usize,
+        ffn_rms_norm_slot: ?usize,
+        ffn_post_gate_rms_norm_slot: ?usize,
+        ffn_post_down_rms_norm_slot: ?usize,
+        gate_ffn_linear_slot: usize,
+        up_ffn_linear_slot: usize,
+        down_ffn_linear_slot: usize,
+        intermediate_size: usize,
+        activation: ops.DecoderRuntimeActivationKind,
+        layer_index: usize,
+        ple: ?MetalTensor,
+        ple_gate_linear_slot: ?usize,
+        ple_proj_linear_slot: ?usize,
+        ple_post_norm_slot: ?usize,
+        ple_hidden_size: usize,
+        output_scale_value: ?f32,
+    };
+    const request: Request = .{
+        .query_sequence_len = @as(usize, 1),
+        .kv_tokens = @as(usize, 1),
+        .num_heads = heads,
+        .num_kv_heads = kv_heads,
+        .head_dim = head_dim,
+        .query_position_offset = @as(usize, 0),
+        .kv_position_offset = @as(usize, 0),
+        .sliding_window = @as(usize, 0),
+        .total_sequence_len = @as(usize, 1),
+        .attention_linear_slot = @as(usize, 0),
+        .attention_pre_linear_rms_norm_slot = @as(?usize, null),
+        .attention_post_linear_rms_norm_slot = @as(?usize, 0),
+        .hidden_size = hidden,
+        .eps = eps,
+        .ffn_layer_norm_slot = @as(?usize, null),
+        .ffn_rms_norm_slot = @as(?usize, 1),
+        .ffn_post_gate_rms_norm_slot = @as(?usize, null),
+        .ffn_post_down_rms_norm_slot = @as(?usize, 2),
+        .gate_ffn_linear_slot = @as(usize, 1),
+        .up_ffn_linear_slot = @as(usize, 2),
+        .down_ffn_linear_slot = @as(usize, 3),
+        .intermediate_size = intermediate,
+        .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
+        .layer_index = @as(usize, 0),
+        .ple = @as(?MetalTensor, null),
+        .ple_gate_linear_slot = @as(?usize, null),
+        .ple_proj_linear_slot = @as(?usize, null),
+        .ple_post_norm_slot = @as(?usize, null),
+        .ple_hidden_size = @as(usize, 0),
+        .output_scale_value = @as(?f32, 0.75),
+    };
+
+    try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(&provider, 1, heads, kv_heads, head_dim, hidden, intermediate, 0));
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var full_stats: ops.NativeQuantTimingStats = .{};
+    var full = (try runAttentionF32GatedDecoderBlockQuantizedDevice(&provider, request, q, k, v, residual, &full_stats)) orelse return error.UnexpectedNull;
+    defer full.deinit();
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    const output_shape = [_]i32{ 1, hidden };
+    var output = try MetalTensor.deviceAllocateFreshWithAllocator(allocator, @ptrCast(runtime), hidden * @sizeOf(f32), .private, &output_shape);
+    defer output.deinit();
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var borrowed = (try decoderRuntimeBorrowActiveDirectHiddenScratch(&provider, allocator, 0, 1, attention_width)) orelse return error.UnexpectedNull;
+    defer borrowed.deinit();
+    try std.testing.expect(supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, output));
+    // This active-frame write stands in for packed attention and gives the
+    // range tracker a real producer/consumer dependency to barrier.
+    try std.testing.expect(try decoderRuntimeApplyAddInto(&provider, attention_source, zeros, borrowed, attention_width));
+    var tail_stats: ops.NativeQuantTimingStats = .{};
+    var tail = try runPrecomputedGatedBlockDevice(&provider, allocator, request, 0, borrowed, residual, null, output, &tail_stats);
+    defer tail.deinit();
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    const expected = try tensorHostSlice(&full);
+    const actual = try tensorHostSlice(&tail);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual, 0..) |want, got, index| {
+        if (!std.math.isFinite(got) or !std.math.approxEqAbs(f32, want, got, 5e-3)) {
+            std.debug.print("precomputed mixed-q4-q8 tail mismatch index={} expected={d} actual={d}\n", .{ index, want, got });
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(full_stats.active_decode_attention_f32_kernels >= 1);
+    try std.testing.expectEqual(@as(u64, 0), tail_stats.active_decode_attention_f32_kernels);
+    try std.testing.expectEqual(@as(u64, 1), tail_stats.context_precomputed_tail_blocks);
+    try std.testing.expectEqual(@as(u64, 0), tail_stats.context_precomputed_tail_failures);
+    try std.testing.expectEqual(@as(u64, 0), tail_stats.f32_kv_quant_direct_block_successes);
+    const snapshot = runtimeMemorySnapshot(runtime);
+    try std.testing.expect(snapshot.last_frame_planned_barrier_count >= 1);
+
+    // Exercise PLE through the same mixed quantized tail with output scaling
+    // disabled. This covers both optional branches without changing the
+    // attention producer or the quantized projection/FFN formats.
+    var ple_request = request;
+    ple_request.ple = ple;
+    ple_request.ple_gate_linear_slot = 4;
+    ple_request.ple_proj_linear_slot = 5;
+    ple_request.ple_post_norm_slot = 3;
+    ple_request.ple_hidden_size = ple_hidden;
+    ple_request.output_scale_value = null;
+
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var ple_full_stats: ops.NativeQuantTimingStats = .{};
+    var ple_full = (try runAttentionF32GatedDecoderBlockQuantizedDevice(&provider, ple_request, q, k, v, residual, &ple_full_stats)) orelse return error.UnexpectedNull;
+    defer ple_full.deinit();
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var ple_borrowed = (try decoderRuntimeBorrowActiveDirectHiddenScratch(&provider, allocator, 0, 1, attention_width)) orelse return error.UnexpectedNull;
+    defer ple_borrowed.deinit();
+    try std.testing.expect(supportsPrecomputedGatedBlockDevice(&provider, ple_request, 0, residual, ple, output));
+    try std.testing.expect(try decoderRuntimeApplyAddInto(&provider, attention_source, zeros, ple_borrowed, attention_width));
+    var ple_tail = try runPrecomputedGatedBlockDevice(&provider, allocator, ple_request, 0, ple_borrowed, residual, ple, output, &tail_stats);
+    defer ple_tail.deinit();
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    const ple_expected = try tensorHostSlice(&ple_full);
+    const ple_actual = try tensorHostSlice(&ple_tail);
+    try std.testing.expectEqual(ple_expected.len, ple_actual.len);
+    for (ple_expected, ple_actual, 0..) |want, got, index| {
+        if (!std.math.isFinite(got) or !std.math.approxEqAbs(f32, want, got, 5e-3)) {
+            std.debug.print("precomputed PLE mixed-q4-q8 tail mismatch index={} expected={d} actual={d}\n", .{ index, want, got });
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(ple_full_stats.active_decode_attention_f32_kernels >= 1);
+    try std.testing.expectEqual(@as(u64, 2), tail_stats.context_precomputed_tail_blocks);
+    try std.testing.expectEqual(@as(u64, 0), tail_stats.context_precomputed_tail_failures);
+    try std.testing.expectEqual(@as(u64, 0), tail_stats.f32_kv_quant_direct_block_successes);
+    try std.testing.expect(tail_stats.active_decode_quant_ple_linear_kernels >= 2);
+
+    const stable_scratch_bytes = runtimeMemorySnapshot(runtime).scratch_bytes;
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, output));
+
+    // A submitted frame is neither reusable nor eligible while its command
+    // buffer is pending completion.
+    try beginFrame(runtime);
+    try submitFrame(runtime);
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, output));
+    try waitFrame(runtime);
+
+    // Eligibility must reject scratch aliases before a packed hook runs.
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    // Eligibility runs before the packed hook. It must reject an unprepared
+    // runtime quant slot without preparing or uploading it as a side effect.
+    const saved_attention_kind = provider.raw_linear_slot_runtime_prepared_kind[0];
+    provider.raw_linear_slot_runtime_prepared_kind[0] = .none;
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, output));
+    try std.testing.expectEqual(@as(RawQuantizedRuntimeLinearKind, .none), provider.raw_linear_slot_runtime_prepared_kind[0]);
+    provider.raw_linear_slot_runtime_prepared_kind[0] = saved_attention_kind;
+    var inconsistent_ple = request;
+    inconsistent_ple.ple_gate_linear_slot = 4;
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, inconsistent_ple, 0, residual, null, output));
+    var ambiguous_ffn_norm = request;
+    ambiguous_ffn_norm.ffn_layer_norm_slot = 0;
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, ambiguous_ffn_norm, 0, residual, null, output));
+    var aliased_output = (try decoderRuntimeBorrowActiveDirectHiddenScratch(&provider, allocator, 1, 1, hidden)) orelse return error.UnexpectedNull;
+    defer aliased_output.deinit();
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, aliased_output));
+    var unprepared_norm = request;
+    unprepared_norm.attention_post_linear_rms_norm_slot = 31;
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, unprepared_norm, 0, residual, null, output));
+    try cancelFrame(runtime);
+
+    // Offset overflow must fail in the side-effect-free preflight rather than
+    // wrapping the destination range. The wrapper owns only its lifetime
+    // record; the output tensor continues to own the Metal allocation.
+    const overflow_shape = [_]i32{ 1, hidden };
+    var overflow_output = try MetalTensor.deviceBorrowedWithAllocator(
+        allocator,
+        @ptrCast(runtime),
+        output.deviceHandle().?,
+        std.math.maxInt(usize) - @sizeOf(f32),
+        hidden * @sizeOf(f32),
+        &overflow_shape,
+    );
+    defer overflow_output.deinit();
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    try std.testing.expect(!supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, overflow_output));
+    try cancelFrame(runtime);
+
+    // After the packed producer has written slot zero, passing any other
+    // attention source is terminal. The tail must not fall back or allocate,
+    // and cancellation must leave the runtime reusable.
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var produced = (try decoderRuntimeBorrowActiveDirectHiddenScratch(&provider, allocator, 0, 1, attention_width)) orelse return error.UnexpectedNull;
+    defer produced.deinit();
+    try std.testing.expect(supportsPrecomputedGatedBlockDevice(&provider, request, 0, residual, null, output));
+    try std.testing.expect(try decoderRuntimeApplyAddInto(&provider, attention_source, zeros, produced, attention_width));
+    if (runPrecomputedGatedBlockDevice(&provider, allocator, request, 0, attention_source, residual, null, output, &tail_stats)) |unexpected_result| {
+        var unexpected = unexpected_result;
+        unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(error.ContextFramedExecutionUnsupported, err);
+    }
+    try cancelFrame(runtime);
+    try std.testing.expectEqual(@as(u64, 2), tail_stats.context_precomputed_tail_blocks);
+    try std.testing.expectEqual(@as(u64, 1), tail_stats.context_precomputed_tail_failures);
+    try std.testing.expectEqual(stable_scratch_bytes, runtimeMemorySnapshot(runtime).scratch_bytes);
+
+    // Failures rejected before entering C still occur after the caller's
+    // packed mutation boundary and must be visible in the route receipt.
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var invalid_after_hook = request;
+    invalid_after_hook.ple_gate_linear_slot = 4;
+    if (runPrecomputedGatedBlockDevice(&provider, allocator, invalid_after_hook, 0, attention_source, residual, null, output, &tail_stats)) |unexpected_result| {
+        var unexpected = unexpected_result;
+        unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(error.ContextFramedExecutionUnsupported, err);
+    }
+    try cancelFrame(runtime);
+    try std.testing.expectEqual(@as(u64, 2), tail_stats.context_precomputed_tail_failures);
+}
+
+test "context frame callback failure preserves completed GPU workload accounting" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    const provider = .{ .raw_decode_runtime = @as(?*RawMetalDecodeRuntime, runtime) };
+    const Probe = struct {
+        calls: usize = 0,
+        completed: c_int = -1,
+
+        fn complete(raw: ?*anyopaque, completed: c_int) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return -1));
+            self.calls += 1;
+            self.completed = completed;
+            return -1;
+        }
+    };
+
+    var lhs_values: [32]f32 = undefined;
+    var rhs_values: [32]f32 = undefined;
+    for (&lhs_values, &rhs_values, 0..) |*lhs, *rhs, index| {
+        lhs.* = @floatFromInt(index);
+        rhs.* = 0.25;
+    }
+    var lhs = try testDeviceTensorFromSlice(runtime, &lhs_values, &.{ 1, 32 });
+    defer lhs.deinit();
+    var rhs = try testDeviceTensorFromSlice(runtime, &rhs_values, &.{ 1, 32 });
+    defer rhs.deinit();
+    var output = try MetalTensor.deviceAllocate(runtime, 32 * @sizeOf(f32), .private, &.{ 1, 32 });
+    defer output.deinit();
+
+    try workloadProfileBegin(runtime, .decode);
+    errdefer workloadProfileEnd(runtime) catch {};
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    try std.testing.expect(try decoderRuntimeApplyAddInto(provider, lhs, rhs, output, 32));
+    var probe = Probe{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_set_context_frame_completion(runtime, &probe, Probe.complete));
+    try submitFrame(runtime);
+    try std.testing.expectError(FrameError.CommandBufferFailed, waitFrame(runtime));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(c_int, 1), probe.completed);
+    try workloadProfileEnd(runtime);
+    const profile = try workloadProfileSnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 1), profile.profiled_frame_count);
+    try std.testing.expectEqual(lastFrameGpuNanos(runtime), profile.whole_frame_gpu_nanos);
 }
 
 /// Prepared recurrent decoder blocks borrow model-owned slots and frame-safe

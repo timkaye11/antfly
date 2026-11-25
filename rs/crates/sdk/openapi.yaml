@@ -15612,7 +15612,13 @@ paths:
         execution and other context/cache policies are unsupported.
 
 
-        The response is an AFATT001 envelope: JSON metadata followed by exactly
+        The response is an AFATT001 or AFATT002 envelope, selected from Accept:
+
+        AFATT002 uses application/vnd.antfly.attachments.v2 and carries opaque
+
+        prepared-producer authority; AFATT001 remains application/vnd.antfly.attachments.v1.
+
+        Both contain JSON metadata followed by exactly
 
         one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
 
@@ -15642,6 +15648,15 @@ paths:
       operationId: prepareNativeKvCheckpoint
       parameters:
         - in: header
+          name: Accept
+          description: Supported native checkpoint envelope media types. Send application/vnd.antfly.attachments.v2,
+            application/vnd.antfly.attachments.v1 to prefer AFATT002 while retaining legacy fallback.
+            If none of the requested media types is supported, the server returns 406 rather than silently
+            changing framing.
+          required: false
+          schema:
+            type: string
+        - in: header
           name: X-Antfly-KV-Encoding
           description: Checkpoint encoding. f16 is lossless for the supported cache. fp8 stores validated
             fitted history in FP8 and restores it to f16, with per-head f16 fallback. rotated4 stores
@@ -15664,9 +15679,14 @@ paths:
               $ref: '#/components/schemas/InferenceGenerateRequest'
       responses:
         '200':
-          description: Native checkpoint envelope; metadata conforms to NativeKvCheckpointMetadata
+          description: Native checkpoint envelope; AFATT001 metadata conforms to NativeKvCheckpointMetadata
+            and AFATT002 outer metadata conforms to NativeKvEnvelopeV2
           content:
             application/vnd.antfly.attachments.v1:
+              schema:
+                type: string
+                format: binary
+            application/vnd.antfly.attachments.v2:
               schema:
                 type: string
                 format: binary
@@ -15678,6 +15698,12 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '413':
           description: Checkpoint exceeds transfer or state limits
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '406':
+          description: No requested native checkpoint envelope media type is supported
           content:
             application/json:
               schema:
@@ -15702,9 +15728,13 @@ paths:
     post:
       summary: Generate from a portable native KV checkpoint
       description: >
-        Accepts one AFATT001 envelope whose JSON metadata is a GenerateRequest
+        Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateRequest;
 
-        and whose single application/vnd.antfly.kv-checkpoint attachment is a
+        AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+
+        string contains the GenerateRequest. Its single
+
+        application/vnd.antfly.kv-checkpoint attachment is a
 
         complete native checkpoint. The metadata supplies the complete messages,
 
@@ -15738,6 +15768,10 @@ paths:
             schema:
               type: string
               format: binary
+          application/vnd.antfly.attachments.v2:
+            schema:
+              type: string
+              format: binary
       responses:
         '200':
           description: Generated response or token stream
@@ -15748,6 +15782,102 @@ paths:
             text/event-stream:
               schema:
                 type: string
+        '400':
+          description: Invalid checkpoint, prefix/model mismatch or unsupported runtime
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Checkpoint exceeds transfer or state limits
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '507':
+          description: Insufficient inference memory budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/generate/context/resume/batch:
+    post:
+      summary: Resume one checkpoint and generate serial ordinary siblings
+      description: >
+        Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateBatchRequest;
+
+        AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+
+        string contains the GenerateBatchRequest. Its single
+
+        application/vnd.antfly.kv-checkpoint attachment belongs
+
+        to the first request. The remaining requests use ordinary exact generation.
+
+        All requests run serially in submission order and release their private
+
+        generation state before the next request starts. The checkpoint remains
+
+        immutable and reusable; ordinary siblings never inherit its compacted KV.
+
+
+        The batch must contain 2 through 16 requests with distinct nonempty
+
+        custom_id values of at most 128 bytes, the same model and backend
+
+        preference. Every item must explicitly use mode=eager and max_tokens from
+
+        1 through 256. The endpoint disables prompt caching for every item;
+
+        prompt_cache may be false or omitted. Explicit prompt_cache=true,
+
+        streaming, context policies, prompt-cache keys, draft models,
+
+        compiled targets, and context-rewriting options are rejected before any
+
+        item executes. Metadata and each item response are limited to 2 MiB;
+
+        the checkpoint is limited to 2 GiB.
+
+
+        The first request uses the same identity, prefix, resource and release
+
+        certificate checks as single-checkpoint resume. A failed native resume
+
+        returns its normal error and no sibling executes. Once native resume
+
+        succeeds, ordinary sibling failures are returned as indexed batch errors.
+
+        Parent cancellation and its absolute deadline apply to every item.
+      operationId: resumeNativeKvCheckpointBatch
+      requestBody:
+        required: true
+        content:
+          application/vnd.antfly.attachments.v1:
+            schema:
+              type: string
+              format: binary
+          application/vnd.antfly.attachments.v2:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Indexed serial results, with the native checkpoint result first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceGenerateBatchResponse'
         '400':
           description: Invalid checkpoint, prefix/model mismatch or unsupported runtime
           content:
@@ -59241,6 +59371,74 @@ components:
             template to open a public/final response channel directly. Omitted preserves the
 
             model template's default behavior.
+    InferenceGenerateCompactionTarget:
+      type: object
+      additionalProperties: false
+      required:
+        - message_index
+        - part_index
+      properties:
+        message_index:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+        part_index:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: Zero-based text part; string message content is part zero.
+    InferenceGenerateContextPolicy:
+      type: object
+      additionalProperties: false
+      description: >
+        Separate positional context limits from retained KV storage. Exact is the default.
+
+        Approximate modes require a qualified Metal f16 implementation and reject unsupported
+
+        combinations; setting a policy never extends the artifact's positional limit.
+      properties:
+        compaction_targets:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/InferenceGenerateCompactionTarget'
+          description: >
+            Explicit user/tool text payloads eligible for attention matching. Other roles,
+
+            metadata, special tokens and boundary-crossing tokens remain exact. Unsupported
+
+            renderer/tokenizer provenance is rejected. Approximate serving is not yet qualified.
+        mode:
+          type: string
+          enum:
+            - exact
+            - rolling
+            - attention_matching
+          default: exact
+        max_context_tokens:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          description: Optional cap on prompt plus output positions, bounded by the model limit.
+        max_kv_tokens:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          description: Retained rows per global KV head. Required for approximate modes.
+        keep_prefix_tokens:
+          type: integer
+          x-go-type-skip-optional-pointer: false
+          minimum: 0
+          maximum: 4294967295
+          default: 256
+          description: Exact prefix protection in approximate modes; does not identify message boundaries.
+        keep_recent_tokens:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          default: 2048
+          description: Minimum recent exact tail in approximate modes.
     InferenceGenerateRequest:
       type: object
       required:
@@ -59320,6 +59518,21 @@ components:
             does not stop on the model's end-of-sequence token and continues until another stop
 
             condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
+          default: false
+        fixed_length_mask_eos:
+          type: boolean
+          description: >
+            Qualification-only fixed-length greedy policy. When true, every primary and additional
+
+            end-of-sequence token is suppressed from request-local token selection until `max_tokens`
+
+            is reached. Requires `ignore_eos=true`, deterministic greedy sampling, and no speculative
+
+            decoding. HTTP serving also requires the operator qualification opt-in
+
+            `ANTFLY_INFERENCE_JSON_TOKEN_IDS=1`. Omitted or false preserves the existing `ignore_eos`
+
+            behavior.
           default: false
         tools:
           type: array
@@ -59420,6 +59633,8 @@ components:
             inference-native KV cache quantization format. Lower precision reduces memory usage but may
 
             affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
+        context_policy:
+          $ref: '#/components/schemas/InferenceGenerateContextPolicy'
         cache_compaction_ratio:
           type: number
           format: float
@@ -59435,7 +59650,7 @@ components:
 
             The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
 
-            device-backed compaction is not yet supported.
+            device-backed compaction is not yet supported. Cannot be combined with context_policy.
         context_management:
           $ref: '#/components/schemas/InferenceContextManagement'
         kv_cache:
@@ -60248,6 +60463,27 @@ components:
           nullable: true
           allOf:
             - $ref: '#/components/schemas/InferenceGenerateSpeculationStatus'
+        generated_token_ids:
+          type: array
+          items:
+            type: integer
+            format: int32
+          description: Qualification-only unfiltered generated token IDs on terminal usage chunks.
+        applied_suppress_token_ids:
+          type: array
+          items:
+            type: integer
+            format: int32
+          description: Exact deduplicated request-local suppression union applied during token selection.
+        eos_token_ids:
+          type: array
+          items:
+            type: integer
+            format: int32
+          description: EOS token IDs used by the request-scoped fixed-length mask.
+        fixed_length_mask_eos:
+          type: boolean
+          description: True when request-scoped EOS suppression was active.
     InferenceGenerateChunkChoice:
       type: object
       required:

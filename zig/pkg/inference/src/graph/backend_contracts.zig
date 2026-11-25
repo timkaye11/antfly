@@ -1015,6 +1015,10 @@ pub const ForwardKvReuse = struct {
 };
 
 pub const AttentionContext = struct {
+    /// Optional context-compaction owner for the synchronous attention call.
+    /// The hook remains request-scoped and is never retained by a graph.
+    context_session: ?runtime.kv.context_session.Hook = null,
+    context_consumer_layer: ?u32 = null,
     forward_kv_reuse: ?ForwardKvReuse = null,
     dense_attention_rows: ?DenseAttentionRowsBinding = null,
     dense_attention_prefix: ?DenseAttentionPrefixBinding = null,
@@ -1071,6 +1075,10 @@ pub const RunGatedFfnResidualRequest = struct {
     intermediate_size: usize,
     eps: f32 = 0.0,
     activation: DecoderRuntimeActivationKind,
+    /// Authenticated exact-E4 packed-prefill admission. Backends must still
+    /// validate active-frame ownership, dimensions, row count, quantization,
+    /// activation, and norm shape before selecting the large-row kernel.
+    resident_e4_prefill_m64: bool = false,
     planned_layer_contract: PlannedLayerContract = .{},
 };
 
@@ -1247,11 +1255,16 @@ pub const RunGatedDecoderBlockRequest = struct {
     ple_hidden_size: usize = 0,
     output_scale: ?CT = null,
     output_scale_value: ?f32 = null,
+    /// Set only by the verified resident-FFN owner after identity activation.
+    /// It is consumed by precomputed-tail admission and is never user input.
+    resident_row1_q4_mmv: bool = false,
     planned_setup_contract: PlannedLayerContract = .{},
     planned_layer_contract: PlannedLayerContract = .{},
     planned_frame_contract: PlannedLayerContract = .{},
     planned_frame_layer_window: ?PlannedFrameLayerWindow = null,
     graph_plan_tail_vocab_size: usize = 0,
+    recent_query_capture_plan: ?@import("recent_prefill_query_capture.zig").NativePlan = null,
+    recent_query_capture_batch: ?@import("recent_prefill_query_capture.zig").NativeBatchTransport = null,
 };
 
 pub const PlannedFrameLayerWindow = struct {
@@ -1397,6 +1410,12 @@ pub const DecoderRuntimeDecodeRequest = struct {
     mode: DecoderRuntimeDecodeMode = .greedy_argmax,
     sampling: ?DecoderRuntimeSamplingRequest = null,
     phase: DecoderRuntimeDecodePhase = .full,
+    qualification_require_finite_logits: bool = false,
+    qualification_final_logit_softcap: f32 = 0,
+    /// Require a cancellable active frame before any decoder operation is
+    /// encoded. A `false` return then proves no KV append was committed;
+    /// failures after submit must be returned as errors.
+    require_atomic_frame: bool = false,
     configured_layer_count: usize,
     layer_count: usize,
     hidden_size: usize,
@@ -1485,6 +1504,7 @@ pub const DecoderRuntimeGraphCommandPlanFrameRequest = struct {
     output_hidden: *?CT,
     /// Borrowed synchronous request control; check between encoded layers.
     execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
+    recent_query_capture: ?@import("recent_prefill_query_capture.zig").Descriptor = null,
 };
 
 pub const DebertaEncoderLayerSpec = struct {

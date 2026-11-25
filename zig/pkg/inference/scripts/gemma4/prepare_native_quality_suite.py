@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 
 MODEL = "google/gemma-4-E4B-it-qat-q4_0-gguf"
+MODELS = ("google/gemma-4-E2B-it-qat-q4_0-gguf", MODEL)
 CATEGORIES = ("fact", "instruction", "code", "tool_call")
 POSITIONS = (0.10, 0.25, 0.45, 0.60)
 
@@ -175,7 +176,9 @@ def task(category, index):
     return system, data, question, expected, definition
 
 
-def build_cases(lines=742):
+def build_cases(lines=742, model=MODEL):
+    if model not in MODELS:
+        raise ValueError("unsupported Gemma4 qualification model")
     if lines < 100:
         raise ValueError("suite requires a long context")
     filler = "This log entry records ordinary maintenance with no changes.\n"
@@ -196,7 +199,7 @@ def build_cases(lines=742):
             )
             prompt += "\nKeep this archive available for a later question."
             body = {
-                "model": MODEL,
+                "model": model,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": prompt},
@@ -239,18 +242,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--lines", type=int, default=742)
+    parser.add_argument("--model", choices=MODELS, default=MODEL)
+    parser.add_argument(
+        "--quality-profile", choices=("bounded", "extended"), default="extended"
+    )
     args = parser.parse_args()
     manifest_path = args.output.with_suffix(".manifest.json")
     if args.output.exists() or manifest_path.exists():
         raise FileExistsError("preserve the frozen suite; choose a new output path")
-    cases = build_cases(args.lines)
+    cases = build_cases(args.lines, args.model)
+    if args.quality_profile == "bounded":
+        cases = [case for case in cases if case["critical"]]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     encoded = "".join(json.dumps(case, separators=(",", ":")) + "\n" for case in cases)
     args.output.write_text(encoded)
     manifest = {
         "schema_version": 2,
         "cases": len(cases),
-        "cases_per_category": 16,
+        "quality_profile": args.quality_profile,
+        "cases_per_category": 4 if args.quality_profile == "bounded" else 16,
         "critical_cases": 16,
         "families_per_category": 4,
         "filler_lines": args.lines,

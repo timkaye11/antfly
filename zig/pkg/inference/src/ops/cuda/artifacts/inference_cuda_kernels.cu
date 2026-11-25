@@ -8836,7 +8836,6 @@ __device__ __forceinline__ void termite_q4_0_q8_1_rows_impl(
     }
 
 }
-
 // tile-codegen:end projection.q4q8.rows family
 // Named two-row operand staging retains SM100 register usage (32 versus 40).
 // tile-codegen:begin projection.direct.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)

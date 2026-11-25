@@ -610,11 +610,35 @@
    }
   },
   {
+   "name": "antfly_paged_attention_prefill_flash_hd256_gqa4_twohead_register_v1",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_paged_attention_prefill_flash_hd256_gqa8_twohead_register_v1",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "antfly_paged_attention_prefill_flash_hd512_generated_msl_v1",
    "family": "attention",
    "generated": true,
    "source": {
     "path": "zig/pkg/inference/src/ops/metal/generated/attention_prefill_flash_hd512.metal"
+   }
+  },
+  {
+   "name": "antfly_paged_attention_prefill_flash_hd512_twohead_register_v1",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
    }
   },
   {
@@ -986,6 +1010,86 @@
    }
   },
   {
+   "name": "cast_e4_down_lhs_f16",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "cast_half_input",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "dense_down_mpp_32_64",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "dense_e4_down_f16_mpp_32_64",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "dense_mpp_128_16",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "dense_mpp_128_32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "dense_mpp_32_128",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "dense_mpp_32_64",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "dense_mpp_64_32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "dense_mpp_64_64",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "dt_dkdv",
    "family": "other",
    "generated": false,
@@ -1044,6 +1148,22 @@
   {
    "name": "dt_zero",
    "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "expand_down_f16",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "expand_pair_f16",
+   "family": "fusion",
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m"
@@ -1179,6 +1299,46 @@
   },
   {
    "name": "termite_apply_head_rms_rope",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_apply_head_rms_rope_gemma_cossin",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_apply_head_rms_rope_gemma_hd256_512_hybrid",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_apply_head_rms_rope_gemma_prefill_cossin",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_apply_head_rms_rope_gemma_qk_fused",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_apply_head_rms_rope_gemma_qkv_fused",
    "family": "fusion",
    "generated": true,
    "source": {
@@ -1338,6 +1498,14 @@
    }
   },
   {
+   "name": "termite_apply_linear_f16_1x_reduce_simd",
+   "family": "matvec",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_apply_linear_f16_multi_row",
    "family": "matvec",
    "generated": true,
@@ -1482,6 +1650,14 @@
    }
   },
   {
+   "name": "termite_apply_rms_norm_1x_reduce_simd_tree",
+   "family": "norm_rope",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_apply_rms_norm_add_1x",
    "family": "fusion",
    "generated": true,
@@ -1491,6 +1667,14 @@
   },
   {
    "name": "termite_apply_rms_norm_add_1x_f16_input",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_add_1x_simd_tree",
    "family": "fusion",
    "generated": true,
    "source": {
@@ -1523,6 +1707,14 @@
   },
   {
    "name": "termite_apply_rms_norm_add_scale_1x",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_add_scale_1x_simd_tree",
    "family": "fusion",
    "generated": true,
    "source": {
@@ -1651,6 +1843,38 @@
   },
   {
    "name": "termite_argmax_logits_1x",
+   "family": "sampling",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_argmax_logits_finite_1x",
+   "family": "sampling",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_argmax_logits_finite_partials",
+   "family": "sampling",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_argmax_logits_finite_reduce",
+   "family": "sampling",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_argmax_logits_finite_suppress_partials",
    "family": "sampling",
    "generated": true,
    "source": {
@@ -2210,6 +2434,22 @@
    }
   },
   {
+   "name": "termite_exact_kv_head_major",
+   "family": "kv",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_exact_kv_ring",
+   "family": "kv",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_ffn_gelu_backward_rank1_branches",
    "family": "training",
    "generated": true,
@@ -2402,6 +2642,14 @@
    }
   },
   {
+   "name": "termite_gemma_dual_rms_boundary_1x_simd_tree",
+   "family": "norm_rope",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_glide_cast_half",
    "family": "other",
    "generated": true,
@@ -2554,6 +2802,38 @@
    }
   },
   {
+   "name": "termite_gqa_hd256_kv1_specialized",
+   "family": "kv",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_gqa_hd256_kv2_specialized",
+   "family": "kv",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_gqa_hd512_kv1_specialized",
+   "family": "kv",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_gqa_hd512_kv2_specialized",
+   "family": "kv",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_i2_s_linear",
    "family": "matvec",
    "generated": true,
@@ -2580,6 +2860,14 @@
   {
    "name": "termite_i8_s_linear",
    "family": "matvec",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_init_gemma_rope_cossin",
+   "family": "norm_rope",
    "generated": true,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m"
@@ -3258,6 +3546,22 @@
    }
   },
   {
+   "name": "termite_paged_attention_kv_decode_gqa_vector_hd256",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_paged_attention_kv_decode_gqa_vector_hd512",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_paged_f16_kv_seed",
    "family": "attention",
    "generated": true,
@@ -3419,6 +3723,14 @@
   },
   {
    "name": "termite_q4_0_linear_1x_reduce_nr4_nsg4",
+   "family": "matvec",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce_nr4_nsg4_aligned",
    "family": "matvec",
    "generated": true,
    "source": {
@@ -3618,7 +3930,31 @@
    }
   },
   {
+   "name": "termite_q4_0_pair_activation_1x_reduce_nr2_nsg4_aligned_distributed_gelu_kind1",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_q4_0_pair_activation_1x_reduce_nr4_nsg2",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_reduce_nr4_nsg2_aligned",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_reduce_nr4_nsg2_aligned_distributed_gelu",
    "family": "fusion",
    "generated": true,
    "source": {
@@ -3635,6 +3971,22 @@
   },
   {
    "name": "termite_q4_0_pair_activation_1x_reduce_nr4_nsg4",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_reduce_nr4_nsg4_aligned",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_reduce_nr4_nsg4_aligned_distributed_gelu",
    "family": "fusion",
    "generated": true,
    "source": {
@@ -3706,6 +4058,30 @@
    }
   },
   {
+   "name": "termite_q4_0_pair_activation_mm_m64_n32_nk64_aligned",
+   "family": "mm_sg",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_mm_m64_n32_nk64_tail",
+   "family": "mm_sg",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_mpp_m64_n32_k64",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_q4_0_pair_activation_multiply_r2_ext",
    "family": "fusion",
    "generated": true,
@@ -3764,6 +4140,14 @@
   {
    "name": "termite_q4_0_pair_linear_id",
    "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_q4_0_qkv_fused_nr4_nsg4_aligned",
+   "family": "kv",
    "generated": true,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m"
@@ -4107,6 +4491,14 @@
   },
   {
    "name": "termite_q6_k_linear_1x_reduce",
+   "family": "matvec",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_1x_reduce_aligned",
    "family": "matvec",
    "generated": true,
    "source": {

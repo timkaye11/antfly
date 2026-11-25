@@ -20,6 +20,9 @@ const PublishedArtifacts = @import("../registry/published_artifacts.zig").Publis
 const ComponentConstruction = @import("session_loader.zig").ComponentConstruction;
 const session_loader = @import("session_loader.zig");
 const tokenizer_loader = @import("tokenizer_loader.zig");
+const c_file = @import("../util/c_file.zig");
+const gguf_format = @import("../gguf/format.zig");
+const gguf_metadata = @import("../gguf/metadata.zig");
 
 pub const Host = struct {
     /// Standalone owners have no registry or eviction service. Component loads
@@ -78,6 +81,9 @@ const native_kv_identity = @import("../runtime/kv/attention_match_identity.zig")
 const platform = @import("antfly_platform");
 const qwen3vl_reranker = @import("../architectures/qwen3vl_reranker.zig");
 const runtime = @import("../runtime/root.zig");
+const compaction_profile = @import("../runtime/kv/compaction_profile.zig");
+const context_execution_pool = @import("../backends/context_execution_pool.zig");
+const context_query_protocol = @import("../backends/context_query_protocol.zig");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
 const session_factory = @import("../architectures/session_factory.zig");
 const std = @import("std");
@@ -86,6 +92,25 @@ const vision_config = @import("../readers/vision_config.zig");
 const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
 
 pub const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
+
+pub const CompactionCandidateSlot = if (builtin.is_test) ?*const compaction_profile.Profile else void;
+
+pub const QualificationCandidate = struct {
+    pub const Authority = enum { canonical_profile, staged_private_dynamic_budget, qualified_private_dynamic_budget };
+    profile: *const compaction_profile.Profile,
+    profile_sha256: [32]u8,
+    binary_sha256: [32]u8,
+    implementation_semantic_sha256: [32]u8,
+    authority: Authority = .canonical_profile,
+};
+
+fn nativeCheckpointQualificationAuthority(authority: QualificationCandidate.Authority) bool {
+    return authority == .staged_private_dynamic_budget or authority == .qualified_private_dynamic_budget;
+}
+
+fn genericCompactionQualificationAuthority(authority: QualificationCandidate.Authority) bool {
+    return authority == .canonical_profile;
+}
 
 pub const EmbeddingPipeline = embedding_mod.EmbeddingPipeline;
 
@@ -142,6 +167,18 @@ fn componentDependencySignatureWithControl(io: std.Io, dependencies: []const []c
     var digest: ComponentPlanKey = undefined;
     hash.final(&digest);
     return digest;
+}
+
+fn loadedTokenizerPolicyIdentity(parsed_identity: [32]u8, add_bos_token: bool, bos_token: []const u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly.loaded-tokenizer-policy.v1\x00");
+    hash.update(&parsed_identity);
+    hash.update(&.{@intFromBool(add_bos_token)});
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, @intCast(bos_token.len), .little);
+    hash.update(&length);
+    hash.update(bos_token);
+    return hash.finalResult();
 }
 
 pub fn spinLock(m: *std.atomic.Mutex) void {
@@ -627,6 +664,9 @@ pub const Runtime = struct {
         resolved_session.model_contract = @import("../models/session_contract.zig").resolve(session.model_contract, &man, session.backend());
         model.* = .{
             .chunk_planning = chunk_planning,
+            .load_generation = assets.load_generation,
+            .compaction_candidate = assets.compaction_candidate,
+            .qualification_candidate = assets.qualification_candidate,
             .resolution_revision = resolution_revision,
             .native_kv_asset_generation = native_kv_asset_generation,
             .native_kv_tokenizer_contract = if (native_kv_asset_generation != null) .{
@@ -740,6 +780,9 @@ pub const Runtime = struct {
 
     pending_primary: ?PrimaryConstruction = null,
     managed_publication: ?[32]u8 = null,
+    load_generation: u64 = 0,
+    compaction_candidate: CompactionCandidateSlot = if (builtin.is_test) null else {},
+    qualification_candidate: ?QualificationCandidate = null,
     runtime_id: RuntimeId = 0,
     residency_mode: RuntimeResidencyMode = .backend_managed,
     chunk_planning: ?ChunkPlanningSnapshot = null,
@@ -787,6 +830,9 @@ pub const Runtime = struct {
     generation_admission: runtime.scheduler.generation_admission.Lane = .{},
     native_generation_step_lane: execution_control_mod.ExecutionLane = .{},
     native_generation_graph_cache: graph_mod.cache.GraphCache,
+    context_execution_pool: ?context_execution_pool.Pool = null,
+    context_execution_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    context_execution_init_mutex: std.atomic.Mutex = .unlocked,
     // ponytail: model-wide safety lock; replace with per-request backend state only when continuous batching is proven safe.
     native_generate_lock: std.atomic.Mutex = .unlocked,
     /// The GGUF projector kept open for Gemma media prompts, opened on the
@@ -964,6 +1010,237 @@ pub const Runtime = struct {
         // A pinned handle keeps both tokenizer and backend provider alive.
         tokenizer.cache_identity = if (self.embedding_identity) |signature| std.hash.Wyhash.hash(0, &signature) else null;
         return tokenizer;
+    }
+
+    pub const GgufTokenizerMetadata = struct {
+        bos_token_id: ?i32,
+        eos_token_id: ?i32,
+        padding_token_id: ?i32,
+        unknown_token_id: ?i32,
+        add_bos_token: ?bool,
+        add_eos_token: ?bool,
+    };
+
+    pub const CompactionTokenizerSourceKind = enum { hf_json, gguf_derived };
+
+    pub const CompactionProvenanceExport = struct {
+        allocator: std.mem.Allocator,
+        load_generation: u64,
+        artifact_sha256: [32]u8,
+        tokenizer_kind: CompactionTokenizerSourceKind,
+        tokenizer_source: []u8,
+        tokenizer_parsed_source_sha256: [32]u8,
+        tokenizer_gguf_metadata: ?GgufTokenizerMetadata,
+        tokenizer_add_bos_token: bool,
+        tokenizer_bos_token: []u8,
+        tokenizer_loaded_sha256: [32]u8,
+        template_source: []u8,
+        template_bos_token: []u8,
+        template_eos_token: []u8,
+        template_unk_token: []u8,
+        template_pad_token: []u8,
+        template_loaded_sha256: [32]u8,
+
+        pub fn deinit(self: *CompactionProvenanceExport) void {
+            self.allocator.free(self.template_pad_token);
+            self.allocator.free(self.template_unk_token);
+            self.allocator.free(self.template_eos_token);
+            self.allocator.free(self.template_bos_token);
+            self.allocator.free(self.template_source);
+            self.allocator.free(self.tokenizer_bos_token);
+            self.allocator.free(self.tokenizer_source);
+            self.* = undefined;
+        }
+    };
+
+    fn compactionTemplateIdentity(source: []const u8, bos_token: []const u8, eos_token: []const u8, unk_token: []const u8, pad_token: []const u8) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly.chat-template.v1\x00");
+        for ([_][]const u8{ source, bos_token, eos_token, unk_token, pad_token }) |field| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, @intCast(field.len), .little);
+            hash.update(&length);
+            hash.update(field);
+        }
+        return hash.finalResult();
+    }
+
+    pub fn exportCompactionProvenance(self: *LoadedModel, allocator: std.mem.Allocator) !CompactionProvenanceExport {
+        const loaded = try self.compactionLoadedIdentity();
+        const tokenizer = self.hf_tok orelse return error.UnsupportedCompactionTokenizer;
+        var source: []u8 = undefined;
+        var kind: CompactionTokenizerSourceKind = undefined;
+        var parsed_identity: [32]u8 = undefined;
+        var gguf_source_metadata: ?GgufTokenizerMetadata = null;
+        if (self.manifest.tokenizer_json_path) |path| {
+            source = try c_file.readFile(allocator, path);
+            std.crypto.hash.sha2.Sha256.hash(source, &parsed_identity, .{});
+            kind = .hf_json;
+        } else {
+            const artifact = session_factory.getLoadedGgufArtifactBytes(self.session) orelse return error.UnsupportedCompactionTokenizer;
+            const parse_allocator = platform.allocator.processAllocator(allocator);
+            var parsed = try gguf_format.parse(parse_allocator, artifact);
+            defer parsed.deinit(parse_allocator);
+            source = try tokenizer_loader.tokenizerJsonFromParsedGguf(allocator, &parsed);
+            parsed_identity = tokenizer_loader.ggufTokenizerIdentity(&parsed, source);
+            const view = gguf_metadata.View.init(&parsed);
+            gguf_source_metadata = .{
+                .bos_token_id = tokenizer_loader.metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id"),
+                .eos_token_id = tokenizer_loader.metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id"),
+                .padding_token_id = tokenizer_loader.metadataTokenId(&parsed, "tokenizer.ggml.padding_token_id"),
+                .unknown_token_id = tokenizer_loader.metadataTokenId(&parsed, "tokenizer.ggml.unknown_token_id"),
+                .add_bos_token = view.getBool("tokenizer.ggml.add_bos_token"),
+                .add_eos_token = view.getBool("tokenizer.ggml.add_eos_token"),
+            };
+            kind = .gguf_derived;
+        }
+        errdefer allocator.free(source);
+        if (!std.mem.eql(u8, &parsed_identity, &tokenizer.source_identity)) return error.ModelArtifactsChanging;
+        const tokenizer_loaded = loadedTokenizerPolicyIdentity(parsed_identity, self.manifest.add_bos_token, self.manifest.bos_token);
+        if (!std.mem.eql(u8, &tokenizer_loaded, &loaded.bytes.tokenizer)) return error.ModelArtifactsChanging;
+        const owned_tokenizer_bos = try allocator.dupe(u8, self.manifest.bos_token);
+        errdefer allocator.free(owned_tokenizer_bos);
+        const chat = self.chat_tmpl orelse return error.UnsupportedCompactionTemplate;
+        const template_source = self.manifest.chat_template orelse return error.UnsupportedCompactionTemplate;
+        const template_loaded = compactionTemplateIdentity(template_source, chat.bos_token, chat.eos_token, chat.unk_token, chat.pad_token);
+        if (!std.mem.eql(u8, &template_loaded, &chat.source_identity) or !std.mem.eql(u8, &template_loaded, &loaded.bytes.template)) return error.ModelArtifactsChanging;
+        const owned_template_source = try allocator.dupe(u8, template_source);
+        errdefer allocator.free(owned_template_source);
+        const owned_bos_token = try allocator.dupe(u8, chat.bos_token);
+        errdefer allocator.free(owned_bos_token);
+        const owned_eos_token = try allocator.dupe(u8, chat.eos_token);
+        errdefer allocator.free(owned_eos_token);
+        const owned_unk_token = try allocator.dupe(u8, chat.unk_token);
+        errdefer allocator.free(owned_unk_token);
+        const owned_pad_token = try allocator.dupe(u8, chat.pad_token);
+        errdefer allocator.free(owned_pad_token);
+        return .{
+            .allocator = allocator,
+            .load_generation = loaded.generation,
+            .artifact_sha256 = loaded.bytes.artifact,
+            .tokenizer_kind = kind,
+            .tokenizer_source = source,
+            .tokenizer_parsed_source_sha256 = parsed_identity,
+            .tokenizer_gguf_metadata = gguf_source_metadata,
+            .tokenizer_add_bos_token = self.manifest.add_bos_token,
+            .tokenizer_bos_token = owned_tokenizer_bos,
+            .tokenizer_loaded_sha256 = tokenizer_loaded,
+            .template_source = owned_template_source,
+            .template_bos_token = owned_bos_token,
+            .template_eos_token = owned_eos_token,
+            .template_unk_token = owned_unk_token,
+            .template_pad_token = owned_pad_token,
+            .template_loaded_sha256 = template_loaded,
+        };
+    }
+
+    pub const CompactionLoadedIdentity = struct { generation: u64, bytes: compaction_profile.LoadedBytes };
+    pub const CompactionIdentity = struct { load_generation: u64, identity: compaction_profile.Identity };
+    pub const CompactionSelection = struct {
+        load_generation: u64,
+        identity: compaction_profile.Identity,
+        profile: *const compaction_profile.Profile,
+        profile_sha256: [32]u8,
+        profile_semantic_digest: [32]u8,
+        producer_policy: @import("../runtime/kv/attention_match_fit_policy.zig").Policy,
+        producer_policy_sha256: [32]u8,
+        query_protocols: []const compaction_profile.QueryProtocolAuthority = &.{},
+    };
+
+    pub fn compactionLoadedIdentity(self: *LoadedModel) !CompactionLoadedIdentity {
+        if (self.load_generation == 0) return error.UnpublishedModelGeneration;
+        const artifact = session_factory.getLoadedGgufArtifactDigest(self.session) orelse return error.UnsupportedCompactionArtifact;
+        const tokenizer = if (self.hf_tok) |tok|
+            loadedTokenizerPolicyIdentity(tok.source_identity, self.manifest.add_bos_token, self.manifest.bos_token)
+        else
+            return error.UnsupportedCompactionTokenizer;
+        const template = if (self.chat_tmpl) |chat| chat.source_identity else return error.UnsupportedCompactionTemplate;
+        return .{ .generation = self.load_generation, .bytes = .{ .artifact = artifact, .tokenizer = tokenizer, .template = template } };
+    }
+
+    pub fn compactionIdentity(self: *LoadedModel, layout: runtime.context_policy.Layout, implementation: compaction_profile.Implementation) !CompactionIdentity {
+        const loaded = try self.compactionLoadedIdentity();
+        return .{ .load_generation = loaded.generation, .identity = try compaction_profile.Identity.fromLoaded(loaded.bytes, layout, implementation) };
+    }
+
+    pub fn validatePinnedCompactionSelection(self: *LoadedModel, layout: runtime.context_policy.Layout, implementation: compaction_profile.Implementation, selection: CompactionSelection) !CompactionIdentity {
+        const loaded = try self.compactionIdentity(layout, implementation);
+        if (loaded.load_generation != self.load_generation or loaded.load_generation != selection.load_generation or !std.meta.eql(loaded.identity, selection.identity))
+            return error.StaleContextView;
+        return loaded;
+    }
+
+    pub fn selectCompactionProfile(self: *LoadedModel, layout: runtime.context_policy.Layout, implementation: compaction_profile.Implementation) !CompactionSelection {
+        const loaded = try self.compactionIdentity(layout, implementation);
+        const profile = compaction_profile.select(loaded.identity) catch |err| blk: {
+            if (err != error.UnqualifiedCompactionArtifact) return err;
+            const candidate_authority: QualificationCandidate.Authority = if (self.qualification_candidate) |qualified| qualified.authority else .canonical_profile;
+            const candidate = if (self.qualification_candidate) |qualified| candidate: {
+                if (!std.mem.eql(u8, &qualified.implementation_semantic_sha256, &@import("compaction_identity").digest) or
+                    !std.mem.eql(u8, &qualified.profile_sha256, &try compaction_profile.profileArtifactDigest(qualified.profile.*))) return error.InvalidQualificationCandidate;
+                break :candidate qualified.profile;
+            } else if (comptime builtin.is_test)
+                self.compaction_candidate orelse return err
+            else
+                return err;
+            _ = try compaction_profile.profileArtifactDigest(candidate.*);
+            if (!genericCompactionQualificationAuthority(candidate_authority)) return error.UnqualifiedCompactionArtifact;
+            try candidate.validate(loaded.identity, layout, 1, 1);
+            break :blk candidate;
+        };
+        for (profile.query_protocols) |authority| try context_query_protocol.validateRuntimeAuthority(authority, layout);
+        return .{
+            .load_generation = loaded.load_generation,
+            .identity = loaded.identity,
+            .profile = profile,
+            .profile_sha256 = try compaction_profile.profileArtifactDigest(profile.*),
+            .profile_semantic_digest = profile.semanticDigest(),
+            .producer_policy = profile.producer_policy,
+            .producer_policy_sha256 = profile.producer_policy.digest(),
+            .query_protocols = profile.query_protocols,
+        };
+    }
+
+    pub fn selectNativeCheckpointQualificationProfile(self: *LoadedModel, dtype: runtime.kv.pool.KvDType, control: ?InferenceExecutionControl, layout: runtime.context_policy.Layout) !CompactionSelection {
+        if (self.load_generation == 0) return error.UnpublishedModelGeneration;
+        const qualified = self.qualification_candidate orelse return error.UnqualifiedCompactionArtifact;
+        if (!nativeCheckpointQualificationAuthority(qualified.authority) or
+            !std.mem.eql(u8, &qualified.implementation_semantic_sha256, &@import("compaction_identity").digest) or
+            !std.mem.eql(u8, &qualified.profile_sha256, &try compaction_profile.profileArtifactDigest(qualified.profile.*)))
+            return error.InvalidQualificationCandidate;
+        const identity = try self.nativeKvIdentity(dtype, control);
+        const implementation = compaction_profile.servingImplementation(.native_whole_head_v2, true, true);
+        try @import("../context_private_dense_profile.zig").validateNativeCheckpointCompatibilityProfile(qualified.profile.*, identity, layout, implementation);
+        return .{
+            .load_generation = self.load_generation,
+            .identity = qualified.profile.identity,
+            .profile = qualified.profile,
+            .profile_sha256 = qualified.profile_sha256,
+            .profile_semantic_digest = qualified.profile.semanticDigest(),
+            .producer_policy = qualified.profile.producer_policy,
+            .producer_policy_sha256 = qualified.profile.producer_policy.digest(),
+            .query_protocols = qualified.profile.query_protocols,
+        };
+    }
+
+    pub fn ensureContextExecutionPool(self: *LoadedModel, limits: runtime.tier.memory.Limits, device_bytes_before: ?u64, control: InferenceExecutionControl) !*context_execution_pool.Pool {
+        if (self.session.backend() != .metal) return error.UnsupportedContextCombination;
+        try control.lock(&self.context_execution_init_mutex);
+        defer self.context_execution_init_mutex.unlock();
+        if (self.context_execution_pool) |*pool| return pool;
+        if (self.context_execution_resource_lease != null) return error.InvalidContextExecutionAdmission;
+        const resident: runtime.tier.memory.AdmissionAmounts = .{ .backend_scratch_bytes = context_execution_pool.admitted_backend_bytes };
+        var lease = try self.host.reserve(self.host.context, .gpu, limits, resident);
+        errdefer lease.release();
+        self.context_execution_pool = try context_execution_pool.Pool.init(self.load_generation, context_execution_pool.admitted_backend_bytes);
+        errdefer {
+            self.context_execution_pool.?.deinit();
+            self.context_execution_pool = null;
+        }
+        try self.context_execution_pool.?.warm(device_bytes_before);
+        try lease.retain(resident);
+        self.context_execution_resource_lease = lease;
+        return &self.context_execution_pool.?;
     }
 
     pub fn getEmbeddingPrototypeCache(self: *LoadedModel, limits: runtime.tier.memory.Limits, control: InferenceExecutionControl) !*@import("../extractors/embedding_prototypes.zig").Cache {
@@ -1733,6 +2010,14 @@ pub const Runtime = struct {
             store.close();
             self.projector_store = null;
         }
+        if (self.context_execution_pool) |*pool| {
+            pool.deinit();
+            self.context_execution_pool = null;
+        }
+        if (self.context_execution_resource_lease) |*lease| {
+            lease.release();
+            self.context_execution_resource_lease = null;
+        }
         // Cache destruction may enter a driver before Session.close. Protect
         // every retained component first, without borrowing request controls.
         const sessions = [_]?backends.Session{ self.session, self.vision_session, self.audio_session, self.text_projection, self.visual_projection, self.audio_projection };
@@ -1916,6 +2201,9 @@ pub const Assets = struct {
     embedding_signature: ?[32]u8,
     tokenizer_resource_lease: ?runtime.tier.memory.AdmissionLease,
     kernel_jit_profile_bundle: ?kernel_jit_profile_output.LoadedProfileBundle,
+    load_generation: u64 = 0,
+    compaction_candidate: CompactionCandidateSlot = if (builtin.is_test) null else {},
+    qualification_candidate: ?QualificationCandidate = null,
 
     fn deinit(self: *Assets, allocator: std.mem.Allocator) void {
         self.session.deinit();
@@ -2036,6 +2324,9 @@ pub const PrimaryPreparation = struct {
     serving_policy: ?@import("compatibility.zig").Policy = null,
     tokenizer_options: @import("tokenizer_loader.zig").Options = .{},
     tokenizer_admission: ?TokenizerAdmission = null,
+    load_generation: u64 = 0,
+    compaction_candidate: CompactionCandidateSlot = if (builtin.is_test) null else {},
+    qualification_candidate: ?QualificationCandidate = null,
 };
 
 /// A synchronous model load consumes its own runtime snapshot. Borrowed backend
@@ -2214,6 +2505,9 @@ pub fn preparePrimary(allocator: std.mem.Allocator, model_dir: []const u8, sourc
         .embedding_signature = embedding_signature,
         .tokenizer_resource_lease = tokenizer_resource_lease,
         .kernel_jit_profile_bundle = qualified_profile_bundle,
+        .load_generation = preparation.load_generation,
+        .compaction_candidate = preparation.compaction_candidate,
+        .qualification_candidate = preparation.qualification_candidate,
     };
     managed_prompt = null;
     man_owned = false;

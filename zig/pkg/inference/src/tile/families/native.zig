@@ -38,7 +38,43 @@ fn pairedProjectionUse(index: usize, entry: []const u8) r.ProgramUse {
     };
 }
 
+// Complete JIT libraries retain their native compiler inputs and launch ABIs.
+pub const attention_segmented_f16 = @embedFile("native/metal/attention_segmented_f16.metal");
+pub const attention_match_query_f32 = @embedFile("native/metal/attention_match_query_f32.metal");
+pub const attention_match_fit_frontend_f32 = @embedFile("native/metal/attention_match_fit_frontend_f32.metal");
+pub const attention_segmented_flash_f16 = @embedFile("native/metal/attention_segmented_flash_f16.metal");
+pub const attention_replay_f32 = @embedFile("native/metal/attention_replay_f32.metal");
+pub const kv_layout_rows_u32 = @embedFile("native/metal/kv_layout_rows_u32.metal");
+pub const attention_match_probability_f32 = @embedFile("native/metal/attention_match_probability_f32.metal");
+pub const attention_encoded_matrix_stage_f32 = @embedFile("native/metal/attention_encoded_matrix_stage_f32.metal");
+pub const attention_encoded_split_stage_f32 = @embedFile("native/metal/attention_encoded_split_stage_f32.metal");
+pub const attention_rotated4_matrix_stage_f32 = @embedFile("native/metal/attention_rotated4_matrix_stage_f32.metal");
+pub const attention_encoded_split_reduce_f32 = @embedFile("native/metal/attention_encoded_split_reduce_f32.metal");
+pub const kv_encoded_storage_f16_fp8_rotated4 = @embedFile("native/metal/kv_encoded_storage_f16_fp8_rotated4.metal");
+
 pub const regions = r.regions(&.{
+    r.metalSourceFile("attention.segmented.f16", "src/tile/families/native/metal/attention_segmented_f16.metal", attention_segmented_f16),
+    r.metalSourceFile("attention.match.query.f32", "src/tile/families/native/metal/attention_match_query_f32.metal", attention_match_query_f32),
+    r.metalSourceFile("attention.match.fit.frontend.f32", "src/tile/families/native/metal/attention_match_fit_frontend_f32.metal", attention_match_fit_frontend_f32),
+    r.metalSourceFile("attention.segmented.flash.f16", "src/tile/families/native/metal/attention_segmented_flash_f16.metal", attention_segmented_flash_f16),
+    r.metalSourceFile("attention.replay.f32", "src/tile/families/native/metal/attention_replay_f32.metal", attention_replay_f32),
+    r.metalSourceFile("kv.layout.rows.u32", "src/tile/families/native/metal/kv_layout_rows_u32.metal", kv_layout_rows_u32),
+    r.metalSourceFile("attention.match.probability.f32", "src/tile/families/native/metal/attention_match_probability_f32.metal", attention_match_probability_f32),
+    r.metalSourceFile("attention.encoded.matrix.stage.f32", "src/tile/families/native/metal/attention_encoded_matrix_stage_f32.metal", attention_encoded_matrix_stage_f32),
+    r.metalSourceFile("attention.encoded.split.stage.f32", "src/tile/families/native/metal/attention_encoded_split_stage_f32.metal", attention_encoded_split_stage_f32),
+    r.metalSourceFile("attention.rotated4.matrix.stage.f32", "src/tile/families/native/metal/attention_rotated4_matrix_stage_f32.metal", attention_rotated4_matrix_stage_f32),
+    r.metalSourceFile("attention.encoded.split.reduce.f32", "src/tile/families/native/metal/attention_encoded_split_reduce_f32.metal", attention_encoded_split_reduce_f32),
+    r.metalSourceFile("kv.encoded.storage.f16.fp8.rotated4", "src/tile/families/native/metal/kv_encoded_storage_f16_fp8_rotated4.metal", kv_encoded_storage_f16_fp8_rotated4),
+
+    r.metalSourceFamily("projection.tensor_pair", @embedFile("native/metal/projection_tensor_pair.metal")),
+    r.metalSourceFamily("projection.aligned_rows", @embedFile("native/metal/projection_aligned_rows.metal")),
+    r.metalSourceFamily("attention.register_prefill", @embedFile("native/metal/attention_register_prefill.metal")),
+    r.metalSourceFamily("normalization.simd_boundary", @embedFile("native/metal/normalization_simd_boundary.metal")),
+    r.metalSourceFamily("position.rotary_fused", @embedFile("native/metal/position_rotary_fused.metal")),
+    r.metalSourceFamily("projection.simd_dense", @embedFile("native/metal/projection_simd_dense.metal")),
+    r.metalSourceFamily("selection.finite_argmax", @embedFile("native/metal/selection_finite_argmax.metal")),
+    r.metalSourceFamily("layout.exact_cache", @embedFile("native/metal/layout_exact_cache.metal")),
+    r.metalSourceFamily("attention.grouped_cache", @embedFile("native/metal/attention_grouped_cache.metal")),
     r.shared(r.nativeFamily("src/graph/templates/cuda_attention_scalar_phases.cuh", "", "attention.scalar_phases", struct {
         pub const source_0 = @import("antfly_tile").native_attention.CausalWindow.cudaSource() ++ @import("antfly_tile").native_attention.DecodeReplay.cudaSource();
     }), &.{.{ .operation = "attention.window_replay", .source = "../../lib/tile/src/native_attention.zig", .scope = .phase, .precision = "native wrapping U32 bounds and ordered device scalar acquisition", .schedule = "caller-owned guards; scalar and first/last-query tile bounds" }}),

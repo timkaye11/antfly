@@ -288,6 +288,15 @@ pub const KvManager = struct {
     ) ![]const block.KvBlockId {
         return self.logicalBlocksWithReservationsWithAllocator(sequence_id, out, self.allocator);
     }
+    pub fn logicalBlocksWithReservationsAllocated(
+        self: *const KvManager,
+        out_allocator: std.mem.Allocator,
+        sequence_id: SequenceId,
+        out: *std.ArrayListUnmanaged(block.KvBlockId),
+    ) ![]const block.KvBlockId {
+        return self.logicalBlocksWithReservationsWithAllocator(sequence_id, out, out_allocator);
+    }
+
     /// The caller owns the destination's allocator and its eventual free.
     /// Manager storage ownership grants no allocation authority for that list.
     pub fn logicalBlocksWithReservationsWithAllocator(self: *const KvManager, sequence_id: SequenceId, out: *std.ArrayListUnmanaged(block.KvBlockId), destination_allocator: std.mem.Allocator) ![]const block.KvBlockId {
@@ -985,6 +994,29 @@ test "manager retain paths do not leak block refs on allocation failure" {
     try std.testing.expectEqual(@as(usize, 0), retained.items.len);
     try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(0).?.refcount);
     try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(1).?.refcount);
+}
+
+test "manager block freelist recycles released pages in nonidentity logical order" {
+    const allocator = std.testing.allocator;
+    var manager = KvManager.init(allocator);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+    });
+    const first = try manager.attachSequence(pool_id);
+    try manager.appendTokens(first, 6);
+    try std.testing.expectEqualSlices(block.KvBlockId, &.{ 0, 1, 2 }, manager.blockTable(first).?.blocks.items);
+    try manager.releaseSequence(first);
+
+    const recycled = try manager.attachSequence(pool_id);
+    try manager.appendTokens(recycled, 6);
+    // releaseRef appends 0,1,2; acquire pops the freelist, so logical pages
+    // are validly owned but map to physical IDs in reverse order.
+    try std.testing.expectEqualSlices(block.KvBlockId, &.{ 2, 1, 0 }, manager.blockTable(recycled).?.blocks.items);
 }
 
 test "manager reuses released sequence slots" {

@@ -142,6 +142,87 @@ const backend_contracts = @import("../graph/backend_contracts.zig");
 const graph_mod = @import("../graph/root.zig");
 const kernel_jit_profile_output = @import("../kernel_jit_profile_output.zig");
 const runtime = @import("../runtime/root.zig");
+const compaction_profile = @import("../runtime/kv/compaction_profile.zig");
+const context_execution_pool = @import("../backends/context_execution_pool.zig");
+const context_query_protocol = @import("../backends/context_query_protocol.zig");
+
+/// A qualification candidate exists only in test binaries. Release builds use
+/// `void`, eliminating both storage and a callable selector input.
+pub const CompactionCandidateSlot = loaded_runtime.CompactionCandidateSlot;
+
+/// Full-CLI qualification capability. This is process-local and has no HTTP,
+/// manifest, environment, or model-name constructor. The operator entrypoint
+/// creates it only after verifying the running executable and candidate bytes.
+pub const QualificationCandidate = loaded_runtime.QualificationCandidate;
+
+fn nativeCheckpointQualificationAuthority(authority: QualificationCandidate.Authority) bool {
+    return authority == .staged_private_dynamic_budget or authority == .qualified_private_dynamic_budget;
+}
+
+fn genericCompactionQualificationAuthority(authority: QualificationCandidate.Authority) bool {
+    return authority == .canonical_profile;
+}
+
+test "qualified private authority is native-only" {
+    try std.testing.expect(nativeCheckpointQualificationAuthority(.qualified_private_dynamic_budget));
+    try std.testing.expect(nativeCheckpointQualificationAuthority(.staged_private_dynamic_budget));
+    try std.testing.expect(!nativeCheckpointQualificationAuthority(.canonical_profile));
+    try std.testing.expect(!genericCompactionQualificationAuthority(.qualified_private_dynamic_budget));
+    try std.testing.expect(!genericCompactionQualificationAuthority(.staged_private_dynamic_budget));
+    try std.testing.expect(genericCompactionQualificationAuthority(.canonical_profile));
+}
+
+comptime {
+    if (!builtin.is_test and CompactionCandidateSlot != void)
+        @compileError("release builds must not expose compaction candidate storage");
+}
+
+fn cloneCompactionProfile(
+    allocator: std.mem.Allocator,
+    source: compaction_profile.Profile,
+) !*const compaction_profile.Profile {
+    const profile = try allocator.create(compaction_profile.Profile);
+    errdefer allocator.destroy(profile);
+    const owners = try allocator.alloc(compaction_profile.Owner, source.owners.len);
+    var copied: usize = 0;
+    errdefer {
+        for (owners[0..copied]) |owner| allocator.free(owner.retained);
+        allocator.free(owners);
+    }
+    for (source.owners, owners) |owner, *out| {
+        out.* = .{
+            .layer = owner.layer,
+            .retained = try allocator.dupe(u32, owner.retained),
+        };
+        copied += 1;
+    }
+    const query_protocols = try allocator.alloc(compaction_profile.QueryProtocolAuthority, source.query_protocols.len);
+    var copied_protocols: usize = 0;
+    errdefer {
+        for (query_protocols[0..copied_protocols]) |protocol| allocator.free(protocol.strata);
+        allocator.free(query_protocols);
+    }
+    for (source.query_protocols, query_protocols) |protocol, *out| {
+        out.* = protocol;
+        out.strata = try allocator.dupe(compaction_profile.QueryStratum, protocol.strata);
+        copied_protocols += 1;
+    }
+    profile.* = source;
+    profile.owners = owners;
+    profile.query_protocols = query_protocols;
+    return profile;
+}
+
+fn destroyCompactionProfile(
+    allocator: std.mem.Allocator,
+    profile: *const compaction_profile.Profile,
+) void {
+    for (profile.owners) |owner| allocator.free(owner.retained);
+    allocator.free(profile.owners);
+    for (profile.query_protocols) |protocol| allocator.free(protocol.strata);
+    allocator.free(profile.query_protocols);
+    allocator.destroy(profile);
+}
 const onnx_graph = @import("onnx_graph");
 const ml = @import("ml");
 
@@ -1833,6 +1914,7 @@ pub const ModelManager = struct {
     startup_load_policies: std.StringHashMapUnmanaged(StartupLoadPolicy) = .{},
     runtime_epoch: u64,
     next_runtime_sequence: u64 = 1,
+    next_loaded_generation: std.atomic.Value(u64) = .init(1),
     /// Protects loaded-model maps and the in-flight registry. Expensive tokenizer,
     /// weight, and backend initialization always runs outside this lock.
     load_lock: std.atomic.Mutex = .unlocked,
@@ -1875,6 +1957,25 @@ pub const ModelManager = struct {
     owns_resource_domain: bool = true,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe_config: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
+    compaction_candidate: CompactionCandidateSlot = if (builtin.is_test) null else {},
+    qualification_candidate: ?QualificationCandidate = null,
+
+    pub fn configureQualificationCandidate(self: *ModelManager, candidate: compaction_profile.Profile, binary_sha256: [32]u8, implementation_semantic_sha256: [32]u8, authority: QualificationCandidate.Authority) !void {
+        if (self.loaded.count() != 0 or self.loaded_aliases.count() != 0 or self.in_flight_loads.count() != 0 or self.qualification_candidate != null)
+            return error.CompactionCandidateAfterModelLoad;
+        if (!std.mem.eql(u8, &implementation_semantic_sha256, &@import("compaction_identity").digest))
+            return error.InvalidQualificationCandidate;
+        const profile_sha256 = try compaction_profile.profileArtifactDigest(candidate);
+        const profile = try cloneCompactionProfile(self.allocator, candidate);
+        errdefer destroyCompactionProfile(self.allocator, profile);
+        self.qualification_candidate = .{
+            .profile = profile,
+            .profile_sha256 = profile_sha256,
+            .binary_sha256 = binary_sha256,
+            .implementation_semantic_sha256 = implementation_semantic_sha256,
+            .authority = authority,
+        };
+    }
 
     pub fn init(allocator: std.mem.Allocator, session_manager: backends.SessionManager) ModelManager {
         return initWithRuntimeEpoch(
@@ -1904,6 +2005,29 @@ pub const ModelManager = struct {
         self.next_runtime_sequence +%= 1;
         if (self.next_runtime_sequence == 0) self.next_runtime_sequence = 1;
         return (@as(RuntimeId, self.runtime_epoch) << 64) | sequence;
+    }
+
+    fn configureCompactionCandidateForTestingImpl(
+        self: *ModelManager,
+        candidate: compaction_profile.Profile,
+    ) !void {
+        std.debug.assert(builtin.is_test);
+        if (self.loaded.count() != 0 or self.loaded_aliases.count() != 0 or
+            self.in_flight_loads.count() != 0 or self.compaction_candidate != null)
+            return error.CompactionCandidateAfterModelLoad;
+        self.compaction_candidate = try cloneCompactionProfile(self.allocator, candidate);
+    }
+
+    /// Qualification harnesses inject a copied candidate into one manager.
+    /// In production this declaration is `void`, so no callable injection API
+    /// or process-global/request-controlled bypass is compiled.
+    pub const configureCompactionCandidateForTesting = if (builtin.is_test)
+        configureCompactionCandidateForTestingImpl
+    else {};
+
+    comptime {
+        if (!builtin.is_test and @TypeOf(configureCompactionCandidateForTesting) != void)
+            @compileError("release builds must not compile compaction candidate injection");
     }
 
     pub fn configureServingPolicy(self: *ModelManager, policy: model_compatibility.Policy) void {
@@ -2113,6 +2237,25 @@ pub const ModelManager = struct {
             self.logRunAdmissionDenied(err, pressure, &.{request});
             return err;
         };
+    }
+
+    fn admissionSnapshotForTestingImpl(
+        self: *const ModelManager,
+    ) runtime.tier.memory.AdmissionAmounts {
+        std.debug.assert(builtin.is_test);
+        const domain = self.resource_domain orelse return .{};
+        return domain.admission.snapshot();
+    }
+
+    /// Qualification observers may prove that all request-scoped admission
+    /// returned to its exact baseline. Release builds expose no callable hook.
+    pub const admissionSnapshotForTesting = if (builtin.is_test)
+        admissionSnapshotForTestingImpl
+    else {};
+
+    comptime {
+        if (!builtin.is_test and @TypeOf(admissionSnapshotForTesting) != void)
+            @compileError("release builds must not compile admission observation hooks");
     }
 
     /// Auxiliary resident models share the physical host domain with primary
@@ -4278,6 +4421,16 @@ pub const ModelManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.loaded_aliases.deinit(self.allocator);
+        if (comptime builtin.is_test) {
+            if (self.compaction_candidate) |candidate| {
+                destroyCompactionProfile(self.allocator, candidate);
+                self.compaction_candidate = null;
+            }
+        }
+        if (self.qualification_candidate) |candidate| {
+            destroyCompactionProfile(self.allocator, candidate.profile);
+            self.qualification_candidate = null;
+        }
         if (self.resource_domain) |lifetime| {
             if (self.owns_resource_domain) lifetime.close();
             self.tokenizer_cache_config.resource_budget = null;
@@ -5746,6 +5899,9 @@ pub const ModelManager = struct {
             .serving_policy = self.serving_policy,
             .tokenizer_options = .{ .cache = self.tokenizer_cache_config, .parallel = self.tokenizer_parallel_bpe_config },
             .tokenizer_admission = .{ .context = self, .reserve_fn = Adapter.reserve },
+            .load_generation = self.next_loaded_generation.fetchAdd(1, .monotonic),
+            .compaction_candidate = if (builtin.is_test) self.compaction_candidate else {},
+            .qualification_candidate = self.qualification_candidate,
         };
     }
 
@@ -5767,6 +5923,25 @@ pub const ModelManager = struct {
         // A cancelled manager task must close its fully constructed runtime
         // without exposing a transient loaded generation to other requests.
         if (control) |active| try active.update(.loading_model, 4, 4);
+
+        // Establish the trusted native4 identity before this loaded generation
+        // can publish or any request can populate its compiled executor cache.
+        // This shifts the one-time admitted bundle hash out of first inference;
+        // unsupported model families retain ordinary inference unchanged.
+        if (model.native_kv_asset_generation != null) {
+            const warmed_identity: ?runtime.kv.attention_match_checkpoint.Identity = model.nativeKvIdentity(.f16, control) catch |err| switch (err) {
+                error.UnsupportedKvIdentity => null,
+                error.Canceled,
+                error.Cancelled,
+                error.Timeout,
+                error.ProcessIsolationRequired,
+                error.HardCancellationWatchdogNotStarted,
+                error.InferenceWorkerShuttingDown,
+                => return err,
+                else => return err,
+            };
+            _ = warmed_identity;
+        }
 
         // Publication performs max-loaded eviction. When the cache is already
         // full, prewarming first makes the incoming runtime compete with the
@@ -10697,6 +10872,28 @@ test "load huggingface tokenizer from gguf gemma4 bpe metadata" {
     try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[0]);
     try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[1]);
     try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[2]);
+
+    var aligned = try tok.tokenizer().encodeGenerationWithOffsets(allocator, "hello world", 8, true);
+    defer aligned.deinit();
+    try std.testing.expectEqualSlices(i32, encoded.ids, aligned.ids);
+    try std.testing.expectEqualSlices(i32, encoded.attention_mask, aligned.attention_mask);
+    try std.testing.expectEqualSlices([2]u32, &.{ .{ 0, 0 }, .{ 0, 5 }, .{ 5, 11 } }, aligned.offsets.?[0..3]);
+
+    const repeated = try allocator.alloc(u8, 12 * 48);
+    defer allocator.free(repeated);
+    for (0..48) |i| @memcpy(repeated[i * 12 ..][0..12], "hello world\n");
+    var ordinary_long = try tok.tokenizer().encodeForGenerationConfigured(allocator, repeated, 512, true);
+    defer ordinary_long.deinit();
+    var aligned_long = try tok.tokenizer().encodeGenerationWithOffsets(allocator, repeated, 512, true);
+    defer aligned_long.deinit();
+    try std.testing.expectEqualSlices(i32, ordinary_long.ids, aligned_long.ids);
+    try std.testing.expectEqualSlices(i32, ordinary_long.attention_mask, aligned_long.attention_mask);
+    var previous_end: u32 = 0;
+    for (aligned_long.offsets.?) |span| {
+        if (span[1] == 0) continue;
+        try std.testing.expect(span[0] >= previous_end and span[1] <= repeated.len);
+        previous_end = span[1];
+    }
 
     const special_ids = try tok.tokenizer().encode(allocator, "<|turn>hello");
     defer allocator.free(special_ids);

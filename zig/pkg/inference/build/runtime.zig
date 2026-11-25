@@ -358,10 +358,10 @@ pub fn create(config: Config) Graph {
     // Native server composition replaces these imports when it builds the bridge.
     const apple_native_options = b.addOptions();
     apple_native_options.addOption(bool, "enabled", false);
+    const apple_native_options_mod = apple_native_options.createModule();
     const apple_native_mod = createSharedModule(config, "lib/apple_native/src/mod.zig");
-    const apple_options_mod = apple_native_options.createModule();
-    apple_native_mod.addImport("apple_native_options", apple_options_mod);
-    if (!readers_mod.import_table.contains("apple_reader_options")) readers_mod.addImport("apple_reader_options", apple_options_mod);
+    apple_native_mod.addImport("apple_native_options", apple_native_options_mod);
+    if (!readers_mod.import_table.contains("apple_reader_options")) readers_mod.addImport("apple_reader_options", apple_native_options_mod);
     if (!readers_mod.import_table.contains("antfly_inference_work")) {
         const work_mod = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/host/work.zig")), .target = target, .optimize = optimize });
         work_mod.addImport("antfly_scraping", scraping_mod);
@@ -436,6 +436,15 @@ pub fn create(config: Config) Graph {
     inference_chunker_mod.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     inference_chunker_mod.addImport("antfly_image", image_mod);
     inference_chunker_mod.addImport("antfly_hash", hash_mod);
+
+    const inference_work_mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/host/work.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_work_mod.addImport("antfly_scraping", scraping_mod);
+    inference_work_mod.addImport("antfly_image", image_mod);
+    readers_mod.addImport("antfly_inference_work", inference_work_mod);
 
     const inference_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/inference.zig")),
@@ -565,6 +574,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("antfly_document_runs", document_runs_mod);
     inference_internal_mod.addImport("antfly_decisions", decisions_mod);
     inference_internal_mod.addImport("antfly_structured", structured_mod);
+    inference_internal_mod.addImport("antfly_readers", readers_mod);
     inference_internal_mod.addImport("antfly_extracting", extracting_mod);
     inference_internal_mod.addImport("build_info", shared.build_info_mod);
     identities.addImports(inference_internal_mod);
@@ -1086,6 +1096,7 @@ pub fn configureMetal(
     addMacosSdkPaths(b, module, target);
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
+    module.linkFramework("Accelerate", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
     module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.inference_root, "src/backends/metal_kernels.m")), .flags = &.{"-fobjc-arc"} });
 }

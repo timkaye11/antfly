@@ -108,6 +108,10 @@ const MetaspacePrependScheme = enum {
 
 pub const HfTokenizer = struct {
     allocator: std.mem.Allocator,
+    /// Digest of the exact byte slice successfully parsed to construct this
+    /// tokenizer. Loaders may compare this against a canonical tokenizer view
+    /// derived from a retained GGUF mapping; no pathname re-read is needed.
+    source_identity: [std.crypto.hash.sha2.Sha256.digest_length]u8,
     model_type: ModelType,
     vocab: std.StringHashMapUnmanaged(i32),
     id_to_token: std.AutoHashMapUnmanaged(i32, []const u8),
@@ -149,6 +153,8 @@ pub const HfTokenizer = struct {
     replace_space_with: ?[]const u8,
     unigram_normalizer: unicode_normalizer.Profile = .{},
     bpe_normalizer: unicode_normalizer.Profile = .{},
+    /// Only an explicitly recognized reversible Gemma BPE profile has offsets.
+    bpe_byte_offsets: bool = false,
     unigram_min_score: f64 = std.math.inf(f64),
     // A generic unsupported normalizer keeps the complete legacy encoding
     // behavior. This is selected internally, never by a strict load option.
@@ -812,6 +818,7 @@ pub const HfTokenizer = struct {
         .encodeForModel = @ptrCast(&encodeForModel),
         .encodeForModelUnpadded = @ptrCast(&encodeForModelUnpadded),
         .encodeGeneration = @ptrCast(&encodeGeneration),
+        .encodeGenerationWithOffsets = &encodeGenerationWithOffsets,
         .decode = @ptrCast(&decode),
         .decodeToken = @ptrCast(&decodeToken),
         .tokenPiece = @ptrCast(&tokenPieceForVTable),
@@ -828,6 +835,7 @@ pub const HfTokenizer = struct {
     pub fn encodeWithOffsets(self: *HfTokenizer, allocator: std.mem.Allocator, text: []const u8) !?EncodingWithOffsets {
         if (text.len > std.math.maxInt(u32)) return null;
         if (self.unigram_normalizer.len != 0 or self.bpe_normalizer.len != 0) return null;
+        if (self.bpe_byte_offsets) return try self.encodeGemmaBpeWithOffsets(allocator, text);
         if (self.model_type == .word_piece and self.pre_tokenizer_type == .bert) {
             const protected = self.wordpiece_raw_added.findNext(text, 0) != null;
             if (self.wordpiece_normalizer.len == 0) {
@@ -865,6 +873,49 @@ pub const HfTokenizer = struct {
             return try self.encodeUnigramWithOffsets(allocator, text);
         }
         return null;
+    }
+
+    /// Actual BPE merge spans, mapped through the reversible space replacement.
+    /// All added-token matches have empty offsets and remain protected. This
+    /// bypasses the ID-only cache; ordinary encode has no new tracking cost.
+    fn encodeGemmaBpeWithOffsets(self: *HfTokenizer, allocator: std.mem.Allocator, text: []const u8) !EncodingWithOffsets {
+        if (!self.bpe_byte_offsets or text.len > 16 * 1024 * 1024 or !std.unicode.utf8ValidateSlice(text))
+            return error.UnsupportedTokenizerOffsets;
+        const replacement = self.replace_space_with.?;
+        const normalized = try replaceSpacesAlloc(allocator, text, replacement);
+        defer allocator.free(normalized);
+        if (normalized.len > 48 * 1024 * 1024) return error.UnsupportedTokenizerOffsets;
+        const mapping = try allocator.alloc([2]u32, normalized.len);
+        defer allocator.free(mapping);
+        var offset: usize = 0;
+        for (text, 0..) |byte, original| {
+            const count = if (byte == ' ') replacement.len else 1;
+            @memset(mapping[offset..][0..count], .{ @intCast(original), @intCast(original + 1) });
+            offset += count;
+        }
+        var result = EncodingWithOffsets{};
+        errdefer result.deinit(allocator);
+        var scratch = BpeScratch{ .offsets = &result.offsets };
+        defer scratch.deinit(allocator);
+        var cursor: usize = 0;
+        while (cursor < normalized.len) {
+            if (self.matchAddedTokenAt(normalized[cursor..])) |match| {
+                try result.ids.append(allocator, match.id);
+                try result.offsets.append(allocator, .{ 0, 0 });
+                cursor += match.len;
+                continue;
+            }
+            const end = self.findNextAddedToken(normalized, cursor) orelse normalized.len;
+            const first = result.offsets.items.len;
+            try self.bpeEncodeWordUncached(allocator, normalized[cursor..end], &result.ids, &scratch);
+            for (result.offsets.items[first..]) |*span| {
+                if (span[0] >= span[1] or span[1] > end - cursor) return error.UnsupportedTokenizerOffsets;
+                span.* = .{ mapping[cursor + span[0]][0], mapping[cursor + span[1] - 1][1] };
+            }
+            cursor = end;
+        }
+        if (result.ids.items.len != result.offsets.items.len) return error.UnsupportedTokenizerOffsets;
+        return result;
     }
 
     pub fn applySpecialTokenIds(
@@ -958,9 +1009,13 @@ pub const HfTokenizer = struct {
         const root = parsed.value;
         if (root != .object) return error.InvalidTokenizerJson;
 
+        var source_identity: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(json_bytes, &source_identity, .{});
+
         const self = try allocator.create(HfTokenizer);
         self.* = .{
             .allocator = allocator,
+            .source_identity = source_identity,
             .model_type = .word_piece,
             .vocab = .{},
             .id_to_token = .{},
@@ -1058,6 +1113,29 @@ pub const HfTokenizer = struct {
                 try self.parseNormalizer(norm.object, options.strict_unigram_normalizer);
             } else if (norm != .null and (self.model_type == .word_piece or (options.strict_unigram_normalizer and self.model_type == .unigram)))
                 return error.InvalidTokenizerNormalizer;
+        }
+
+        // Offset support is an explicit profile capability. Unknown/compound
+        // normalizers or pre-tokenizers must never silently claim alignment.
+        if (self.model_type == .bpe and !self.do_lowercase and self.bpe_normalizer.len == 0 and
+            self.pre_tokenizer_type == .none and self.continuing_prefix.len == 0 and self.end_of_word_suffix.len == 0)
+        {
+            if (root.object.get("normalizer")) |norm| {
+                if (norm == .object) {
+                    const kind = norm.object.get("type");
+                    const pattern = norm.object.get("pattern");
+                    if (kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "Replace") and
+                        pattern != null and pattern.? == .object and self.replace_space_with != null and std.mem.eql(u8, self.replace_space_with.?, "▁"))
+                    {
+                        const literal = pattern.?.object.get("String");
+                        if (literal != null and literal.? == .string and std.mem.eql(u8, literal.?.string, " ")) {
+                            if (root.object.get("pre_tokenizer")) |pt| {
+                                self.bpe_byte_offsets = pt == .object and isSpaceSplitMergedWithPrevious(pt.object);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Parse added_tokens
@@ -5769,9 +5847,16 @@ pub const HfTokenizer = struct {
     };
 
     const BpeScratch = struct {
+        offsets: ?*std.ArrayListUnmanaged([2]u32) = null,
+
         symbols: std.ArrayListUnmanaged(BpeSymbol) = .empty,
         transcode_ids: std.ArrayListUnmanaged(i32) = .empty,
         candidates: ?PriorityQueue(BpeCandidate) = null,
+
+        fn emit(self: *BpeScratch, allocator: std.mem.Allocator, ids: *std.ArrayListUnmanaged(i32), id: i32, start: usize, end: usize) !void {
+            try ids.append(allocator, id);
+            if (self.offsets) |offsets| try offsets.append(allocator, .{ @intCast(start), @intCast(end) });
+        }
 
         fn candidateQueue(
             self: *BpeScratch,
@@ -7061,7 +7146,7 @@ pub const HfTokenizer = struct {
 
         // Check added tokens first
         if (self.added_tokens.get(word)) |id| {
-            try ids.append(allocator, id);
+            try scratch.emit(allocator, ids, id, 0, word.len);
             return;
         }
 
@@ -7073,12 +7158,12 @@ pub const HfTokenizer = struct {
         // ("a</w>"); taking the raw hit here bypasses suffix-aware merges.
         if (self.end_of_word_suffix.len == 0 and self.vocab.get(word) != null) {
             const id = self.vocab.get(word).?;
-            try ids.append(allocator, id);
+            try scratch.emit(allocator, ids, id, 0, word.len);
             return;
         }
 
         if (self.shouldPreferDirectBpePieces()) {
-            try self.bpeEncodeByDirectPieces(allocator, word, ids);
+            try self.bpeEncodeByDirectPieces(allocator, word, ids, scratch);
             return;
         }
 
@@ -7094,18 +7179,30 @@ pub const HfTokenizer = struct {
                 const mask = self.bpe_merge_boundaries.masks[pair / @bitSizeOf(usize)];
                 const shift: std.math.Log2Int(usize) = @intCast(pair % @bitSizeOf(usize));
                 if (mask & (@as(usize, 1) << shift) != 0) continue;
-                try self.bpeEncodeMergeSegment(allocator, word[start..end], ids, scratch);
+                try self.bpeEncodeMergeSegment(allocator, word[start..end], ids, scratch, start);
                 start = end;
             }
             if (start != 0) {
-                try self.bpeEncodeMergeSegment(allocator, word[start..], ids, scratch);
+                try self.bpeEncodeMergeSegment(allocator, word[start..], ids, scratch, start);
                 return;
             }
         }
         try self.bpeEncodeMerges(allocator, word, ids, scratch);
     }
 
-    fn bpeEncodeMergeSegment(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32), scratch: *BpeScratch) !void {
+    fn bpeEncodeMergeSegment(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32), scratch: *BpeScratch, offset_base: usize) !void {
+        if (scratch.offsets) |offsets| {
+            // The shared cache contains bare IDs. Provenance must use the
+            // actual merges, then map segment-local spans back into the word.
+            const first = offsets.items.len;
+            try self.bpeEncodeMerges(allocator, word, ids, scratch);
+            const base = std.math.cast(u32, offset_base) orelse return error.UnsupportedTokenizerOffsets;
+            for (offsets.items[first..]) |*span| {
+                span[0] = std.math.add(u32, span[0], base) catch return error.UnsupportedTokenizerOffsets;
+                span[1] = std.math.add(u32, span[1], base) catch return error.UnsupportedTokenizerOffsets;
+            }
+            return;
+        }
         // Segment results must not alias the whole-word vocabulary shortcut:
         // a vocab entry can exist without being reachable by BPE merges.
         if (self.bpe_profile_enabled.load(.acquire)) _ = self.bpe_profile.pretokens.fetchAdd(1, .monotonic);
@@ -7249,21 +7346,21 @@ pub const HfTokenizer = struct {
             if (sym.alive) {
                 const bytes = work[sym.start..sym.end];
                 if (sym.token_id >= 0) {
-                    try ids.append(allocator, sym.token_id);
+                    try scratch.emit(allocator, ids, sym.token_id, sym.start, sym.end);
                 } else if (self.vocab.get(bytes)) |id| {
-                    try ids.append(allocator, id);
+                    try scratch.emit(allocator, ids, id, sym.start, sym.end);
                 } else if (self.byte_fallback) {
-                    for (bytes) |byte| {
+                    for (bytes, 0..) |byte, byte_index| {
                         var hex_buf: [6]u8 = undefined;
                         const hex = std.fmt.bufPrint(&hex_buf, "<0x{X:0>2}>", .{byte}) catch continue;
                         if (self.vocab.get(hex)) |id| {
-                            try ids.append(allocator, id);
+                            try scratch.emit(allocator, ids, id, sym.start + byte_index, sym.start + byte_index + 1);
                         } else {
-                            try ids.append(allocator, self.special.unk_id);
+                            try scratch.emit(allocator, ids, self.special.unk_id, sym.start + byte_index, sym.start + byte_index + 1);
                         }
                     }
                 } else {
-                    try ids.append(allocator, self.special.unk_id);
+                    try scratch.emit(allocator, ids, self.special.unk_id, sym.start, sym.end);
                 }
             }
             if (sym.next < 0) break;
@@ -7289,6 +7386,7 @@ pub const HfTokenizer = struct {
         allocator: std.mem.Allocator,
         word: []const u8,
         ids: *std.ArrayListUnmanaged(i32),
+        scratch: *BpeScratch,
     ) !void {
         // Caller already gated on shouldPreferDirectBpePieces, which is the
         // same predicate that guarantees the trie was built at load time.
@@ -7297,7 +7395,7 @@ pub const HfTokenizer = struct {
         const trie: *const VocabTrie = if (self.bpe_direct_trie) |*t|
             t
         else
-            return self.bpeEncodeByDirectPiecesFallback(allocator, word, ids);
+            return self.bpeEncodeByDirectPiecesFallback(allocator, word, ids, scratch);
         const trie_nodes = trie.nodes.items;
 
         var start: usize = 0;
@@ -7319,7 +7417,7 @@ pub const HfTokenizer = struct {
             }
 
             if (best_id >= 0) {
-                try ids.append(allocator, best_id);
+                try scratch.emit(allocator, ids, best_id, start, best_end);
                 start = best_end;
                 continue;
             }
@@ -7330,20 +7428,20 @@ pub const HfTokenizer = struct {
             const end_cp = @min(start + cp_len, word.len);
             const piece = word[start..end_cp];
             if (self.byte_fallback) {
-                for (piece) |byte| {
+                for (piece, 0..) |byte, byte_index| {
                     var buf: [6]u8 = undefined;
                     const hex = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{byte}) catch {
-                        try ids.append(allocator, self.special.unk_id);
+                        try scratch.emit(allocator, ids, self.special.unk_id, start + byte_index, start + byte_index + 1);
                         continue;
                     };
                     if (self.vocab.get(hex)) |id| {
-                        try ids.append(allocator, id);
+                        try scratch.emit(allocator, ids, id, start + byte_index, start + byte_index + 1);
                     } else {
-                        try ids.append(allocator, self.special.unk_id);
+                        try scratch.emit(allocator, ids, self.special.unk_id, start + byte_index, start + byte_index + 1);
                     }
                 }
             } else {
-                try ids.append(allocator, self.special.unk_id);
+                try scratch.emit(allocator, ids, self.special.unk_id, start, end_cp);
             }
             start = end_cp;
         }
@@ -7354,6 +7452,7 @@ pub const HfTokenizer = struct {
         allocator: std.mem.Allocator,
         word: []const u8,
         ids: *std.ArrayListUnmanaged(i32),
+        scratch: *BpeScratch,
     ) !void {
         var start: usize = 0;
         while (start < word.len) {
@@ -7366,7 +7465,7 @@ pub const HfTokenizer = struct {
                 }
                 const piece = word[start..end];
                 if (self.vocab.get(piece)) |id| {
-                    try ids.append(allocator, id);
+                    try scratch.emit(allocator, ids, id, start, end);
                     start = end;
                     found = true;
                     break;
@@ -7379,22 +7478,22 @@ pub const HfTokenizer = struct {
             const end_cp = @min(start + cp_len, word.len);
             const piece = word[start..end_cp];
             if (self.vocab.get(piece)) |id| {
-                try ids.append(allocator, id);
+                try scratch.emit(allocator, ids, id, start, end_cp);
             } else if (self.byte_fallback) {
-                for (piece) |byte| {
+                for (piece, 0..) |byte, byte_index| {
                     var buf: [6]u8 = undefined;
                     const hex = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{byte}) catch {
-                        try ids.append(allocator, self.special.unk_id);
+                        try scratch.emit(allocator, ids, self.special.unk_id, start + byte_index, start + byte_index + 1);
                         continue;
                     };
                     if (self.vocab.get(hex)) |id| {
-                        try ids.append(allocator, id);
+                        try scratch.emit(allocator, ids, id, start + byte_index, start + byte_index + 1);
                     } else {
-                        try ids.append(allocator, self.special.unk_id);
+                        try scratch.emit(allocator, ids, self.special.unk_id, start + byte_index, start + byte_index + 1);
                     }
                 }
             } else {
-                try ids.append(allocator, self.special.unk_id);
+                try scratch.emit(allocator, ids, self.special.unk_id, start, end_cp);
             }
             start = end_cp;
         }
@@ -7470,8 +7569,18 @@ pub const HfTokenizer = struct {
         } else {
             try self.encodeInto(allocator, text, &raw);
         }
-        const raw_ids = raw.items;
+        return self.wrapGeneration(allocator, raw.items, null, max_length, add_bos_token);
+    }
 
+    fn encodeGenerationWithOffsets(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, add_bos_token: bool) anyerror!@import("tokenizer.zig").EncodeResult {
+        const self: *HfTokenizer = @ptrCast(@alignCast(ptr));
+        if (!self.bpe_byte_offsets) return error.UnsupportedTokenizerOffsets;
+        var raw = try self.encodeGemmaBpeWithOffsets(allocator, text);
+        defer raw.deinit(allocator);
+        return self.wrapGeneration(allocator, raw.ids.items, raw.offsets.items, max_length, add_bos_token);
+    }
+
+    fn wrapGeneration(self: *HfTokenizer, allocator: std.mem.Allocator, raw_ids: []const i32, raw_offsets: ?[]const [2]u32, max_length: usize, add_bos_token: bool) !@import("tokenizer.zig").EncodeResult {
         const tok_iface = self.tokenizer();
         const prepend_bos = add_bos_token and tok_iface.specialTokens().cls_id >= 0 and max_length > 0;
         const available = if (prepend_bos) max_length - 1 else max_length;
@@ -7479,6 +7588,10 @@ pub const HfTokenizer = struct {
         const ids = try allocator.alloc(i32, max_length);
         errdefer allocator.free(ids);
         const mask = try allocator.alloc(i32, max_length);
+        errdefer allocator.free(mask);
+        const offsets = if (raw_offsets != null) try allocator.alloc([2]u32, max_length) else null;
+        errdefer if (offsets) |spans| allocator.free(spans);
+        if (offsets) |spans| @memset(spans, .{ 0, 0 });
 
         var pos: usize = 0;
         if (prepend_bos) {
@@ -7489,6 +7602,7 @@ pub const HfTokenizer = struct {
         for (0..token_count) |i| {
             ids[pos + i] = raw_ids[i];
             mask[pos + i] = 1;
+            if (offsets) |spans| spans[pos + i] = raw_offsets.?[i];
         }
         for (pos + token_count..max_length) |i| {
             ids[i] = tok_iface.specialTokens().pad_id;
@@ -7498,6 +7612,7 @@ pub const HfTokenizer = struct {
         return .{
             .ids = ids,
             .attention_mask = mask,
+            .offsets = offsets,
             .allocator = allocator,
         };
     }
@@ -12374,6 +12489,21 @@ test "normalized Unigram encoding cleans up every failed allocation" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseNormalizedUnigramAllocations, .{tok});
 }
 
+test "context tokenizer source identity binds the exact successfully parsed bytes" {
+    const fixture = @import("normalizer_fixtures.zig");
+    const tok = try HfTokenizer.loadFromBytes(std.testing.allocator, fixture.tiny_tokenizer_json);
+    defer tok.deinitSelf();
+    var expected: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(fixture.tiny_tokenizer_json, &expected, .{});
+    try std.testing.expectEqual(expected, tok.source_identity);
+
+    const with_trailing_whitespace = try std.fmt.allocPrint(std.testing.allocator, "{s}\n", .{fixture.tiny_tokenizer_json});
+    defer std.testing.allocator.free(with_trailing_whitespace);
+    const second = try HfTokenizer.loadFromBytes(std.testing.allocator, with_trailing_whitespace);
+    defer second.deinitSelf();
+    try std.testing.expect(!std.mem.eql(u8, &tok.source_identity, &second.source_identity));
+}
+
 test "metaspace pre-tokenizer" {
     const allocator = std.testing.allocator;
 
@@ -12773,6 +12903,96 @@ test "raw token bytes retain metaspace and split byte fallback without sequence 
     const byte = try tokenizer.tokenBytes(a, 5);
     defer a.free(byte);
     try std.testing.expectEqualSlices(u8, &.{0xc3}, byte);
+}
+test "context Gemma BPE provenance preserves ranked merges Unicode specials and wrapping" {
+    const a = std.testing.allocator;
+    const profile =
+        \\{"normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},
+        \\"pre_tokenizer":{"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false},
+        \\"model":{"type":"BPE","byte_fallback":true,"vocab":{"a":0,"b":1,"ab":2,"▁":3,"▁ab":4,"<unk>":5,"<0xC3>":6,"<0xA9>":7},"merges":["a b","▁ ab"]},
+        \\"added_tokens":[{"id":8,"content":"<role>","special":true}]}
+    ;
+    const tok = try HfTokenizer.loadFromBytes(a, profile);
+    defer tok.deinitSelf();
+    tok.applySpecialTokenIds(9, 8, 10, 5);
+    const text = "ab abé<role>ab ab";
+    var raw = (try tok.encodeWithOffsets(a, text)).?;
+    defer raw.deinit(a);
+    const ordinary = try tok.encode(a, text);
+    defer a.free(ordinary);
+    try std.testing.expectEqualSlices(i32, ordinary, raw.ids.items);
+    try std.testing.expectEqualSlices(i32, &.{ 2, 4, 6, 7, 8, 2, 4 }, raw.ids.items);
+    try std.testing.expectEqualSlices([2]u32, &.{ .{ 0, 2 }, .{ 2, 5 }, .{ 5, 6 }, .{ 6, 7 }, .{ 0, 0 }, .{ 13, 15 }, .{ 15, 18 } }, raw.offsets.items);
+    for ([_]usize{ 0, 1, 4, 12 }) |limit| {
+        for ([_]bool{ false, true }) |bos| {
+            var plain = try tok.tokenizer().encodeForGenerationConfigured(a, text, limit, bos);
+            defer plain.deinit();
+            var aligned = try tok.tokenizer().encodeGenerationWithOffsets(a, text, limit, bos);
+            defer aligned.deinit();
+            try std.testing.expectEqualSlices(i32, plain.ids, aligned.ids);
+            try std.testing.expectEqualSlices(i32, plain.attention_mask, aligned.attention_mask);
+            for (aligned.attention_mask, aligned.offsets.?, 0..) |mask, span, i| {
+                if (mask == 0 or (bos and i == 0)) try std.testing.expectEqual([2]u32{ 0, 0 }, span);
+            }
+        }
+    }
+}
+
+test "context Gemma BPE provenance tracks vocab-only direct pieces and rejects unknown normalization" {
+    const a = std.testing.allocator;
+    const profile =
+        \\{"normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},
+        \\"pre_tokenizer":{"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false},
+        \\"model":{"type":"BPE","byte_fallback":true,"vocab":{"a":0,"▁a":1,"<unk>":2,"<0xC3>":3,"<0xA9>":4},"merges":[]}}
+    ;
+    const tok = try HfTokenizer.loadFromBytes(a, profile);
+    defer tok.deinitSelf();
+    var raw = (try tok.encodeWithOffsets(a, "a aé")).?;
+    defer raw.deinit(a);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 3, 4 }, raw.ids.items);
+    try std.testing.expectEqualSlices([2]u32, &.{ .{ 0, 1 }, .{ 1, 3 }, .{ 3, 4 }, .{ 4, 5 } }, raw.offsets.items);
+    const unknown = try HfTokenizer.loadFromBytes(a,
+        \\{"normalizer":{"type":"Lowercase"},"model":{"type":"BPE","vocab":{"a":0},"merges":[]}}
+    );
+    defer unknown.deinitSelf();
+    try std.testing.expectError(error.UnsupportedTokenizerOffsets, unknown.tokenizer().encodeGenerationWithOffsets(a, "A", 1, false));
+    try std.testing.expectError(error.UnsupportedTokenizerOffsets, tok.tokenizer().encodeGenerationWithOffsets(a, "\xff", 1, false));
+}
+
+test "context Gemma BPE provenance tracks long repeated segments across cold and warm caches" {
+    const a = std.testing.allocator;
+    const profile =
+        \\{"normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},
+        \\"pre_tokenizer":{"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false},
+        \\"model":{"type":"BPE","byte_fallback":true,"vocab":{"a":0,"b":1,"ab":2,"▁":3,"▁ab":4,"<unk>":5,"<0xC3>":6,"<0xA9>":7,"\n":8},"merges":["a b","▁ ab"]},
+        \\"added_tokens":[{"id":9,"content":"<role>","special":true}]}
+    ;
+    const tok = try HfTokenizer.loadFromBytes(a, profile);
+    defer tok.deinitSelf();
+    const text = z17RepeatString("ab abé\n", 64);
+    var cold = try tok.tokenizer().encodeGenerationWithOffsets(a, text, 384, false);
+    defer cold.deinit();
+    const plain = try tok.encode(a, text);
+    defer a.free(plain);
+    try std.testing.expectEqualSlices(i32, plain, cold.ids[0..plain.len]);
+    // The ordinary path populates the ID-only segment cache. Repeated
+    // provenance calls must compute merge spans rather than reuse bare IDs.
+    for (0..2) |_| {
+        var aligned = try tok.tokenizer().encodeGenerationWithOffsets(a, text, 384, false);
+        defer aligned.deinit();
+        try std.testing.expectEqualSlices(i32, plain, aligned.ids[0..plain.len]);
+        try std.testing.expectEqual(@as(usize, 320), plain.len);
+        for (0..64) |i| {
+            const start: u32 = @intCast(i * 8);
+            const spans = [_][2]u32{
+                .{ start, start + 2 },     .{ start + 2, start + 5 },
+                .{ start + 5, start + 6 }, .{ start + 6, start + 7 },
+                .{ start + 7, start + 8 },
+            };
+            try std.testing.expectEqualSlices([2]u32, &spans, aligned.offsets.?[i * 5 ..][0..5]);
+        }
+        for (aligned.offsets.?[320..]) |span| try std.testing.expectEqual([2]u32{ 0, 0 }, span);
+    }
 }
 
 const ordered_wordpiece_model =

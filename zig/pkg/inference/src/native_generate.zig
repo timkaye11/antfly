@@ -27,6 +27,7 @@ const gpt_arch = @import("architectures/gpt.zig");
 const gemma4_runtime = @import("architectures/gemma4_runtime.zig");
 const session_factory = @import("architectures/session_factory.zig");
 const generation = @import("pipelines/generation.zig");
+const prompt_lookup = @import("pipelines/prompt_lookup.zig");
 const graph_mod = @import("graph/root.zig");
 const kernel_jit = graph_mod.kernel_jit;
 const quant_matmul = @import("graph/quant_matmul.zig");
@@ -35,6 +36,7 @@ const manifest_mod = @import("models/manifest.zig");
 const gpt_mod = @import("models/gpt.zig");
 const runtime = @import("runtime/root.zig");
 const c_file = @import("util/c_file.zig");
+const native_kv_upload = @import("cli/native_kv_upload.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const native_run_artifact = @import("native_run_artifact.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
@@ -87,6 +89,12 @@ fn shouldSkipAutoMtpDraftLoad(opts: Options, draft_cfg: gpt_mod.Config) bool {
 const Options = struct {
     model_dir: []const u8,
     prompt: []const u8,
+    context_document_file: ?[]const u8 = null,
+    context_question_file: ?[]const u8 = null,
+    context_document_sha256: ?[]const u8 = null,
+    context_question_sha256: ?[]const u8 = null,
+    context_document: ?[]const u8 = null,
+    context_question: ?[]const u8 = null,
     prompt_file: ?[]const u8 = null,
     image_paths: [8][]const u8 = @splat(""),
     image_count: usize = 0,
@@ -133,12 +141,17 @@ const Options = struct {
     no_bos: bool = false,
     raw_decode_bench: bool = false,
     ignore_eos: bool = false,
+    fixed_length_mask_eos: bool = false,
     cache_dtype: ?[]const u8 = null,
     cache_compaction_ratio: ?f32 = null,
+    context_policy: runtime.context_policy.Policy = .{},
+    context_policy_explicit: bool = false,
     mode: ?ExecutionMode = null,
     compiled_target: ?CompiledTarget = null,
     artifact_dir: ?[]const u8 = null,
     server_url: ?[]const u8 = null,
+    messages_file: ?[]const u8 = null,
+    native_kv_checkpoint: ?[]const u8 = null,
     require_server: bool = false,
     stream: bool = false,
     json_timing_path: ?[]const u8 = null,
@@ -281,9 +294,81 @@ fn shouldSkipMetalAutoDraftLoad(opts: Options, draft_is_gemma4_mtp: bool) bool {
 }
 
 fn validateCacheCompactionOption(ratio: ?f32) !void {
-    const value = ratio orelse return;
-    try (runtime.kv.compaction.CompactionConfig{ .target_ratio = value }).validate();
-    return error.KvStorageCompactionNotSupported;
+    try runtime.context_policy.validateLegacyRatio(ratio);
+}
+
+const StructuredCliInput = struct {
+    allocator: std.mem.Allocator,
+    document: []u8,
+    question: []u8,
+
+    fn deinit(self: *@This()) void {
+        self.allocator.free(self.document);
+        self.allocator.free(self.question);
+        self.* = undefined;
+    }
+};
+
+fn parseDigest32(text: []const u8) ![32]u8 {
+    if (text.len != 64) return error.InvalidStructuredCliInputDigest;
+    var result: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&result, text) catch return error.InvalidStructuredCliInputDigest;
+    return result;
+}
+
+fn readStructuredCliFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, expected_hex: []const u8) ![]u8 {
+    if (path.len == 0) return error.InvalidStructuredCliInput;
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file or stat.size == 0 or stat.size > 16 * 1024 * 1024)
+        return error.InvalidStructuredCliInput;
+    const size = std.math.cast(usize, stat.size) orelse return error.InvalidStructuredCliInput;
+    const bytes = try allocator.alloc(u8, size);
+    errdefer allocator.free(bytes);
+    if (try file.readPositionalAll(io, bytes, 0) != size or !std.unicode.utf8ValidateSlice(bytes))
+        return error.InvalidStructuredCliInput;
+    var actual: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+    const expected = try parseDigest32(expected_hex);
+    if (!std.mem.eql(u8, &actual, &expected)) return error.StructuredCliInputDigestMismatch;
+    return bytes;
+}
+
+fn loadStructuredCliInput(allocator: std.mem.Allocator, io: std.Io, opts: Options) !?StructuredCliInput {
+    const present = .{
+        opts.context_document_file != null,
+        opts.context_question_file != null,
+        opts.context_document_sha256 != null,
+        opts.context_question_sha256 != null,
+    };
+    if (!present[0] and !present[1] and !present[2] and !present[3]) return null;
+    if (!present[0] or !present[1] or !present[2] or !present[3] or !std.mem.eql(u8, opts.prompt, "-") or
+        opts.image_count != 0 or opts.audio_count != 0 or opts.video_path != null or opts.context_policy.mode != .attention_matching or
+        opts.context_policy.compaction_targets.count != 1)
+        return error.InvalidStructuredCliInput;
+    const target = opts.context_policy.compaction_targets.slice()[0];
+    if (target.message_index != 0 or target.part_index != 0)
+        return error.InvalidStructuredCliInput;
+    const document = try readStructuredCliFile(allocator, io, opts.context_document_file.?, opts.context_document_sha256.?);
+    errdefer allocator.free(document);
+    const question = try readStructuredCliFile(allocator, io, opts.context_question_file.?, opts.context_question_sha256.?);
+    return .{ .allocator = allocator, .document = document, .question = question };
+}
+
+fn contextRequestFeatures(opts: Options) runtime.context_policy.RequestFeatures {
+    return .{
+        // Auto is resolved by the warm server. Local approximate execution
+        // remains gated by validateExecution with no qualified capabilities.
+        .metal = opts.backend == .auto or opts.backend == .metal,
+        .f16_kv = opts.cache_dtype == null or std.mem.eql(u8, opts.cache_dtype.?, "f16"),
+        .multimodal = opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null,
+        .speculation = opts.draft_model != null,
+    };
 }
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -292,12 +377,24 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     }
     var opts = try parseArgs(args);
+    try validateRemoteMessageOptions(opts);
+    var structured_cli = try loadStructuredCliInput(allocator, io, opts);
+    defer if (structured_cli) |*value| value.deinit();
+    if (structured_cli) |value| {
+        opts.context_document = value.document;
+        opts.context_question = value.question;
+    }
     const file_prompt = if (opts.prompt_file) |path| try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) else null;
     defer if (file_prompt) |bytes| allocator.free(bytes);
     if (file_prompt) |bytes| opts.prompt = bytes;
     try validateVideoOptions(opts);
     const jit_config = try validateKernelJitOptions(io, opts);
     try validateCacheCompactionOption(opts.cache_compaction_ratio);
+    const context_features = contextRequestFeatures(opts);
+    // The client owns structural and immutable request-feature validation. The
+    // warm server alone owns loaded-profile capability and publication state.
+    try runtime.context_policy.validateRequestFeatures(opts.context_policy, context_features);
+    try validateContextExecutionMode(opts);
     try native_backend_choice.validate(opts.backend);
     if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null)) return error.RawDecodeBenchRequiresTextOnly;
     if (opts.raw_decode_bench and opts.draft_model != null and opts.speculation_policy != .off) return error.RawDecodeBenchSpeculationUnsupported;
@@ -315,6 +412,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (!serverGenerateSupportsOptions(opts)) return error.UnsupportedServerGenerateOption;
         return error.WarmInferenceServerUnavailable;
     }
+
+    // Local execution has no loaded, release-qualified compaction profile. It
+    // stays fail-closed even though the same structurally valid request may be
+    // transported to a warm server that owns that authority.
+    try runtime.context_policy.validateExecution(opts.context_policy, context_features, .{});
 
     var preflight_draft_gpt_config: ?gpt_mod.Config = null;
     const effective_draft_model = if (opts.speculation_policy == .off) null else if (opts.backend == .metal and opts.speculation_policy == .auto) blk: {
@@ -349,6 +451,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var content_parts = std.ArrayListUnmanaged(generation.Message.ContentPart).empty;
     defer content_parts.deinit(allocator);
 
+    if (opts.context_document) |document| {
+        try content_parts.append(allocator, .{ .text = document });
+        try content_parts.append(allocator, .{ .text = opts.context_question.? });
+    }
     for (0..opts.image_count) |idx| {
         const image_bytes = try std.Io.Dir.cwd().readFileAlloc(io, opts.image_paths[idx], allocator, .limited(std.math.maxInt(usize)));
         try loaded_images.append(allocator, image_bytes);
@@ -384,7 +490,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const messages = [_]generation.Message{
         .{
             .role = "user",
-            .content = opts.prompt,
+            .content = if (opts.context_document == null) opts.prompt else "",
             .image_bytes = message_image_slice,
             .video_bytes = loaded_video,
             .audio_bytes = message_audio_slice,
@@ -405,7 +511,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .speculation_policy = opts.speculation_policy,
         .speculation_calibration = opts.speculation_calibration,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
+        .context_policy = opts.context_policy,
         .ignore_eos = opts.ignore_eos,
+        .fixed_length_mask_eos = opts.fixed_length_mask_eos,
         .enable_thinking = opts.enable_thinking,
         .qwen3vl_parity_json_path = opts.qwen3vl_parity_json_path,
         .qwen3vl_parity_patch_path = opts.qwen3vl_parity_patch_path,
@@ -474,6 +582,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (opts.disable_gemma_embedding_scale and gpt_config.family == .gemma) {
         gpt_config.disable_token_embedding_scale = true;
     }
+    if (gpt_config.family == .gemma and !gpt_config.gemma4_mtp_assistant) _ = try runtime.context_policy.Layout.init(gpt_config);
+    if (generation.kvSlidingTrimForced() and gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers()) return error.UnsafeGlobalContextTrim;
     const tokenizer = model.getTokenizer();
     if (effective_draft_model != null and (opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null)) {
         return error.MultimodalSpeculativeDecodingNotSupported;
@@ -525,12 +635,13 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         &transport_inspection,
     );
     const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(&messages, gpt_config);
-    const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+    const prompt_token_limit = try generation.nativeGenerationPromptTokenLimitWithPolicy(
         gpt_config,
         if (draft_model != null and opts.speculation_policy != .off) draft_gpt_config else null,
         @intCast(@max(opts.max_tokens, 1)),
         if (draft_model != null and opts.speculation_policy != .off and opts.speculative_k > 0) 1 else 0,
         preliminary_media_allowance,
+        opts.context_policy,
     );
     var prompt_encoded = try generation.encodeNativeGenerationPrompt(
         tokenizer,
@@ -547,6 +658,18 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         prompt_media_admission.token_allowance,
         gpt_config,
         if (draft_model != null and opts.speculation_policy != .off) draft_gpt_config else null,
+        @intCast(@max(opts.max_tokens, 1)),
+        if (draft_model != null and opts.speculation_policy != .off and opts.speculative_k > 0) 1 else 0,
+    );
+
+    // Dynamic media admission can overestimate the final visual span. Keep
+    // scheduler/memory accounting conservative and defer its exact context
+    // check to the pipeline after expansion.
+    const policy_prompt_tokens = std.math.add(usize, countPromptTokens(prompt_encoded.attention_mask), preliminary_media_allowance) catch return error.PromptTooLong;
+    _ = try opts.context_policy.admit(
+        gpt_config.max_position_embeddings,
+        if (draft_model != null and opts.speculation_policy != .off) draft_gpt_config.?.max_position_embeddings else null,
+        policy_prompt_tokens,
         @intCast(@max(opts.max_tokens, 1)),
         if (draft_model != null and opts.speculation_policy != .off and opts.speculative_k > 0) 1 else 0,
     );
@@ -688,27 +811,46 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         budget_limits.backend_limit_bytes / (1024 * 1024),
         budget_limits.combined_limit_bytes / (1024 * 1024),
     });
+    const request_suppress_policy = try generation.RequestSuppressPolicy.init(gpt_config, config);
+    const request_suppress_token_ids = if (config.fixed_length_mask_eos)
+        request_suppress_policy.ids()
+    else
+        &.{};
     const compiled_whole_model_route = graph_mode and
         explicit_partition_backend == .metal and
         compiled_attachment_target == .whole_model and
         backend_kind == .metal and
         graph_mod.metal_executor.supportsSession(model.session);
     const live_whole_model_route = liveWholeModelExecutorRequested(&opts, gpt_config) and
+        liveWholeModelExecutorSupportsGenerationConfig(config, request_suppress_token_ids, backend_kind == .metal) and
         backend_kind == .metal and
         !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
         config.draft_model == null and
         !config.speculation_requested and
         opts.video_path == null and opts.image_count == 0 and
         opts.audio_count == 0;
-    const kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
-        if (compiled_whole_model_route or live_whole_model_route)
-            .metal_whole_model
-        else
-            .standard,
+    // Prompt lookup needs transactional suffix rollback. Select full-history
+    // KV before memory admission so budget accounting and runtime storage agree.
+    const whole_model_prompt_lookup_policy = wholeModelPromptLookupStructuralEligible(
+        platform.env.getenvBool("ANTFLY_INFERENCE_PROMPT_LOOKUP"),
+        live_whole_model_route,
         gpt_config,
         config,
-        kv_dtype,
+        dumpGenerateLogitsPath() != null,
+        platform.env.getenv("TERMITE_METAL_TEACHER_FORCE_TOKEN_IDS") != null,
     );
+    const kv_capacity_policy: runtime.tier.memory.GenerationKvCapacityPolicy = if (whole_model_prompt_lookup_policy)
+        .full_history
+    else
+        generation.generationKvCapacityPolicyForRoute(
+            if (compiled_whole_model_route or live_whole_model_route)
+                .metal_whole_model
+            else
+                .standard,
+            gpt_config,
+            config,
+            kv_dtype,
+        );
     const draft_kv_dtype = if (draft_model) |loaded| blk: {
         const requested_draft_kv_dtype = if (opts.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
@@ -729,6 +871,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         (opts.image_count != 0 or opts.audio_count != 0 or opts.video_path != null);
     var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
     budget_components[0] = .{
+        .context_policy = config.context_policy,
         .backend = backend_kind,
         .kv_dtype = kv_dtype,
         .config = gpt_config,
@@ -736,6 +879,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .workspace_capacity = model.session.generationWorkspaceCapacity(),
         .backend_owns_kv = explicit_partition_backend == .pjrt,
         .fixed_prefill_shape = explicit_partition_backend == .pjrt,
+        .additional_backend_scratch_bytes = try generation.generationRequestAdditionalBackendScratchBytes(backend_kind, gpt_config),
+        .metal_e4_transient_down_scratch_bytes = try generation.generationRequestMetalE4TransientDownScratchBytes(backend_kind, gpt_config),
+        .additional_backend_weight_bytes = try generation.boundedPleF16MirrorRequestWeightBytes(backend_kind, gpt_config),
         .prompt_input_copies = if (prepared_prompt_inputs) 2 else 0,
         .host_prompt_input_copies = if (prepared_prompt_inputs) 1 else 0,
     };
@@ -747,6 +893,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 .kv_dtype = draft_kv_dtype.?,
                 .config = draft_cfg,
                 .workspace_capacity = draft_model.?.session.generationWorkspaceCapacity(),
+                .additional_backend_scratch_bytes = try generation.generationRequestAdditionalBackendScratchBytes(draft_backend_kind.?, draft_cfg),
+                .metal_e4_transient_down_scratch_bytes = try generation.generationRequestMetalE4TransientDownScratchBytes(draft_backend_kind.?, draft_cfg),
+                .additional_backend_weight_bytes = try generation.boundedPleF16MirrorRequestWeightBytes(draft_backend_kind.?, draft_cfg),
             };
             budget_component_count = 2;
         }
@@ -796,6 +945,22 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         media_budget_credit.bytes,
     );
     defer generation_resources.release();
+    const admitted_target_estimate = try budget_components[0].estimate(prompt_tokens, budget_max_tokens, config.prefill_chunk_size);
+    const e2b_f16_mirror_admission = generation.NativeGenerationPipeline.makeE2bF16MirrorAdmission(&run_budget, admitted_target_estimate, config.prefill_chunk_size, gpt_config);
+
+    // Memory admission precedes the execution barrier. Approximate context
+    // owns replay/publication state exclusively; exact requests may share the
+    // normal scheduler until an older exclusive waiter reaches the front.
+    if (native_generate_lease) |*lease| {
+        if (model.native_generate_coordinator) |coordinator| {
+            if (config.context_policy.mode == .exact) {
+                try coordinator.awaitSharedExecution(lease, io);
+            } else {
+                try coordinator.markExclusive(lease);
+                try coordinator.awaitExclusiveExecution(lease, io);
+            }
+        }
+    }
 
     // The live executor is an alternate implementation of this admitted
     // route, not an admission bypass. Reuse the effective KV dtype, capacity
@@ -816,6 +981,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         started_at,
         loaded_model_at,
         encoded_prompt_at,
+        e2b_f16_mirror_admission,
+        request_suppress_token_ids,
     ) catch |err| {
         print("error: live whole-model generate failed for {s} with backend {s}: {s}\n", .{
             opts.model_dir,
@@ -833,12 +1000,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     // A requested live route can decline when the installed executor lacks an
     // operation. Re-admit the actual fallback route before it allocates a cache;
     // a split-ring estimate must never leak into a full-history execution.
-    const fallback_kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
-        if (compiled_whole_model_route) .metal_whole_model else .standard,
-        gpt_config,
-        config,
-        kv_dtype,
-    );
+    const fallback_kv_capacity_policy: runtime.tier.memory.GenerationKvCapacityPolicy = if (whole_model_prompt_lookup_policy)
+        .full_history
+    else
+        generation.generationKvCapacityPolicyForRoute(
+            if (compiled_whole_model_route) .metal_whole_model else .standard,
+            gpt_config,
+            config,
+            kv_dtype,
+        );
     if (fallback_kv_capacity_policy != kv_capacity_policy) {
         generation_resources.release();
         budget_components[0].kv_capacity_policy = fallback_kv_capacity_policy;
@@ -885,6 +1055,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var kv_manager = runtime.kv.manager.KvManager.init(allocator);
     defer kv_manager.deinit();
+
+    if (config.context_policy.mode != .exact) {
+        config.context_budget_bytes = (try budget_components[0].estimate(prompt_tokens, budget_max_tokens, config.prefill_chunk_size)).kv_bytes;
+    }
 
     debugGenerateSetup("compute backend begin", .{});
     var cb = (if (publication_cleanup) |*owner|
@@ -963,7 +1137,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
     }
 
-    const use_scheduler = !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and !graph_mode and !decoder_runtime_scheduler_override and nativeGenerateSchedulerEnabled();
+    const use_scheduler = config.context_policy.mode == .exact and !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and !graph_mode and !decoder_runtime_scheduler_override and nativeGenerateSchedulerEnabled();
     var graph_cache = graph_mod.cache.GraphCache.init(allocator);
     defer graph_cache.deinit();
     const pjrt_admission_policy = @import("graph/pjrt_admission.zig").Context{ .allocator = allocator, .manager = &model_manager, .policy = try load_budget.policy(), .decode_steps_limit = @as(usize, @intCast(@max(opts.max_tokens, 1))) - 1 };
@@ -990,6 +1164,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .explicit_scratch_limit = if (opts.scratch_budget_mb != 0) budget_limits.scratch_limit_bytes else 0,
         .gpt_config = gpt_config,
         .kv_dtype = kv_dtype,
+        .e2b_f16_mirror_admission = e2b_f16_mirror_admission,
         .shared_moe_cache = model.shared_moe_cache,
         .tokenizer = tokenizer,
         .add_bos_token = !opts.no_bos and model.manifest.add_bos_token,
@@ -3652,7 +3827,7 @@ fn metalStatsCompactJson(
         \\,
         \\"q6_high_row_mm_matrix":{d}
         \\}},
-        \\"lm_head_q4_q6_refine":{{"dispatches":{d},"resident_sampling_rejections":{d}}},
+        \\"lm_head_q4_q6_refine":{{"dispatches":{d},"full_q6_argmax_dispatches":{d},"resident_sampling_rejections":{d}}},
         \\"q4_0_policy":{{
         \\"mmv_nr4_nsg2":{d},
         \\"mmv_nr8_nsg2":{d},
@@ -3667,6 +3842,7 @@ fn metalStatsCompactJson(
         .{
             provider.metal_runtime_q6_k_high_row_mm_matrix_dispatches,
             provider.metal_runtime_lm_head_q4_q6_refine_dispatches,
+            provider.metal_runtime_lm_head_q6_full_argmax_dispatches,
             provider.metal_runtime_lm_head_q4_resident_sampling_rejections,
             provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches,
             provider.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches,
@@ -4330,6 +4506,28 @@ fn writeJsonTiming(
         );
         const profile_json = try profile_out.toOwnedSlice(allocator);
         defer allocator.free(profile_json);
+        const prompt_lookup_json = try std.fmt.allocPrint(allocator,
+            \\"prompt_lookup_requested":{},
+            \\"prompt_lookup_enabled":{},
+            \\"prompt_lookup_attempts":{d},
+            \\"prompt_lookup_hits":{d},
+            \\"prompt_lookup_proposed":{d},
+            \\"prompt_lookup_matched":{d},
+            \\"prompt_lookup_target_passes":{d},
+            \\"prompt_lookup_target_rows":{d},
+            \\"prompt_lookup_rollback_tokens":{d},
+        , .{
+            stats.prompt_lookup_requested,
+            stats.prompt_lookup_enabled,
+            stats.prompt_lookup.lookup_attempts,
+            stats.prompt_lookup.lookup_hits,
+            stats.prompt_lookup.proposed_tokens,
+            stats.prompt_lookup.accepted_proposal_tokens,
+            stats.prompt_lookup.target_verify_passes,
+            stats.prompt_lookup.target_verify_rows,
+            stats.prompt_lookup.rollback_tokens,
+        });
+        defer allocator.free(prompt_lookup_json);
         break :blk try std.fmt.allocPrint(
             allocator,
             \\{{
@@ -4344,6 +4542,7 @@ fn writeJsonTiming(
             \\"corrections":{d},
             \\"bonus":{d},
             \\"adaptive_fallbacks":{d},
+            \\{s}
             \\"mtp_enabled":{},
             \\"mtp_graph_replay":"{s}",
             \\"mtp_acceptance_permille":{d},
@@ -4375,6 +4574,7 @@ fn writeJsonTiming(
                 stats.correction_tokens,
                 stats.bonus_tokens,
                 stats.adaptive_fallbacks,
+                prompt_lookup_json,
                 stats.mtp_enabled,
                 stats.mtp_graph_replay_status,
                 stats.acceptancePermille(),
@@ -5775,6 +5975,7 @@ fn writeJsonTiming(
         \\"backend":{f},
         \\"tokens":{d},
         \\"token_ids":{s},
+        \\"prompt_tokens":{d},
         \\"finish_reason":{f},
         \\"decode_tok_per_s":{d:.6},
         \\"timing_ms":{{
@@ -5790,6 +5991,8 @@ fn writeJsonTiming(
         \\"multimodal_prepare_inner":{d},
         \\"runtime_prepare_inner":{d},
         \\"prefill_inner":{d},
+        \\"maintenance_inner":{d},
+        \\"first_token_inner":{f},
         \\"decode_inner":{d},
         \\"text_decode_inner":{d},
         \\"total_inner":{d}
@@ -5810,6 +6013,7 @@ fn writeJsonTiming(
             std.json.fmt(backend_name, .{}),
             result.tokens_used,
             token_ids_json,
+            result.prompt_tokens,
             std.json.fmt(result.finish_reason, .{}),
             tokensPerSecond(result.tokens_used, decode_ms),
             load_model_ms,
@@ -5824,6 +6028,8 @@ fn writeJsonTiming(
             inner_timing.multimodal_prepare,
             inner_timing.runtime_prepare,
             inner_timing.prefill,
+            inner_timing.maintenance,
+            std.json.fmt(inner_timing.first_token, .{}),
             inner_timing.decode,
             inner_timing.text_decode,
             inner_timing.total,
@@ -6101,7 +6307,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d} q6_high_row_mm_matrix={d} lm_head_q4_q6_refine_dispatches={d} lm_head_q4_resident_sampling_rejections={d}\n",
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d} q6_high_row_mm_matrix={d} lm_head_q4_q6_refine_dispatches={d} lm_head_q6_full_argmax_dispatches={d} lm_head_q4_resident_sampling_rejections={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce,
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_1,
@@ -6120,6 +6326,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_f16_input,
             metal_snapshot.provider.metal_runtime_q6_k_high_row_mm_matrix_dispatches,
             metal_snapshot.provider.metal_runtime_lm_head_q4_q6_refine_dispatches,
+            metal_snapshot.provider.metal_runtime_lm_head_q6_full_argmax_dispatches,
             metal_snapshot.provider.metal_runtime_lm_head_q4_resident_sampling_rejections,
         },
     );
@@ -6401,6 +6608,49 @@ fn isPureGreedyConfig(config: generation.GenerationConfig) bool {
         config.presence_penalty == 0;
 }
 
+fn wholeModelPromptLookupStructuralEligible(
+    requested: bool,
+    live_whole_model_route: bool,
+    gpt_config: gpt_mod.Config,
+    config: generation.GenerationConfig,
+    diagnostic_logits: bool,
+    teacher_forcing: bool,
+) bool {
+    return requested and live_whole_model_route and
+        config.context_policy.mode == .exact and isPureGreedyConfig(config) and
+        config.grammar == null and config.token_observer == null and
+        gemma4_runtime.supportsPreparedDenseRuntimeConfig(gpt_config) and
+        !gemma4_runtime.isQualifiedA4bArchitecture(gpt_config) and
+        runtimeTokenDecodeEnabled() and
+        !envFlagEnabled("TERMITE_METAL_DISABLE_DECODER_RUNTIME_EXECUTOR") and
+        !diagnostic_logits and !teacher_forcing;
+}
+
+fn livePromptLookupEligible(
+    requested: bool,
+    runtime_supported: bool,
+    greedy_decode: bool,
+    diagnostic_host_logits: bool,
+    teacher_forcing: bool,
+    has_grammar_or_logprobs: bool,
+    allow_swa_ring: bool,
+) bool {
+    return requested and runtime_supported and greedy_decode and
+        !diagnostic_host_logits and !teacher_forcing and
+        !has_grammar_or_logprobs and !allow_swa_ring;
+}
+
+test "live prompt lookup admission fails closed for unsupported request modes" {
+    try std.testing.expect(livePromptLookupEligible(true, true, true, false, false, false, false));
+    try std.testing.expect(!livePromptLookupEligible(false, true, true, false, false, false, false));
+    try std.testing.expect(!livePromptLookupEligible(true, false, true, false, false, false, false));
+    try std.testing.expect(!livePromptLookupEligible(true, true, false, false, false, false, false));
+    try std.testing.expect(!livePromptLookupEligible(true, true, true, true, false, false, false));
+    try std.testing.expect(!livePromptLookupEligible(true, true, true, false, true, false, false));
+    try std.testing.expect(!livePromptLookupEligible(true, true, true, false, false, true, false));
+    try std.testing.expect(!livePromptLookupEligible(true, true, true, false, false, false, true));
+}
+
 fn liveWholeModelDeclineError(err: anyerror) bool {
     return switch (err) {
         error.UnsupportedOperation,
@@ -6525,6 +6775,33 @@ fn runLiveWholeModelExecutorReuseProbe(
     printLiveWholeModelExecutorDetails(&runtime_model);
 }
 
+fn liveWholeModelExecutorSupportsGenerationConfig(
+    config: generation.GenerationConfig,
+    request_suppress_token_ids: []const i32,
+    request_suppression_backend_supported: bool,
+) bool {
+    if (!config.fixed_length_mask_eos) return request_suppress_token_ids.len == 0;
+    return request_suppression_backend_supported and config.ignore_eos and config.max_tokens > 0 and
+        isPureGreedyConfig(config) and config.grammar == null and
+        !config.speculation_requested and config.draft_model == null and
+        request_suppress_token_ids.len > 0;
+}
+
+fn generationBudgetAllowsPipelineRearm(generated: usize, max_tokens: usize) bool {
+    return generated < max_tokens and max_tokens - generated > 1;
+}
+
+test "known generation budget disables only the terminal pipeline continuation" {
+    try std.testing.expect(generationBudgetAllowsPipelineRearm(0, 300));
+    try std.testing.expect(generationBudgetAllowsPipelineRearm(1, 300));
+    try std.testing.expect(generationBudgetAllowsPipelineRearm(298, 300));
+    try std.testing.expect(!generationBudgetAllowsPipelineRearm(299, 300));
+    try std.testing.expect(!generationBudgetAllowsPipelineRearm(1, 2));
+    try std.testing.expect(!generationBudgetAllowsPipelineRearm(0, 1));
+    try std.testing.expect(!generationBudgetAllowsPipelineRearm(0, 0));
+    try std.testing.expect(!generationBudgetAllowsPipelineRearm(std.math.maxInt(usize), std.math.maxInt(usize)));
+}
+
 fn tryRunLiveWholeModelExecutorGenerate(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -6540,7 +6817,15 @@ fn tryRunLiveWholeModelExecutorGenerate(
     started_at: std.Io.Timestamp,
     loaded_model_at: std.Io.Timestamp,
     encoded_prompt_at: std.Io.Timestamp,
+    e2b_f16_mirror_admission: ?ops.DecoderRuntimeE2bF16MirrorAdmission,
+    request_suppress_token_ids: []const i32,
 ) !bool {
+    if (config.context_policy.mode != .exact) return false;
+    if (!liveWholeModelExecutorSupportsGenerationConfig(
+        config,
+        request_suppress_token_ids,
+        model.session.backend() == .metal,
+    )) return false;
     if (!liveWholeModelExecutorRequested(opts, gpt_config)) return false;
     if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
     if (config.draft_model != null or config.speculation_requested) return false;
@@ -6574,32 +6859,69 @@ fn tryRunLiveWholeModelExecutorGenerate(
     // Passing the complete long-context prompt to prepare() would preplan and
     // reserve full-prompt Metal scratch before chunked execution begins.
     const prefill_chunk_size = liveWholeModelPrefillChunkSize(config, prompt_ids.len);
+    const prompt_lookup_requested = platform.env.getenvBool("ANTFLY_INFERENCE_PROMPT_LOOKUP");
+    const runtime_caps = runtime_model.capabilities();
+    const prompt_lookup_prepare = prompt_lookup_requested and
+        runtime_caps.supports_greedy_verify_transaction and
+        runtimeTokenDecodeEnabled() and
+        isPureGreedyConfig(config);
 
     var warmed_runtime_at = created_runtime_at;
     var runtime_prewarm_ms: u64 = 0;
+    const whole_model_backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .pjrt, .wasm => return false,
+    };
+    const bounded_ple_prepare_required = (try generation.boundedPleQ6RequestScratchBytes(
+        whole_model_backend_kind,
+        gpt_config,
+        platform.env.getenvBool("TERMITE_METAL_ENABLE_BOUNDED_PLE_Q6_ROWS"),
+        platform.env.getenvBool("TERMITE_METAL_DISABLE_BOUNDED_PLE_Q6_ROWS"),
+    )) != 0;
+    const mirror_prepare_required = whole_model_backend_kind == .metal and generation.gemmaF16MirrorPrepareRequested(
+        gpt_config,
+        e2b_f16_mirror_admission != null,
+    );
+    const request_prepare_required = bounded_ple_prepare_required or mirror_prepare_required;
+    const prepare_request: graph_mod.model_runtime.PrepareRequest = .{
+        .kv_tokens_hint = prefill_chunk_size,
+        // Greedy Metal owns and enforces a copy of request suppression across
+        // every pipeline arm and continuation. Prompt lookup remains
+        // transactional and cannot use speculative one-token lookahead.
+        .disable_pipelined_decode = prompt_lookup_prepare,
+        .e2b_f16_mirror_admission = e2b_f16_mirror_admission,
+    };
+    const bounded_ple_prefill_decode_handoff_required =
+        bounded_ple_prepare_required and
+        mirror_prepare_required and
+        try generation.boundedPleF16MirrorPhaseRequested(whole_model_backend_kind, gpt_config);
     if (build_options.enable_metal and
         gpt_config.family == .gemma and
         model.session.backend().usesGpuHostedSession() and
-        gemmaPrefillPrewarmEnabled())
+        (gemmaPrefillPrewarmEnabled() or
+            prompt_lookup_prepare or
+            request_prepare_required))
     {
         const prewarm_started_at = std.Io.Timestamp.now(io, .awake);
-        const prewarm_ok = runtime_model.prepare(allocator, .{
-            .kv_tokens_hint = prefill_chunk_size,
-        }) catch |err| blk: {
-            std.log.warn("Gemma4 Metal runtime prewarm failed for {s}: {s}", .{ opts.model_dir, @errorName(err) });
-            break :blk false;
-        };
+        const prewarm_ok = if (request_prepare_required)
+            try runtime_model.prepare(allocator, prepare_request)
+        else
+            runtime_model.prepare(allocator, prepare_request) catch |err| blk: {
+                std.log.warn("Gemma4 Metal runtime prewarm failed for {s}: {s}", .{ opts.model_dir, @errorName(err) });
+                break :blk false;
+            };
         warmed_runtime_at = std.Io.Timestamp.now(io, .awake);
         runtime_prewarm_ms = durationMillis(prewarm_started_at, warmed_runtime_at);
         if (!prewarm_ok) {
+            if (request_prepare_required) return error.RequiredCompiledRuntimePrepareDeclined;
             std.log.warn("Gemma4 Metal runtime prewarm declined for {s}", .{opts.model_dir});
         }
         if (opts.print_timing or opts.json_timing_path != null) {
             runtime_model.resetDebugTimingStats();
         }
     }
-    const runtime_caps = runtime_model.capabilities();
-
     var all_token_ids = std.ArrayListUnmanaged(i64).empty;
     defer all_token_ids.deinit(allocator);
     try all_token_ids.appendSlice(allocator, prompt_ids);
@@ -6636,7 +6958,8 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const diagnostic_host_logits = dump_generate_logits_path != null or teacher_force_token_ids != null;
     if (dump_generate_logits_path != null) {
         std.debug.print("generate_logits_suppress_token_ids:", .{});
-        for (gpt_config.suppressTokenIds()) |token_id| std.debug.print(" {d}", .{token_id});
+        for (if (request_suppress_token_ids.len > 0) request_suppress_token_ids else gpt_config.suppressTokenIds()) |token_id|
+            std.debug.print(" {d}", .{token_id});
         std.debug.print("\n", .{});
     }
     const use_runtime_token_decode = runtimeTokenDecodeEnabled() and !diagnostic_host_logits;
@@ -6644,6 +6967,47 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const use_sample_decode = use_runtime_token_decode and runtime_caps.supports_sample_decode and !use_greedy_decode;
     const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
     const allow_swa_ring = kv_capacity_policy == .split_swa_ring;
+    const prompt_lookup_enabled = livePromptLookupEligible(
+        prompt_lookup_requested,
+        runtime_caps.supports_greedy_verify_transaction,
+        use_greedy_decode,
+        diagnostic_host_logits,
+        teacher_force_token_ids != null,
+        config.grammar != null or config.token_observer != null,
+        allow_swa_ring,
+    ) and !config.fixed_length_mask_eos and wholeModelPromptLookupStructuralEligible(
+        prompt_lookup_requested,
+        true,
+        gpt_config,
+        config,
+        diagnostic_host_logits,
+        teacher_force_token_ids != null,
+    );
+    var prompt_lookup_stats = generation.SpeculativeDecodeStats{
+        .speculation_policy_decision = if (prompt_lookup_enabled) .active else .disabled_unavailable,
+        .prompt_lookup_requested = prompt_lookup_requested,
+        .prompt_lookup_enabled = prompt_lookup_enabled,
+    };
+    var prompt_lookup_proposer: ?*prompt_lookup.Proposer = null;
+    defer if (prompt_lookup_proposer) |proposer| {
+        allocator.destroy(proposer);
+    };
+    if (prompt_lookup_enabled) {
+        const proposer = try allocator.create(prompt_lookup.Proposer);
+        errdefer allocator.destroy(proposer);
+        proposer.* = try prompt_lookup.Proposer.init(.{ .max_draft = 1 });
+        prompt_lookup_proposer = proposer;
+    }
+    var eos_token_ids_buf: [gpt_mod.max_extra_eos_token_ids + 1]i32 = @splat(-1);
+    var eos_token_ids_len: usize = 0;
+    if (gpt_config.eos_token_id >= 0) {
+        eos_token_ids_buf[eos_token_ids_len] = gpt_config.eos_token_id;
+        eos_token_ids_len += 1;
+    }
+    for (gpt_config.extra_eos_token_ids[0..gpt_config.extra_eos_token_ids_len]) |eos_token_id| {
+        eos_token_ids_buf[eos_token_ids_len] = eos_token_id;
+        eos_token_ids_len += 1;
+    }
     const graph_stats_before_generate = graph_mod.executor_stats.snapshot();
     debugGenerateSetup("live prefill prompt_token_count={d}", .{prompt_ids.len});
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
@@ -6665,6 +7029,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 .kv_only = chunk_end < prompt_ids.len,
                 .force_host_logits = forcePrefillHostLogits(),
                 .prefer_greedy_token = prefer_prefill_greedy_token and chunk_end == prompt_ids.len,
+                .suppress_token_ids = if (chunk_end == prompt_ids.len) request_suppress_token_ids else &.{},
             }) catch |err| {
                 debugGenerateSetup("live whole-model prefill unavailable err={s}", .{@errorName(err)});
                 if (liveWholeModelDeclineError(err)) return false;
@@ -6676,13 +7041,59 @@ fn tryRunLiveWholeModelExecutorGenerate(
     };
     const finished_prefill_at = std.Io.Timestamp.now(io, .awake);
     defer output.deinit(allocator);
+    if (bounded_ple_prefill_decode_handoff_required and
+        !try runtime_model.finishPrefillForDecode(prepare_request))
+    {
+        return error.RequiredCompiledRuntimePrepareDeclined;
+    }
 
     var generated: usize = 0;
     var first_token_at: ?std.Io.Timestamp = null;
     while (generated < max_tokens) {
+        if (prompt_lookup_proposer) |proposer| prompt_lookup_round: {
+            // The first generated token comes from prefill. Every later round
+            // has exactly one logical pending token which q_len=2 verification
+            // materializes together with the proposed continuation.
+            if (generated == 0) break :prompt_lookup_round;
+            const remaining = max_tokens - generated;
+            var proposal_buf: [1]i64 = undefined;
+            const proposal = try proposer.propose(all_token_ids.items, remaining, &proposal_buf);
+            if (proposal.tokens.len == 0) break :prompt_lookup_round;
+            const verified = try runtime_model.verifyGreedyTransaction(allocator, .{
+                .pending_token_id = all_token_ids.items[all_token_ids.items.len - 1],
+                .proposal_token_id = proposal.tokens[0],
+                .position = all_token_ids.items.len - 1,
+                .suppress_token_ids = gpt_config.suppressTokenIds(),
+                .eos_token_ids = eos_token_ids_buf[0..eos_token_ids_len],
+                .ignore_eos = config.ignore_eos,
+                .accept_bonus = remaining > 1,
+            });
+            proposer.noteVerification(1, verified.matched_proposals, 2);
+            prompt_lookup_stats.rounds += 1;
+            prompt_lookup_stats.drafted_tokens += 1;
+            prompt_lookup_stats.matched_draft_tokens += verified.matched_proposals;
+            prompt_lookup_stats.accepted_tokens += verified.accepted_count;
+            prompt_lookup_stats.correction_tokens += @intFromBool(verified.correction_added);
+            prompt_lookup_stats.bonus_tokens += @intFromBool(verified.bonus_added);
+            prompt_lookup_stats.prompt_lookup = proposer.counters;
+            for (verified.accepted()) |accepted_token| {
+                if (generated >= max_tokens) return error.InvalidSpeculativeState;
+                try generated_token_ids.append(allocator, @intCast(accepted_token));
+                try all_token_ids.append(allocator, accepted_token);
+                generated += 1;
+            }
+            if (verified.hit_eos) {
+                finish_reason = "stop";
+                break;
+            }
+            if (generated >= max_tokens) break;
+            // Correction/bonus remains pending. A matched proposal is already
+            // materialized, so this continue prevents any q_len=1 replay.
+            continue;
+        }
         const sampled_token_i32: i32 = if (generated == 0) blk: {
             if (use_greedy_decode) {
-                break :blk @intCast(try output.greedyToken(allocator, gpt_config.vocab_size));
+                break :blk @intCast(try output.greedyTokenSuppress(allocator, gpt_config.vocab_size, request_suppress_token_ids));
             }
             const output_logits = try output.hostLogits(allocator);
             traceGenerateTopLogits("prefill", generated, output_logits);
@@ -6698,6 +7109,8 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 .token_id = all_token_ids.items[all_token_ids.items.len - 1],
                 .position = all_token_ids.items.len - 1,
                 .attention_mode = .paged_decode,
+                .suppress_token_ids = request_suppress_token_ids,
+                .allow_pipeline_rearm = generationBudgetAllowsPipelineRearm(generated, max_tokens),
             });
             break :blk @intCast(greedy.token_id);
         } else if (use_sample_decode) blk: {
@@ -6748,6 +7161,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         output.deinit(allocator);
         output = next_output;
     }
+    if (prompt_lookup_proposer) |proposer| prompt_lookup_stats.prompt_lookup = proposer.counters;
 
     const result_token_ids = try allocator.dupe(i32, generated_token_ids.items);
     defer allocator.free(result_token_ids);
@@ -7070,6 +7484,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
             .tokens_used = result_token_ids.len,
             .finish_reason = finish_reason,
             .timing_ms = live_timing,
+            .speculative = if (prompt_lookup_requested) prompt_lookup_stats else null,
             .allocator = allocator,
         };
         const metal_stats: ?ops.BackendDebugTimingSnapshot = if (comptime build_options.enable_metal) blk: {
@@ -7137,7 +7552,15 @@ fn generateWithOptionalStreaming(
     return result;
 }
 
-fn serverGenerateRequest(opts: Options, messages: []const api.ChatMessage) api.GenerateRequest {
+fn serverGenerateRequest(allocator: std.mem.Allocator, opts: Options, messages: []const api.ChatMessage) !api.GenerateRequest {
+    try validateContextExecutionMode(opts);
+    try validateRemoteMessageOptions(opts);
+    const targets: ?[]api.GenerateCompactionTarget = if (opts.context_policy_explicit and opts.context_policy.compaction_targets.count != 0) blk: {
+        const selected = opts.context_policy.compaction_targets.slice();
+        const wire = try allocator.alloc(api.GenerateCompactionTarget, selected.len);
+        for (selected, wire) |target, *entry| entry.* = .{ .message_index = target.message_index, .part_index = target.part_index };
+        break :blk wire;
+    } else null;
     const draft_requested = opts.draft_model != null;
     return .{
         .model = opts.model_dir,
@@ -7147,26 +7570,84 @@ fn serverGenerateRequest(opts: Options, messages: []const api.ChatMessage) api.G
         .top_p = opts.top_p,
         .top_k = opts.top_k,
         .ignore_eos = if (opts.ignore_eos) true else null,
+        .fixed_length_mask_eos = if (opts.fixed_length_mask_eos) true else null,
         .repetition_penalty = opts.repetition_penalty,
         .stream = if (opts.stream) true else null,
         .stream_options = if (opts.stream) .{ .include_usage = true } else null,
+        .chat_template_kwargs = if (opts.enable_thinking) |value| .{ .enable_thinking = value } else null,
         .draft_model = opts.draft_model,
         .speculative_k = if (draft_requested) opts.speculative_k else null,
         .speculation_policy = if (draft_requested) opts.speculation_policy.name() else null,
         .speculation_calibration = if (draft_requested) opts.speculation_calibration.name() else null,
         .cache_dtype = opts.cache_dtype,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
+        .prompt_cache = if (opts.native_kv_checkpoint != null) false else null,
+        .context_policy = if (opts.context_policy_explicit) .{
+            .mode = @tagName(opts.context_policy.mode),
+            .max_context_tokens = if (opts.context_policy.max_context_tokens) |v| v else null,
+            .max_kv_tokens = if (opts.context_policy.max_kv_tokens) |v| v else null,
+            .keep_prefix_tokens = opts.context_policy.keep_prefix_tokens,
+            .keep_recent_tokens = opts.context_policy.keep_recent_tokens,
+            .compaction_targets = targets,
+        } else null,
         .backend = generateBackendOverrideForChoice(opts.backend),
         .mode = serverGenerateModeName(opts),
         .compiled_target = serverGenerateCompiledTargetName(opts),
     };
 }
 
+fn freeServerGenerateTargets(allocator: std.mem.Allocator, request: api.GenerateRequest) void {
+    if (request.context_policy) |policy| if (policy.compaction_targets) |targets| allocator.free(targets);
+}
+
 fn serializeServerGenerateRequest(allocator: std.mem.Allocator, request: api.GenerateRequest) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, request, .{ .emit_null_optional_fields = false });
 }
 
+const ServerMessagesFile = struct {
+    allocator: std.mem.Allocator,
+    bytes: []u8,
+    parsed: std.json.Parsed([]api.ChatMessage),
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !ServerMessagesFile {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only, .allow_directory = false, .follow_symlinks = false });
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file or stat.size == 0 or stat.size > 2 * 1024 * 1024) return error.InvalidMessagesFile;
+        const bytes = try allocator.alloc(u8, @intCast(stat.size));
+        errdefer allocator.free(bytes);
+        if (try file.readPositionalAll(io, bytes, 0) != bytes.len or !std.unicode.utf8ValidateSlice(bytes)) return error.InvalidMessagesFile;
+        var parsed = try std.json.parseFromSlice([]api.ChatMessage, allocator, bytes, .{ .allocate = .alloc_always });
+        errdefer parsed.deinit();
+        if (parsed.value.len == 0) return error.InvalidMessagesFile;
+        return .{ .allocator = allocator, .bytes = bytes, .parsed = parsed };
+    }
+
+    fn deinit(self: *ServerMessagesFile) void {
+        self.parsed.deinit();
+        self.allocator.free(self.bytes);
+    }
+};
+
+fn validateRemoteMessageOptions(opts: Options) !void {
+    if (opts.messages_file) |path| {
+        if (path.len == 0 or !std.mem.eql(u8, opts.prompt, "-") or opts.context_document_file != null or
+            opts.context_question_file != null or opts.context_document != null or opts.context_question != null or
+            opts.image_count != 0 or opts.audio_count != 0 or opts.video_path != null)
+            return error.InvalidMessagesFileOptions;
+    }
+    if (opts.native_kv_checkpoint) |path| {
+        if (path.len == 0 or opts.max_tokens < 1 or opts.max_tokens > 256 or opts.context_policy_explicit or
+            opts.mode == .compiled or opts.compiled_target != null or opts.cache_compaction_ratio != null or
+            (opts.cache_dtype != null and !std.mem.eql(u8, opts.cache_dtype.?, "f16")) or
+            opts.draft_model != null or opts.image_count != 0 or opts.audio_count != 0 or opts.video_path != null or
+            opts.raw_prompt or opts.no_bos or opts.no_chat_template or opts.raw_decode_bench)
+            return error.UnsupportedNativeCheckpointCliOptions;
+    }
+}
+
 fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, quiet_errors: bool) !void {
+    try validateRemoteMessageOptions(opts);
     if (!serverGenerateSupportsOptions(opts)) {
         return error.UnsupportedServerGenerateOption;
     }
@@ -7176,28 +7657,59 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
     var http = httpx.Client.init(allocator, io_impl.io());
     defer http.deinit();
 
-    const url = try generateEndpointUrl(allocator, opts.server_url.?);
-    defer allocator.free(url);
+    const generate_url = try generateEndpointUrl(allocator, opts.server_url.?);
+    defer allocator.free(generate_url);
+    const url = if (opts.native_kv_checkpoint != null)
+        try std.fmt.allocPrint(allocator, "{s}/context/resume", .{generate_url})
+    else
+        generate_url;
+    defer if (opts.native_kv_checkpoint != null) allocator.free(url);
 
-    const messages = [_]api.ChatMessage{.{
-        .role = .user,
-        .content = .{ .string = opts.prompt },
-    }};
-    const request = serverGenerateRequest(opts, &messages);
+    var document_object: std.json.ObjectMap = .empty;
+    defer document_object.deinit(allocator);
+    var question_object: std.json.ObjectMap = .empty;
+    defer question_object.deinit(allocator);
+    var structured_parts = std.json.Array.init(allocator);
+    defer structured_parts.deinit();
+    const content: std.json.Value = if (opts.context_document) |document| blk: {
+        try document_object.put(allocator, "type", .{ .string = "text" });
+        try document_object.put(allocator, "text", .{ .string = document });
+        try question_object.put(allocator, "type", .{ .string = "text" });
+        try question_object.put(allocator, "text", .{ .string = opts.context_question.? });
+        try structured_parts.append(.{ .object = document_object });
+        try structured_parts.append(.{ .object = question_object });
+        break :blk .{ .array = structured_parts };
+    } else .{ .string = opts.prompt };
+    const messages = [_]api.ChatMessage{.{ .role = .user, .content = content }};
+    var file_messages: ?ServerMessagesFile = if (opts.messages_file) |path| try ServerMessagesFile.init(allocator, io, path) else null;
+    defer if (file_messages) |*value| value.deinit();
+    const request = try serverGenerateRequest(allocator, opts, if (file_messages) |value| value.parsed.value else &messages);
+    defer freeServerGenerateTargets(allocator, request);
     const body = try serializeServerGenerateRequest(allocator, request);
     defer allocator.free(body);
 
+    var native_upload: ?native_kv_upload.Upload = if (opts.native_kv_checkpoint) |path|
+        try native_kv_upload.Upload.init(allocator, io, path, body)
+    else
+        null;
+    defer if (native_upload) |*upload| upload.deinit();
     if (opts.stream) {
-        return try runServerGenerateStream(allocator, io, &http, url, body, opts, quiet_errors);
+        return try runServerGenerateStream(allocator, io, &http, url, body, opts, quiet_errors, if (native_upload) |*upload| upload else null);
     }
 
+    var native_response: native_kv_upload.JsonResponse = .{ .allocator = allocator };
+    defer native_response.deinit();
     const started_at = std.Io.Timestamp.now(io, .awake);
-    var resp = try http.post(url, .{ .json = body, .timeout_ms = 300_000 });
+    var resp = if (native_upload) |*upload|
+        try http.requestToWriter(.POST, url, upload.requestOptions(false), &native_response, null, null)
+    else
+        try http.post(url, .{ .json = body, .timeout_ms = 300_000 });
     defer resp.deinit();
     const finished_at = std.Io.Timestamp.now(io, .awake);
+    const response_payload: ?[]const u8 = if (native_upload != null) native_response.bytes.items else resp.body;
     if (!resp.ok()) {
         if (!quiet_errors) {
-            if (resp.body) |payload| {
+            if (response_payload) |payload| {
                 print("server_error status={d} body={s}\n", .{ resp.status.code, payload });
             } else {
                 print("server_error status={d}\n", .{resp.status.code});
@@ -7205,12 +7717,16 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
         }
         return error.GenerateRequestFailed;
     }
-    const payload = resp.body orelse return error.EmptyResponse;
+    const payload = response_payload orelse return error.EmptyResponse;
     var parsed = try std.json.parseFromSlice(api.GenerateResponse, allocator, payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const choice = if (parsed.value.choices.len > 0) parsed.value.choices[0] else return error.EmptyResponse;
 
-    print("{s}\n", .{choice.message.content.valueOrNull() orelse ""});
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    try stdout_writer.interface.writeAll(choice.message.content.valueOrNull() orelse "");
+    try stdout_writer.interface.writeByte('\n');
+    try stdout_writer.interface.flush();
     if (opts.print_finish_reason or opts.print_token_count) {
         if (opts.print_finish_reason) print("finish_reason={s}", .{@tagName(choice.finish_reason)});
         if (opts.print_token_count) {
@@ -7267,6 +7783,21 @@ pub const ServerGenerateSseWriter = struct {
     /// When set, streamed content deltas are also appended here so callers
     /// (chat) can retain the assistant reply for multi-turn history.
     capture: ?*std.ArrayListUnmanaged(u8) = null,
+    /// Exact public response sink. Diagnostics and reasoning never enter this
+    /// writer. A null sink preserves legacy callers that only inspect SSE
+    /// metadata or use `capture` for chat history.
+    public_output: ?*std.Io.Writer = null,
+
+    fn writePublic(self: *@This(), bytes: []const u8) !void {
+        if (self.public_output) |writer| {
+            try writer.writeAll(bytes);
+            // Preserve streaming visibility rather than buffering the first
+            // public bytes until process exit.
+            try writer.flush();
+        } else {
+            print("{s}", .{bytes});
+        }
+    }
 
     pub fn deinit(self: *@This()) void {
         self.buffer.deinit(self.allocator);
@@ -7332,7 +7863,7 @@ pub const ServerGenerateSseWriter = struct {
         if (parsed.value.usage.valueOrNull()) |usage| self.usage = usage;
         for (parsed.value.choices) |choice| {
             if (choice.delta.content.valueOrNull()) |content| {
-                print("{s}", .{content});
+                try self.writePublic(content);
                 if (self.capture) |capture| {
                     try capture.appendSlice(self.allocator, content);
                 }
@@ -7362,8 +7893,14 @@ fn runServerGenerateStream(
     body: []const u8,
     opts: Options,
     quiet_errors: bool,
+    native_upload: ?*native_kv_upload.Upload,
 ) !void {
-    var stream_writer = ServerGenerateSseWriter{ .allocator = allocator };
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    var stream_writer = ServerGenerateSseWriter{
+        .allocator = allocator,
+        .public_output = &stdout_writer.interface,
+    };
     defer stream_writer.deinit();
 
     const headers = [_][2][]const u8{
@@ -7371,11 +7908,11 @@ fn runServerGenerateStream(
     };
 
     const started_at = std.Io.Timestamp.now(io, .awake);
-    var resp = try http.requestToWriter(.POST, url, .{
-        .json = body,
-        .headers = &headers,
-        .timeout_ms = 300_000,
-    }, &stream_writer, null, null);
+    const request_options: httpx.RequestOptions = if (native_upload) |upload|
+        upload.requestOptions(true)
+    else
+        .{ .json = body, .headers = &headers, .timeout_ms = 300_000 };
+    var resp = try http.requestToWriter(.POST, url, request_options, &stream_writer, null, null);
     defer resp.deinit();
     const finished_at = std.Io.Timestamp.now(io, .awake);
 
@@ -7392,7 +7929,7 @@ fn runServerGenerateStream(
     try stream_writer.finish();
     if (stream_writer.stream_error) return error.GenerateRequestFailed;
 
-    print("\n", .{});
+    try stream_writer.writePublic("\n");
     if (opts.print_finish_reason or opts.print_token_count) {
         const finish_reason = if (stream_writer.finish_reason) |reason| @tagName(reason) else "unknown";
         const completion_tokens = if (stream_writer.usage) |usage|
@@ -7428,7 +7965,8 @@ fn runServerGenerateStream(
 }
 
 fn requireWarmServer(opts: Options) bool {
-    return opts.require_server or platform.env.getenvBool("ANTFLY_INFERENCE_REQUIRE_WARM_SERVER");
+    return opts.require_server or opts.messages_file != null or opts.native_kv_checkpoint != null or
+        platform.env.getenvBool("ANTFLY_INFERENCE_REQUIRE_WARM_SERVER");
 }
 
 fn defaultServerModelName(model_dir: []const u8) ?[]const u8 {
@@ -7481,13 +8019,25 @@ fn compiledTargetName(target: CompiledTarget) []const u8 {
     };
 }
 
+fn validateContextExecutionMode(opts: Options) !void {
+    // Rolling and attention-matching contexts are owned by the eager paged or
+    // packed KV pipeline. A compiled request cannot silently bypass that owner.
+    if (opts.context_policy.mode != .exact and
+        (opts.mode == .compiled or opts.compiled_target != null))
+        return error.UnsupportedContextCombination;
+}
+
 fn serverGenerateModeName(opts: Options) ?[]const u8 {
+    if (opts.native_kv_checkpoint != null) return "eager";
     if (opts.mode) |mode| return @tagName(mode);
+    if (opts.context_policy.mode != .exact) return @tagName(ExecutionMode.eager);
     if (opts.backend == .metal) return @tagName(ExecutionMode.compiled);
     return null;
 }
 
 fn serverGenerateCompiledTargetName(opts: Options) ?[]const u8 {
+    if (opts.native_kv_checkpoint != null) return null;
+    if (opts.context_policy.mode != .exact) return null;
     if (opts.compiled_target) |target| return compiledTargetName(target);
     if (opts.backend == .metal and (opts.mode == null or opts.mode.? != .eager)) return compiledTargetName(.whole_model);
     return null;
@@ -7621,6 +8171,17 @@ fn parseArgs(args: []const []const u8) !Options {
             if (i >= args.len) return error.MissingVideoPath;
             if (opts.video_path != null) return error.VideoLimitExceeded;
             opts.video_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--context-document-file") or
+            std.mem.eql(u8, arg, "--context-question-file") or
+            std.mem.eql(u8, arg, "--context-document-sha256") or
+            std.mem.eql(u8, arg, "--context-question-sha256"))
+        {
+            i += 1;
+            if (i >= args.len) return error.InvalidStructuredCliInput;
+            if (std.mem.eql(u8, arg, "--context-document-file")) opts.context_document_file = args[i];
+            if (std.mem.eql(u8, arg, "--context-question-file")) opts.context_question_file = args[i];
+            if (std.mem.eql(u8, arg, "--context-document-sha256")) opts.context_document_sha256 = args[i];
+            if (std.mem.eql(u8, arg, "--context-question-sha256")) opts.context_question_sha256 = args[i];
         } else if (std.mem.eql(u8, arg, "--image")) {
             i += 1;
             if (i >= args.len) return error.MissingImagePath;
@@ -7729,10 +8290,32 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.raw_decode_bench = true;
         } else if (std.mem.eql(u8, arg, "--ignore-eos")) {
             opts.ignore_eos = true;
+        } else if (std.mem.eql(u8, arg, "--fixed-length-mask-eos")) {
+            opts.fixed_length_mask_eos = true;
         } else if (std.mem.eql(u8, arg, "--cache-dtype")) {
             i += 1;
             if (i >= args.len) return error.MissingCacheDtype;
             opts.cache_dtype = args[i];
+        } else if (std.mem.eql(u8, arg, "--context-mode")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidContextPolicy;
+            opts.context_policy.mode = std.meta.stringToEnum(runtime.context_policy.Mode, args[i]) orelse return error.InvalidContextPolicy;
+            opts.context_policy_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--compact-part")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidCompactionTarget;
+            try opts.context_policy.compaction_targets.parse(args[i]);
+            opts.context_policy_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--context-window") or
+            std.mem.eql(u8, arg, "--max-kv-tokens") or
+            std.mem.eql(u8, arg, "--keep-prefix-tokens") or
+            std.mem.eql(u8, arg, "--keep-recent-tokens"))
+        {
+            i += 1;
+            if (i >= args.len) return error.InvalidContextPolicy;
+            const value = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidContextPolicy;
+            if (std.mem.eql(u8, arg, "--context-window")) opts.context_policy.max_context_tokens = value else if (std.mem.eql(u8, arg, "--max-kv-tokens")) opts.context_policy.max_kv_tokens = value else if (std.mem.eql(u8, arg, "--keep-prefix-tokens")) opts.context_policy.keep_prefix_tokens = value else opts.context_policy.keep_recent_tokens = value;
+            opts.context_policy_explicit = true;
         } else if (std.mem.eql(u8, arg, "--cache-compaction-ratio")) {
             i += 1;
             if (i >= args.len) return error.MissingCacheCompactionRatio;
@@ -7797,6 +8380,16 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingServerUrl;
             opts.server_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--messages-file") or std.mem.eql(u8, arg, "--kv-checkpoint")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) return error.InvalidArguments;
+            if (std.mem.eql(u8, arg, "--messages-file")) {
+                if (opts.messages_file != null) return error.InvalidArguments;
+                opts.messages_file = args[i];
+            } else {
+                if (opts.native_kv_checkpoint != null) return error.InvalidArguments;
+                opts.native_kv_checkpoint = args[i];
+            }
         } else if (std.mem.eql(u8, arg, "--require-server")) {
             opts.require_server = true;
         } else {
@@ -7805,6 +8398,10 @@ fn parseArgs(args: []const []const u8) !Options {
         }
     }
 
+    try opts.context_policy.validate();
+    try validateRemoteMessageOptions(opts);
+    if (opts.context_policy_explicit and opts.cache_compaction_ratio != null) return error.InvalidContextPolicy;
+    if (opts.cache_compaction_ratio == 1) opts.cache_compaction_ratio = null;
     return opts;
 }
 
@@ -8391,11 +8988,17 @@ test "video CLI accepts one clip and rejects conflicting inputs" {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt|--prompt-file path> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--video clip] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt|--prompt-file path> [--server http://host:port] [--require-server] [--stream] [--messages-file path] [--kv-checkpoint path] [--image path]... [--audio path] [--video clip] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--context-mode exact|rolling|attention_matching] [--context-window N] [--max-kv-tokens N] [--keep-prefix-tokens N] [--keep-recent-tokens N] [--compact-part MESSAGE:PART]... [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --prompt-file reads up to 16 MiB of text, supporting prompts beyond process argument limits.
         \\  --stream prints generated text incrementally as token deltas arrive.
+        \\  --messages-file reads a JSON message array with prompt '-' and requires a warm server.
+        \\  --kv-checkpoint resumes an existing native KV checkpoint on the warm server in eager mode.
+        \\  --video accepts one progressive 8-bit H.264 MP4 clip on local CUDA Gemma4 (up to 60s, sampled at 1 FPS).
+        \\  Video currently excludes audio, mixed image inputs, HDR, rotation, and non-square pixels.
+        \\  Sealed attention-matching CLI input requires prompt '-' plus --context-document-file,
+        \\  --context-document-sha256, --context-question-file, and --context-question-sha256.
         \\  --video accepts one clip with a Gemma 4 vision projector. Sampling targets 1 FPS, up to 32 frames.
         \\  CUDA uses NVDEC for supported H.264, HEVC and AV1 MP4. Portable decoding supports H.264, AV1, VP8, VP9 and MJPEG. HEVC requires NVDEC or VideoToolbox. Video may be combined with text.
         \\  --require-server or ANTFLY_INFERENCE_REQUIRE_WARM_SERVER=1 fails unless a server URL is configured.
@@ -8704,6 +9307,7 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_1 = 3;
     snapshot.provider.metal_runtime_q6_k_high_row_mm_matrix_dispatches = 7;
     snapshot.provider.metal_runtime_lm_head_q4_q6_refine_dispatches = 7;
+    snapshot.provider.metal_runtime_lm_head_q6_full_argmax_dispatches = 11;
     snapshot.provider.metal_runtime_lm_head_q4_resident_sampling_rejections = 2;
 
     const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
@@ -8720,6 +9324,7 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     try std.testing.expectEqual(@as(i64, 7), k_quant.get("q6_high_row_mm_matrix").?.integer);
     const refine = parsed.value.object.get("lm_head_q4_q6_refine").?.object;
     try std.testing.expectEqual(@as(i64, 7), refine.get("dispatches").?.integer);
+    try std.testing.expectEqual(@as(i64, 11), refine.get("full_q6_argmax_dispatches").?.integer);
     try std.testing.expectEqual(@as(i64, 2), refine.get("resident_sampling_rejections").?.integer);
 
     const plan = parsed.value.object.get("quant_kernel_plan").?.object;
@@ -8833,6 +9438,8 @@ test "draft KV backend follows the loaded draft session" {
 
 test "generate CLI rejects unsupported cache compaction before model loading" {
     try validateCacheCompactionOption(null);
+    try validateCacheCompactionOption(1);
+    try std.testing.expectEqual(@as(?f32, null), (try parseArgs(&.{ "m", "p", "--cache-compaction-ratio", "1" })).cache_compaction_ratio);
     try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionOption(0.0));
     try std.testing.expectError(error.KvStorageCompactionNotSupported, validateCacheCompactionOption(0.5));
 }
@@ -9299,29 +9906,34 @@ test "server generate rejects unsupported server options" {
     }));
 }
 
-test "server generate forwards only explicit ignore eos" {
+test "server generate forwards only explicit EOS controls" {
     const messages = [_]api.ChatMessage{.{
         .role = .user,
         .content = .{ .string = "hello" },
     }};
-    const defaults = serverGenerateRequest(.{
+    const defaults = try serverGenerateRequest(std.testing.allocator, .{
         .model_dir = "gemma-e2b",
         .prompt = "hello",
         .backend = .cuda,
     }, &messages);
+    defer freeServerGenerateTargets(std.testing.allocator, defaults);
     const default_body = try serializeServerGenerateRequest(std.testing.allocator, defaults);
     defer std.testing.allocator.free(default_body);
     try std.testing.expect(std.mem.indexOf(u8, default_body, "\"ignore_eos\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, default_body, "\"fixed_length_mask_eos\"") == null);
 
-    const controlled = serverGenerateRequest(.{
+    const controlled = try serverGenerateRequest(std.testing.allocator, .{
         .model_dir = "gemma-e2b",
         .prompt = "hello",
         .backend = .cuda,
         .ignore_eos = true,
+        .fixed_length_mask_eos = true,
     }, &messages);
+    defer freeServerGenerateTargets(std.testing.allocator, controlled);
     const controlled_body = try serializeServerGenerateRequest(std.testing.allocator, controlled);
     defer std.testing.allocator.free(controlled_body);
     try std.testing.expect(std.mem.indexOf(u8, controlled_body, "\"ignore_eos\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, controlled_body, "\"fixed_length_mask_eos\":true") != null);
 }
 
 test "server generate stream requests terminal usage accounting" {
@@ -9329,12 +9941,13 @@ test "server generate stream requests terminal usage accounting" {
         .role = .user,
         .content = .{ .string = "hello" },
     }};
-    const request = serverGenerateRequest(.{
+    const request = try serverGenerateRequest(std.testing.allocator, .{
         .model_dir = "gemma-e2b",
         .prompt = "hello",
         .backend = .cuda,
         .stream = true,
     }, &messages);
+    defer freeServerGenerateTargets(std.testing.allocator, request);
     const body = try serializeServerGenerateRequest(std.testing.allocator, request);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream_options\":{\"include_usage\":true}") != null);
@@ -9356,7 +9969,8 @@ test "server generate forwards supported speculation options" {
         .role = .user,
         .content = .{ .string = opts.prompt },
     }};
-    const request = serverGenerateRequest(opts, &messages);
+    const request = try serverGenerateRequest(std.testing.allocator, opts, &messages);
+    defer freeServerGenerateTargets(std.testing.allocator, request);
     const body = try serializeServerGenerateRequest(std.testing.allocator, request);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"draft_model\":\"gemma-e2b-mtp\"") != null);
@@ -9384,6 +9998,57 @@ test "server generate stream retains final speculation status" {
     try std.testing.expectEqual(@as(i64, 300), writer.usage.?.completion_tokens);
 }
 
+test "server generate stream writes only fragmented public content to injected sink" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var writer = ServerGenerateSseWriter{
+        .allocator = std.testing.allocator,
+        .public_output = &output.writer,
+    };
+    defer writer.deinit();
+    try writer.writeAll(
+        "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gemma-e2b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pub",
+    );
+    try writer.writeAll(
+        "lic\"}}]}\n\ndata: {\"id\":\"chunk-2\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gemma-e2b\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"private\"}}]}\n\n",
+    );
+    try writer.writeAll(
+        "data: {\"id\":\"chunk-3\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gemma-e2b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+    );
+    try writer.finish();
+    try writer.writePublic("\n");
+    try std.testing.expectEqualStrings("public answer\n", output.writer.buffered());
+}
+
+test "server generate stream errors never enter injected public sink" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var writer = ServerGenerateSseWriter{
+        .allocator = std.testing.allocator,
+        .public_output = &output.writer,
+    };
+    defer writer.deinit();
+    try writer.writeAll("event: error\ndata: server failure\n\n");
+    try writer.finish();
+    try std.testing.expect(writer.stream_error);
+    try std.testing.expectEqual(@as(usize, 0), output.writer.buffered().len);
+}
+
+test "server generate stream propagates injected public sink failures" {
+    var output = std.Io.Writer.fixed(&.{});
+    var writer = ServerGenerateSseWriter{
+        .allocator = std.testing.allocator,
+        .public_output = &output,
+    };
+    defer writer.deinit();
+    try std.testing.expectError(
+        error.WriteFailed,
+        writer.writeAll(
+            "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gemma-e2b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"public\"}}]}\n\n",
+        ),
+    );
+}
+
 test "server model name strips local models dir prefix" {
     try std.testing.expectEqualStrings(
         "ggml-org/gemma-4-e2b-it-gguf",
@@ -9408,6 +10073,32 @@ test "only explicit prepared A4B may route compiled whole model through live exe
     };
     try std.testing.expect(!liveWholeModelExecutorRequestedForPreparedA4b(&opts, false));
     try std.testing.expect(liveWholeModelExecutorRequestedForPreparedA4b(&opts, true));
+}
+
+test "fixed length EOS masking admits only request-mask-aware live route" {
+    try std.testing.expect(liveWholeModelExecutorSupportsGenerationConfig(.{}, &.{}, false));
+    try std.testing.expect(!liveWholeModelExecutorSupportsGenerationConfig(.{}, &.{7}, true));
+    try std.testing.expect(liveWholeModelExecutorSupportsGenerationConfig(.{
+        .ignore_eos = true,
+        .fixed_length_mask_eos = true,
+        .max_tokens = 300,
+    }, &.{ 1, 50, 106 }, true));
+    try std.testing.expect(!liveWholeModelExecutorSupportsGenerationConfig(.{
+        .ignore_eos = true,
+        .fixed_length_mask_eos = true,
+        .max_tokens = 300,
+    }, &.{ 1, 50, 106 }, false));
+    try std.testing.expect(!liveWholeModelExecutorSupportsGenerationConfig(.{
+        .ignore_eos = true,
+        .fixed_length_mask_eos = true,
+        .max_tokens = 300,
+    }, &.{}, true));
+    try std.testing.expect(!liveWholeModelExecutorSupportsGenerationConfig(.{
+        .ignore_eos = true,
+        .fixed_length_mask_eos = true,
+        .max_tokens = 300,
+        .temperature = 0.5,
+    }, &.{ 1, 50, 106 }, true));
 }
 
 test "live whole-model route uses the shared KV capacity policy" {
@@ -9555,6 +10246,143 @@ test "cuda gemma prefill prewarm defaults on with bidirectional env overrides" {
     try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM"));
     try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM", "1", 1));
     try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+}
+
+test "context CLI policy roundtrips through server requests" {
+    const opts = try parseArgs(&.{ "gemma-e2b", "hello", "--context-window", "8192", "--max-kv-tokens", "4096" });
+    try std.testing.expect(opts.context_policy_explicit);
+    const body = try serverGenerateRequest(std.testing.allocator, opts, &.{});
+    defer freeServerGenerateTargets(std.testing.allocator, body);
+    const policy = try runtime.context_policy.fromApi(body.context_policy);
+    try std.testing.expectEqual(opts.context_policy, policy);
+    try std.testing.expectError(error.InvalidContextPolicy, parseArgs(&.{ "m", "p", "--context-window", "0" }));
+    try std.testing.expectError(error.InvalidContextPolicy, parseArgs(&.{ "m", "p", "--context-mode", "unknown" }));
+    try std.testing.expectError(error.InvalidContextPolicy, parseArgs(&.{ "m", "p", "--context-window", "4096", "--cache-compaction-ratio", "0.5" }));
+}
+
+test "context CLI remote attention matching stays eager and preserves template controls" {
+    const a = std.testing.allocator;
+    const opts = try parseArgs(&.{
+        "gemma-e2b",      "hello",              "--backend",        "metal", "--disable-thinking",
+        "--context-mode", "attention_matching", "--context-window", "8192",  "--max-kv-tokens",
+        "4096",           "--compact-part",     "0:0",
+    });
+    for ([_]BackendChoice{ .auto, .metal }) |backend| {
+        var selected = opts;
+        selected.backend = backend;
+        const features = contextRequestFeatures(selected);
+        try runtime.context_policy.validateRequestFeatures(selected.context_policy, features);
+        try std.testing.expectError(
+            error.ContextPolicyNotQualified,
+            runtime.context_policy.validateExecution(selected.context_policy, features, .{}),
+        );
+    }
+    var native = opts;
+    native.backend = .native;
+    try std.testing.expectError(error.UnsupportedContextCombination, runtime.context_policy.validateRequestFeatures(
+        native.context_policy,
+        contextRequestFeatures(native),
+    ));
+    const body = try serverGenerateRequest(a, opts, &.{});
+    defer freeServerGenerateTargets(a, body);
+    try std.testing.expectEqualStrings("eager", body.mode.?);
+    try std.testing.expect(body.compiled_target == null);
+    try std.testing.expectEqual(false, body.chat_template_kwargs.?.enable_thinking.?);
+
+    var enabled = opts;
+    enabled.enable_thinking = true;
+    const thinking = try serverGenerateRequest(a, enabled, &.{});
+    defer freeServerGenerateTargets(a, thinking);
+    try std.testing.expectEqual(true, thinking.chat_template_kwargs.?.enable_thinking.?);
+    var omitted = opts;
+    omitted.enable_thinking = null;
+    const defaults = try serverGenerateRequest(a, omitted, &.{});
+    defer freeServerGenerateTargets(a, defaults);
+    try std.testing.expect(defaults.chat_template_kwargs == null);
+
+    var explicit_compiled = opts;
+    explicit_compiled.mode = .compiled;
+    try std.testing.expectError(
+        error.UnsupportedContextCombination,
+        serverGenerateRequest(a, explicit_compiled, &.{}),
+    );
+    var explicit_target = opts;
+    explicit_target.context_policy.mode = .rolling;
+    explicit_target.compiled_target = .whole_model;
+    try std.testing.expectError(
+        error.UnsupportedContextCombination,
+        serverGenerateRequest(a, explicit_target, &.{}),
+    );
+}
+
+test "context CLI selected payloads roundtrip without retaining stack storage" {
+    const a = std.testing.allocator;
+    const opts = try parseArgs(&.{ "gemma-e2b", "hello", "--context-mode", "attention_matching", "--max-kv-tokens", "4096", "--compact-part", "1:0", "--compact-part", "3:2" });
+    const body = try serverGenerateRequest(a, opts, &.{});
+    defer freeServerGenerateTargets(a, body);
+    const policy = try runtime.context_policy.fromApi(body.context_policy);
+    try std.testing.expectEqual(opts.context_policy, policy);
+    const json = try serializeServerGenerateRequest(a, body);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compaction_targets\":[{\"message_index\":1,\"part_index\":0}") != null);
+    try std.testing.expectError(error.InvalidCompactionTarget, parseArgs(&.{ "m", "p", "--compact-part", "0:0" }));
+}
+
+test "context structured CLI requires complete sealed two-part input" {
+    var opts = Options{ .model_dir = "model", .prompt = "-" };
+    opts.context_document_file = "document.txt";
+    try std.testing.expectError(
+        error.InvalidStructuredCliInput,
+        loadStructuredCliInput(std.testing.allocator, std.testing.io, opts),
+    );
+    try std.testing.expectError(
+        error.InvalidStructuredCliInputDigest,
+        parseDigest32("not-a-sha256"),
+    );
+}
+
+test "context structured CLI rejects video before opening sealed text inputs" {
+    const digest = "0000000000000000000000000000000000000000000000000000000000000000";
+    const opts = try parseArgs(&.{
+        "model",                   "-",                  "--video",                   "clip.mp4",
+        "--context-mode",          "attention_matching", "--context-window",          "8192",
+        "--max-kv-tokens",         "4096",               "--compact-part",            "0:0",
+        "--context-document-file", "missing-document",   "--context-document-sha256", digest,
+        "--context-question-file", "missing-question",   "--context-question-sha256", digest,
+    });
+    try std.testing.expectError(
+        error.InvalidStructuredCliInput,
+        loadStructuredCliInput(std.testing.allocator, std.testing.io, opts),
+    );
+}
+
+test "context CLI native checkpoint preserves remote controls and excludes conflicting execution" {
+    const opts = try parseArgs(&.{ "gemma-e2b", "-", "--server", "http://127.0.0.1:8090", "--backend", "metal", "--messages-file", "messages.json", "--kv-checkpoint", "saved.kv", "--stream", "--max-tokens", "64", "--temperature", "0" });
+    try std.testing.expectEqualStrings("messages.json", opts.messages_file.?);
+    try std.testing.expectEqualStrings("saved.kv", opts.native_kv_checkpoint.?);
+    try std.testing.expect(requireWarmServer(opts));
+    try std.testing.expectEqualStrings("eager", serverGenerateModeName(opts).?);
+    try std.testing.expect(serverGenerateCompiledTargetName(opts) == null);
+    const messages = [_]api.ChatMessage{.{ .role = .user, .content = .{ .string = "consumed" } }};
+    const request = try serverGenerateRequest(std.testing.allocator, opts, &messages);
+    defer freeServerGenerateTargets(std.testing.allocator, request);
+    try std.testing.expectEqual(@as(?bool, false), request.prompt_cache);
+    try std.testing.expectEqual(@as(?f32, 0), request.temperature);
+    try std.testing.expectEqual(@as(?i64, 64), request.max_tokens);
+    try std.testing.expect(request.context_policy == null);
+    var changed = opts;
+    changed.mode = .compiled;
+    try std.testing.expectError(error.UnsupportedNativeCheckpointCliOptions, validateRemoteMessageOptions(changed));
+    changed = opts;
+    changed.context_policy_explicit = true;
+    try std.testing.expectError(error.UnsupportedNativeCheckpointCliOptions, validateRemoteMessageOptions(changed));
+    changed = opts;
+    changed.max_tokens = 257;
+    try std.testing.expectError(error.UnsupportedNativeCheckpointCliOptions, validateRemoteMessageOptions(changed));
+    changed = opts;
+    changed.prompt = "silently ignored prompt";
+    try std.testing.expectError(error.InvalidMessagesFileOptions, validateRemoteMessageOptions(changed));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "model", "-", "--kv-checkpoint", "a", "--kv-checkpoint", "b" }));
 }
 
 test "native generation raw budget overrides preserve omitted composite and scratch provenance" {

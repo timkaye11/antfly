@@ -207,13 +207,19 @@ def verify(root, inventory):
         file = path(output)
         data = file.read_bytes()
         queue.append(file)
-        if entries[0]["owner"] == "generated_file":
+        if entries[0]["owner"] in ("generated_file", "native_source"):
             if len(entries) != 1:
                 raise ValueError("whole-file and region ownership overlap")
             entry = entries[0]
             if fingerprint(data) != {k: entry[k] for k in ("bytes", "sha256")}:
                 raise ValueError("stale generated file: " + output)
-            verified.add((output, "generated_file", entry["family_region"]))
+            if entry["owner"] == "native_source":
+                if not output.startswith("src/tile/families/native/") or output not in source_inputs:
+                    raise ValueError("native source owner absent from canonical build inputs")
+                if source_regions(data):
+                    raise ValueError("whole-file and region ownership overlap")
+                canonical.append({"output": output, "classification": "canonical_native_source", **fingerprint(data)})
+            verified.add((output, entry["owner"], entry["family_region"]))
             continue
         cursor, surrounds = 0, []
         for generator, label, start, end, body in source_regions(data):

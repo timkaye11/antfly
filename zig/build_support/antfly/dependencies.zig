@@ -1199,13 +1199,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     inference_types_mod.addImport("antfly_generating", generating_mod);
-    const inference_work_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/inference/src/host/work.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    inference_work_mod.addImport("antfly_scraping", scraping_mod);
-    inference_work_mod.addImport("antfly_image", image_mod);
+    const inference_work_mod = readers_mod.import_table.get("antfly_inference_work").?;
     const inference_worker_wire_mod = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/host/worker_wire.zig"),
         .target = target,

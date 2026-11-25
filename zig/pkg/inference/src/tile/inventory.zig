@@ -17,7 +17,7 @@
 const std = @import("std");
 const Region = @import("region.zig").Region;
 const schedules = @import("q4_q8_schedule.zig");
-pub const Entry = struct { family_region: []const u8, output: []const u8, bytes: usize, sha256: []const u8, owner: enum { tile_region, quant_region, generated_file }, programs: []const @import("region.zig").ProgramUse = &.{}, algorithm_sharing: enum { unclassified, shared_phases, shared_body } = .unclassified };
+pub const Entry = struct { family_region: []const u8, output: []const u8, bytes: usize, sha256: []const u8, owner: enum { tile_region, quant_region, generated_file, native_source }, programs: []const @import("region.zig").ProgramUse = &.{}, algorithm_sharing: enum { unclassified, shared_phases, shared_body } = .unclassified };
 const Row = struct { schedule: schedules.Schedule, threads: usize, static_shared_bytes: usize, abi: []const u8 };
 
 pub fn render(allocator: std.mem.Allocator, regions: []const Region, extra: []const Entry) ![]u8 {
@@ -27,12 +27,15 @@ pub fn render(allocator: std.mem.Allocator, regions: []const Region, extra: []co
     defer for (entries[0..initialized]) |entry| allocator.free(entry.sha256);
     for (regions, entries[0..regions.len]) |region, *entry| {
         const prefix = "// tile-codegen:begin ";
-        const begin = (std.mem.indexOf(u8, region.begin, prefix) orelse return error.InvalidRegion) + prefix.len;
-        const end = std.mem.indexOfPos(u8, region.begin, begin, " family") orelse return error.InvalidRegion;
+        const name = if (region.native_source) region.family else name: {
+            const begin = (std.mem.indexOf(u8, region.begin, prefix) orelse return error.InvalidRegion) + prefix.len;
+            const end = std.mem.indexOfPos(u8, region.begin, begin, " family") orelse return error.InvalidRegion;
+            break :name region.begin[begin..end];
+        };
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(region.data, &digest, .{});
         const hex = std.fmt.bytesToHex(digest, .lower);
-        entry.* = .{ .family_region = region.begin[begin..end], .output = region.path, .bytes = region.data.len, .sha256 = try allocator.dupe(u8, &hex), .owner = .tile_region, .programs = region.programs };
+        entry.* = .{ .family_region = name, .output = region.path, .bytes = region.data.len, .sha256 = try allocator.dupe(u8, &hex), .owner = if (region.native_source) .native_source else .tile_region, .programs = region.programs };
         for (region.programs) |use| {
             if (entry.algorithm_sharing != .shared_body) entry.algorithm_sharing = if (use.scope == .body) .shared_body else .shared_phases;
         }
@@ -53,14 +56,20 @@ pub fn render(allocator: std.mem.Allocator, regions: []const Region, extra: []co
 }
 
 fn checkInventory(allocator: std.mem.Allocator) !void {
-    const data = try render(allocator, &.{.{ .path = "fixture.cu", .begin = "// tile-codegen:begin fixture.0 family", .end = "unused", .data = "abc" }}, &.{});
+    const data = try render(allocator, &.{
+        .{ .path = "fixture.cu", .begin = "// tile-codegen:begin fixture.0 family", .end = "unused", .data = "abc" },
+        .{ .path = "attention.metal", .begin = "", .end = "", .data = "abc", .native_source = true, .family = "attention.segmented" },
+    }, &.{});
     defer allocator.free(data);
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
     const entries = parsed.value.object.get("native_regions").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
     try std.testing.expectEqualStrings("fixture.0", entries[0].object.get("family_region").?.string);
     try std.testing.expectEqualStrings("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", entries[0].object.get("sha256").?.string);
+    try std.testing.expectEqualStrings("native_source", entries[1].object.get("owner").?.string);
+    try std.testing.expectEqualStrings("attention.segmented", entries[1].object.get("family_region").?.string);
+    try std.testing.expectEqualStrings("unclassified", entries[1].object.get("algorithm_sharing").?.string);
     const rows = parsed.value.object.get("q4_q8_rows").?.array.items;
     try std.testing.expectEqual(@as(i64, 512), rows[3].object.get("static_shared_bytes").?.integer);
 }

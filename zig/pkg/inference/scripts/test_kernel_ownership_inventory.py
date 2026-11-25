@@ -27,6 +27,36 @@ spec.loader.exec_module(ownership)
 
 
 class OwnershipInventoryTest(unittest.TestCase):
+    def test_complete_native_source_requires_build_identity_and_exact_bytes(self):
+        name = "src/tile/families/native/metal/attention_segmented.metal"
+        source = self.package / name
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"#include <metal_stdlib>\nkernel void attention() {}\n")
+        entry = {"output": name, "family_region": "attention.segmented",
+                 "owner": "native_source", **ownership.fingerprint(source.read_bytes())}
+        inventory = {"schema": 1, "native_regions": [entry], "tile_source_inputs": [name]}
+        report = ownership.verify(self.root, inventory)
+        self.assertEqual(report["verification"]["regions_and_files"], 1)
+        self.assertTrue(any(row["classification"] == "canonical_native_source"
+                            for row in report["verification"]["canonical_native"]))
+        missing = copy.deepcopy(inventory)
+        missing["tile_source_inputs"] = []
+        with self.assertRaisesRegex(ValueError, "canonical build inputs"):
+            ownership.verify(self.root, missing)
+        source.write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "stale"):
+            ownership.verify(self.root, inventory)
+
+    def test_complete_native_source_cannot_hide_region_ownership(self):
+        name = "src/tile/families/native/metal/attention_segmented.metal"
+        source = self.package / name
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"// tile-codegen:begin attention family\nbody\n// tile-codegen:end attention family\n")
+        entry = {"output": name, "family_region": "attention.segmented",
+                 "owner": "native_source", **ownership.fingerprint(source.read_bytes())}
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            ownership.verify(self.root, {"schema": 1, "native_regions": [entry], "tile_source_inputs": [name]})
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

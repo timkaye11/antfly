@@ -17,6 +17,7 @@
 //! restore. Context borrows the real model/backend owner and execution lane;
 //! it has no tokenizer, task configuration or generation-pipeline dependency.
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
@@ -34,6 +35,26 @@ const mtpProfileTimestamp = decoder_forward.profileTimestamp;
 const mtpProfileElapsedNs = decoder_forward.profileElapsedNs;
 const cudaReplayLastLogitsEnabled = decoder_forward.cudaReplayLastLogitsEnabled;
 const writeF32LeFile = @import("../util/c_file.zig").writeF32LeFile;
+const quality_mod = @import("../runtime/kv/metal_checkpoint_quality.zig");
+
+pub const NativeCheckpointTrainingPolicy = enum { primary_only, private_dense512_reference_v1, private_future_decode_mix_v1, private_train_challenge_hybrid_resident_v1 };
+pub const ResidentHybridCohort = quality_mod.Request.ResidentHybridAuthority.Cohort;
+pub const ResidentHybridAuthority = quality_mod.Request.ResidentHybridAuthority;
+
+pub const NativeCheckpointOperatorGrant = struct {
+    pub const PrepareHostOwnerProfile = enum { none, bounded_page_e4_resident_1152m_v1, bounded_page_e4_formal_1152m_v1 };
+};
+
+fn augmentationSamplesAllowed(samples: u16, dense_reference: bool) bool {
+    return runtime.kv.attention_match_training_augmentation.allowedSamples(samples) or
+        (dense_reference and samples == runtime.kv.attention_match_training_augmentation.dense_reference_samples_per_stratum);
+}
+
+fn nativeMetalBatch64Validation(config: gpt_mod.Config) bool {
+    if (!platform.env.getenvBool("ANTFLY_INFERENCE_METAL_GEMMA4_COMPACTION_FP64_BATCH64")) return false;
+    const gemma4 = @import("../architectures/gemma4_runtime.zig");
+    return gemma4.isExactE2bDenseRuntimeConfig(config) or gemma4.isExactE4bDenseRuntimeConfig(config);
+}
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -50,45 +71,328 @@ pub const Context = struct {
 /// The native checkpoint request owns its output until the transport finishes.
 /// A savings rejection returns an exact checkpoint with an explicit outcome.
 pub const PrepareRequest = struct {
+    pub const CompiledPrefillExactKvHandoff = struct {
+        pub const LayoutPolicy = enum {
+            split_swa_permitted,
+            full_history_exact,
+            /// Uniform full-history through 8K; above 8K, local donors use
+            /// their exact page-aligned SWA span while global donors retain
+            /// complete logical history. Candidate v8 authenticates this
+            /// policy independently of all older full-history grants.
+            full_history_exact_8k_split_swa_32k,
+        };
+        pub const CodecScope = enum {
+            f16_only,
+            f16_fp8_rotated4,
+        };
+
+        /// Hard device allocation ceiling admitted by the process-local
+        /// qualification owner. This is not populated from HTTP or CLI input.
+        max_copy_bytes: usize,
+        max_host_staging_bytes: usize,
+        codec_scope: CodecScope = .f16_only,
+        max_logical_tokens: usize = std.math.maxInt(usize),
+        layout_policy: LayoutPolicy = .split_swa_permitted,
+
+        pub fn requiresUniformFullHistory(self: @This(), logical_tokens: usize) bool {
+            return switch (self.layout_policy) {
+                .split_swa_permitted => false,
+                .full_history_exact => true,
+                .full_history_exact_8k_split_swa_32k => logical_tokens <= 8192,
+            };
+        }
+
+        pub fn authorizesBounded32kTsqr(self: @This()) bool {
+            if (self.max_logical_tokens != 32768) return false;
+            return self.layout_policy == .full_history_exact or
+                self.layout_policy == .full_history_exact_8k_split_swa_32k;
+        }
+
+        pub fn allows(self: @This(), encoding: runtime.kv.attention_match_checkpoint.Encoding, logical_tokens: usize) bool {
+            if (logical_tokens == 0 or logical_tokens > self.max_logical_tokens) return false;
+            return switch (self.codec_scope) {
+                .f16_only => encoding == .f16,
+                .f16_fp8_rotated4 => encoding == .f16 or encoding == .fp8 or encoding == .rotated4,
+            };
+        }
+    };
+    pub const CompiledPrefillExactKvReceipt = struct {
+        destination_storage_address: usize,
+        device_allocation_bound_bytes: usize,
+        copied_bytes: usize,
+        peak_host_staging_bytes: usize,
+        source_slots_released: usize,
+        source_live_bytes_before: u64,
+        source_live_bytes_after: u64,
+        source_physically_released_bytes: u64,
+    };
+    pub const QualityFitStrategy = @import("../runtime/kv/metal_checkpoint_quality.zig").FitStrategy;
+    pub const FitPolicy = @import("../runtime/kv/attention_match_fit_policy.zig").Policy;
+    pub const Admission = runtime.kv.attention_match_engine.Options.Admission;
+    pub const WholeFitInputExport = struct {
+        output_dir: []const u8,
+        augmentation_output_dir: ?[]const u8 = null,
+        augmentation_samples: u16 = runtime.kv.attention_match_training_augmentation.legacy_samples_per_stratum,
+        samples: u16 = 320,
+        method: runtime.kv.attention_match_whole_fit_input.Method = .top1,
+        source_freeze_sha256: [32]u8,
+        binary_sha256: [32]u8,
+        exporter_sha256: [32]u8,
+        self_study: ?*SelfStudyTrainingCapture = null,
+        reference_coverage: ?*ReferenceCoverageTrainingCapture = null,
+
+        pub fn validateAugmentation(self: @This()) !void {
+            if (self.self_study != null and self.reference_coverage != null) return error.InvalidTrainingAugmentationBinding;
+            if (self.reference_coverage) |capture| {
+                const expected: u16 = switch (capture.policy) {
+                    .coverage320 => runtime.kv.attention_match_reference_coverage.sample_count,
+                    .dense512 => runtime.kv.attention_match_reference_coverage.dense512_sample_count,
+                };
+                if (self.augmentation_samples != expected) return error.InvalidTrainingAugmentationBinding;
+            }
+            if ((self.self_study != null or self.reference_coverage != null) and self.augmentation_output_dir == null) return error.InvalidTrainingAugmentationBinding;
+            if (self.augmentation_output_dir) |path| {
+                const dense_reference = if (self.reference_coverage) |capture| capture.policy == .dense512 and self.augmentation_samples == runtime.kv.attention_match_training_augmentation.dense_reference_samples_per_stratum else false;
+                if (path.len == 0 or !std.fs.path.isAbsolute(path) or !augmentationSamplesAllowed(self.augmentation_samples, dense_reference)) return error.InvalidTrainingAugmentationBinding;
+            } else if (self.augmentation_samples != runtime.kv.attention_match_training_augmentation.legacy_samples_per_stratum) return error.InvalidTrainingAugmentationBinding;
+        }
+    };
+    pub const SelfStudyTrainingCapture = struct {
+        allocator: std.mem.Allocator,
+        queries: runtime.kv.attention_match_queries.Collector,
+        generated_ids: []i64,
+        prompt_tokens: []const i64,
+        prompt_tokens_sha256: [32]u8,
+        rendered_suffix_sha256: [32]u8,
+        generation_contract_sha256: [32]u8,
+        generated_ids_sha256: [32]u8,
+        complete_repeat_sha256: [32]u8,
+        source_before: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        source_after: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        primary_parent_manifest_sha256: [32]u8,
+        pub fn deinit(self: *@This()) void {
+            self.queries.deinit();
+            self.allocator.free(self.generated_ids);
+            self.* = undefined;
+        }
+    };
+    /// Unqualified staged capture from the unmodified exact source. Unlike the
+    /// template study this starts at the source's own next-token logits.
+    pub const FutureDecodeTrainingCapture = struct {
+        allocator: std.mem.Allocator,
+        queries: runtime.kv.attention_match_queries.Collector,
+        generated_ids: []i64,
+        generated_ids_sha256: [32]u8,
+        source_before: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        source_after: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        early_eos_observations: u16,
+        backend_owned_full_logits_calls: u16 = 0,
+        backend_owned_full_logits_ns: u64 = 0,
+        backend_owned_frame_successes: u16 = 0,
+        generic_last_logits_calls: u16 = 0,
+        backend_owned_full_logits_selected: bool = false,
+        gpu_greedy_calls: u16 = 0,
+        gpu_greedy_ns: u64 = 0,
+        gpu_greedy_frame_successes: u16 = 0,
+        gpu_greedy_selected: bool = false,
+        pub fn deinit(self: *@This()) void {
+            self.queries.deinit();
+            self.allocator.free(self.generated_ids);
+            self.* = undefined;
+        }
+    };
+    pub const ReferenceCoverageTrainingCapture = struct {
+        pub const Policy = enum { coverage320, dense512 };
+        allocator: std.mem.Allocator,
+        queries: runtime.kv.attention_match_queries.Collector,
+        selection: runtime.kv.attention_match_reference_coverage.Selection,
+        policy: Policy,
+        source_before: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        source_after: runtime.kv.attention_match_self_study_training.SourceBoundary,
+        primary_parent_manifest_sha256: [32]u8,
+        pub fn deinit(self: *@This()) void {
+            self.queries.deinit();
+            self.selection.deinit();
+            self.* = undefined;
+        }
+    };
     // Keep HTTP admission and the engine's enforced fitting bound identical,
     // with this ceiling above the request-specific geometry plan. Query capture
     // and transfer buffers remain separately reserved. Process RSS is also gated.
     pub const max_transient_host_bytes: usize = 3840 * 1024 * 1024;
+    /// Prefer the tighter aggregate for ordinary 8K Metal fits. Larger source
+    /// snapshots (notably 32K) still use the unchanged 3,840 MiB hard ceiling;
+    /// source+candidate alone can exceed two GiB there.
+    pub const metal_parallel_target_host_bytes: usize = 2 * 1024 * 1024 * 1024;
+    /// Large fits use the established hard host ceiling with at most two
+    /// workers. Process RSS remains independently guarded; source local rings
+    /// avoid retaining redundant full-history device storage during fitting.
+    pub const metal_large_source_target_host_bytes: usize = max_transient_host_bytes;
+    // Large source/candidate snapshots coexist with model weights and native
+    // device KV. Limit overlapping head work at that boundary; the unchanged
+    // host reservation alone does not bound the model process's total RSS.
+    pub const metal_large_source_fit_workers: usize = 2;
     pub const auxiliary_host_bytes: usize = 128 * 1024 * 1024;
+    /// Peak local-ring K+V staging, within the existing auxiliary reservation
+    /// alongside the 64 MiB query collector and snapshot transfer buffers.
+    pub const query_clone_host_staging_bytes: usize = 4 * 1024 * 1024;
     pub const fit_workers: usize = 4;
     pub const collection_options: runtime.kv.attention_match_queries.Options = .{ .samples_per_consumer = 320 };
     pub const max_repeat_tokens: usize = 512;
 
-    pub const HostPlan = struct { fit_bytes: usize, reservation_bytes: usize, source_bytes: usize, head_workspace_bytes: usize, workers: usize };
+    pub const HostPlan = struct { fit_bytes: usize, reservation_bytes: usize, source_bytes: usize, head_workspace_bytes: usize, workers: usize, query_reserve_bytes: usize = auxiliary_host_bytes, admission: Admission = .fixed, chunk_rows: u16 = 1024, reject_exact_active_fixed_point: bool = false, fit_strategy: QualityFitStrategy = .legacy };
+
+    pub fn privateDenseQueryMaximumBytes() !usize {
+        // Reserve complete collector caps, normalized Dense rows, and one
+        // merged TRAIN owner. The future path clears the old merge before
+        // capturing its continuation or allocating the replacement.
+        const primary = collection_options.max_bytes;
+        const dense: usize = 80 * 1024 * 1024;
+        const future = runtime.kv.attention_match_self_study_training.maximum_bytes;
+        const metadata: usize = 4 * 1024 * 1024;
+        const authenticated_batch: usize = 2 * 1024 * 1024;
+        const selector = runtime.kv.attention_match_future_decode_training.historical_selection.maximum_workspace_bytes;
+        const generated_ids = runtime.kv.attention_match_future_decode_training.generated_tokens * @sizeOf(i64);
+        var total: usize = 0;
+        for ([_]usize{ primary, dense, dense, primary, dense, future, metadata, authenticated_batch, selector, generated_ids }) |bytes|
+            total = try std.math.add(usize, total, bytes);
+        return total;
+    }
+
+    pub fn fitPolicy(self: *const PrepareRequest) FitPolicy {
+        return .{
+            .admission = self.admission,
+            .chunk_rows = self.chunk_rows,
+            .reject_exact_active_fixed_point = self.reject_exact_active_fixed_point,
+        };
+    }
+
+    pub fn validatePlanAdmission(plan: HostPlan, requested: Admission, chunk_rows: u16, reject_exact_active_fixed_point: bool) !void {
+        if (plan.admission != requested or plan.chunk_rows != chunk_rows or plan.reject_exact_active_fixed_point != reject_exact_active_fixed_point)
+            return error.InvalidNativeCheckpointRequest;
+    }
+
+    pub fn v18ParallelPlan(source_bytes: usize, eligible_heads: usize) !HostPlan {
+        return v18ParallelPlanWithWorkspace(source_bytes, eligible_heads, 512 * 1024 * 1024);
+    }
+
+    pub const V18WorkspaceProfile = enum { standard, resident_native_hybrid_2g_v1 };
+
+    pub fn v18ParallelPlanWithWorkspace(source_bytes: usize, eligible_heads: usize, per_head: usize) !HostPlan {
+        return v18ParallelPlanWithWorkspaceProfile(source_bytes, eligible_heads, per_head, .standard);
+    }
+
+    pub fn v18ParallelPlanWithWorkspaceProfile(source_bytes: usize, eligible_heads: usize, per_head: usize, profile: V18WorkspaceProfile) !HostPlan {
+        if (eligible_heads == 0) return error.InvalidNativeCheckpointRequest;
+        const resident_hybrid = profile == .resident_native_hybrid_2g_v1;
+        if (resident_hybrid) {
+            if (per_head != 2 * 1024 * 1024 * 1024) return error.InvalidNativeCheckpointRequest;
+        } else if (per_head != 512 * 1024 * 1024 and per_head != 1024 * 1024 * 1024) {
+            return error.InvalidNativeCheckpointRequest;
+        }
+        // Primary collector (64 MiB), Dense512 collector (80 MiB), normalized
+        // Dense TRAIN, and the merged TRAIN descriptor/value copy are live
+        // together until the synchronous fit returns. Reserve their complete
+        // configured maxima conservatively rather than relying on allocator
+        // reuse or average payload sizes.
+        const query_reserve: usize = if (per_head == 1024 * 1024 * 1024 or resident_hybrid) try privateDenseQueryMaximumBytes() else auxiliary_host_bytes;
+        const resident = try runtime.kv.attention_match_engine.parallelResidentBytes(source_bytes, eligible_heads);
+        // The private Dense512 route already reserves a full 1 GiB for every
+        // worker. Use the existing 3,840 MiB hard ceiling for that explicit
+        // profile so independent heads can run concurrently; this raises no
+        // limit. The ordinary 512 MiB route retains the historical 2 GiB
+        // target whenever its resident source/candidate pair fits there.
+        const gross = if (per_head == 1024 * 1024 * 1024 or resident_hybrid)
+            max_transient_host_bytes
+        else if (resident <= metal_parallel_target_host_bytes)
+            metal_parallel_target_host_bytes
+        else
+            max_transient_host_bytes;
+        if (query_reserve >= gross) return error.CompactionWorkspaceLimit;
+        const aggregate = gross - query_reserve;
+        const planned = try @import("../ops/metal_attention_match_fit.zig").Fitter.parallelPlan(source_bytes, eligible_heads, per_head, aggregate, fit_workers);
+        return .{ .fit_bytes = planned.admitted_bytes, .reservation_bytes = try std.math.add(usize, planned.admitted_bytes, query_reserve), .source_bytes = source_bytes, .head_workspace_bytes = per_head, .workers = planned.workers, .query_reserve_bytes = query_reserve, .admission = .cumulative_ladder_4_3_2, .chunk_rows = 256, .reject_exact_active_fixed_point = true, .fit_strategy = .identity_chunk_coefficients_adaptive_v18 };
+    }
+
+    pub fn v18EligibleHeadCount(config: gpt_mod.Config) !usize {
+        var count: usize = 0;
+        for (0..config.num_hidden_layers) |layer| if (config.isKvDonorLayer(layer) and !config.layerUsesSlidingAttention(layer)) {
+            count = try std.math.add(usize, count, (try config.kvDonorGeometry(layer)).num_kv_heads);
+        };
+        return count;
+    }
 
     pub fn fittingOptions() runtime.kv.attention_match_engine.Options {
-        return .{
+        return fittingOptionsForAdmission(.fixed);
+    }
+
+    pub fn fittingOptionsForAdmission(admission: Admission) runtime.kv.attention_match_engine.Options {
+        return fittingOptionsForPolicy(admission, 1024);
+    }
+
+    pub fn fittingOptionsForPolicy(admission: Admission, chunk_rows: u16) runtime.kv.attention_match_engine.Options {
+        return fittingOptionsForQualityPolicy(admission, chunk_rows, false);
+    }
+
+    pub fn fittingOptionsForQualityPolicy(admission: Admission, chunk_rows: u16, reject_exact_active_fixed_point: bool) runtime.kv.attention_match_engine.Options {
+        var options: runtime.kv.attention_match_engine.Options = .{
+            .admission = admission,
             .storage_precision = .f16,
             .checkpoint_limits = native_kv_checkpoint.serving_limits,
             .prefix_rows = 128,
-            .chunk_rows = 1024,
+            .chunk_rows = chunk_rows,
             .min_retention_divisor = 2,
             .validation = .whole_head,
             .fit = .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set },
         };
+        if (admission == .cumulative_ladder_4_3_2) {
+            options.retention_divisor = 4;
+            options.min_retention_divisor = 2;
+            options.independent_fp64_publication = true;
+            options.min_global_savings_ratio = 1.5;
+        }
+        options.fit.reject_exact_active_fixed_point = reject_exact_active_fixed_point;
+        return options;
     }
 
     /// Exact-prefix preparation only. Admission uses the same per-head sizing
     /// as fitting, including the largest worker and a full-size fallback cache.
     /// Existing compacted states must use their own coverage-aware planner.
-    pub fn hostPlan(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding) !HostPlan {
-        if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
+    pub fn hostPlan(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding, metal: bool) !HostPlan {
+        return hostPlanWithAdmission(config, tokens, encoding, metal, .fixed);
+    }
+
+    pub fn hostPlanWithAdmission(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding, metal: bool, admission: Admission) !HostPlan {
+        return hostPlanWithPolicy(config, tokens, encoding, metal, admission, 1024);
+    }
+
+    pub fn hostPlanWithPolicy(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding, metal: bool, admission: Admission, chunk_rows: u16) !HostPlan {
+        return hostPlanWithQualityPolicy(config, tokens, encoding, metal, admission, chunk_rows, false);
+    }
+
+    pub fn hostPlanWithQualityPolicy(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding, metal: bool, admission: Admission, chunk_rows: u16, reject_exact_active_fixed_point: bool) !HostPlan {
+        try (FitPolicy{ .admission = admission, .chunk_rows = chunk_rows, .reject_exact_active_fixed_point = reject_exact_active_fixed_point }).validate(encoding, metal);
+        if (metal) {
+            if (comptime !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
+            if (encoding != .f16 and encoding != .fp8 and encoding != .rotated4)
+                return error.UnsupportedMetalKvCheckpointEncoding;
+        } else if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
+        if ((admission == .fixed and (chunk_rows != 1024 or reject_exact_active_fixed_point)) or
+            (admission == .cumulative_ladder_4_3_2 and (!metal or
+                (encoding != .f16 and encoding != .fp8 and encoding != .rotated4) or
+                (chunk_rows != 128 and chunk_rows != 256 and chunk_rows != 1024)))) return error.InvalidNativeCheckpointRequest;
         if (config.family != .gemma or !config.usesGemma4Channels() or
             config.num_hidden_layers == 0 or config.num_hidden_layers > 256)
             return error.UnsupportedCompactionQueryModel;
         if (tokens < 2 or tokens > native_kv_checkpoint.max_context_tokens) return error.CompactionQueryLimit;
-        const engine = runtime.kv.attention_match_engine;
         const snapshot = runtime.kv.attention_match_snapshot;
-        const Fitter = @import("../ops/cuda/attention_match_fit.zig").Fitter;
-        var options = fittingOptions();
+        var options = fittingOptionsForQualityPolicy(admission, chunk_rows, reject_exact_active_fixed_point);
+        options.independent_fp64_publication = metal;
+        if (metal and nativeMetalBatch64Validation(config)) options.independent_validation_policy = .native_accelerate_fp64_summary64_v1;
+        options.fp8_checkpoint = encoding == .fp8;
         options.rotated4_checkpoint = encoding == .rotated4;
         // Reserve for the largest bounded retry, even when 4:1 succeeds.
-        options.retention_divisor = options.min_retention_divisor.?;
+        if (admission == .fixed) options.retention_divisor = options.min_retention_divisor.?;
         var donors: [256]snapshot.Donor = undefined;
         var mapping: [256]u32 = undefined;
         var count: usize = 0;
@@ -132,38 +436,397 @@ pub const PrepareRequest = struct {
             };
             if (config.num_attention_heads == 0 or config.num_attention_heads % donor.heads != 0) return error.InvalidCompactionQueries;
             const width = try std.math.mul(usize, try std.math.mul(usize, consumers, config.num_attention_heads / donor.heads), donor.dim);
-            const workspace = try Fitter.headHostWorkspace(tokens, target, @min(old_rows - prefix, options.chunk_rows), try std.math.mul(usize, width, samples - heldout), try std.math.mul(usize, width, heldout), donor.dim, options);
+            const workspace = if (metal) workspace: {
+                if (comptime build_options.enable_metal) {
+                    const value = try @import("../ops/metal_attention_match_fit.zig").Fitter.headHostWorkspace(tokens, target, @min(old_rows - prefix, options.chunk_rows), try std.math.mul(usize, width, samples - heldout), try std.math.mul(usize, width, heldout), donor.dim, options);
+                    break :workspace .{ .bytes = value.bytes, .solver_bytes = value.solver_bytes };
+                }
+                unreachable;
+            } else workspace: {
+                if (comptime build_options.enable_cuda) {
+                    const value = try @import("../ops/cuda/attention_match_fit.zig").Fitter.headHostWorkspace(tokens, target, @min(old_rows - prefix, options.chunk_rows), try std.math.mul(usize, width, samples - heldout), try std.math.mul(usize, width, heldout), donor.dim, options);
+                    break :workspace .{ .bytes = value.bytes, .solver_bytes = value.solver_bytes };
+                }
+                unreachable;
+            };
             if (workspace.solver_bytes > options.fit.max_workspace_bytes) return error.CompactionWorkspaceLimit;
             maximum = @max(maximum, workspace.bytes);
         }
-        const resident = try engine.parallelResidentBytes(source_bytes, heads);
-        if (resident > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
-        const workers = if (maximum == 0) fit_workers else @min(fit_workers, (max_transient_host_bytes - resident) / maximum);
-        if (workers == 0) return error.CompactionWorkspaceLimit;
-        const fit_bytes = try engine.parallelHostBytes(source_bytes, heads, maximum, workers);
-        if (fit_bytes > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
-        return .{ .fit_bytes = fit_bytes, .reservation_bytes = try std.math.add(usize, fit_bytes, auxiliary_host_bytes), .source_bytes = source_bytes, .head_workspace_bytes = maximum, .workers = workers };
+        return finishHostPlan(source_bytes, heads, maximum, metal, admission, chunk_rows, reject_exact_active_fixed_point);
     }
+
+    /// Admission for an installed checkpoint uses its retained rows and
+    /// immutable fitted coverage, including each head's largest retry.
+    pub fn hostPlanForState(config: gpt_mod.Config, state: runtime.kv.attention_match_checkpoint.State, encoding: runtime.kv.attention_match_checkpoint.Encoding, control: runtime.kv.attention_match.Control) !HostPlan {
+        return hostPlanForStateWithAdmission(config, state, encoding, .fixed, control);
+    }
+
+    pub fn hostPlanForStateWithAdmission(config: gpt_mod.Config, state: runtime.kv.attention_match_checkpoint.State, encoding: runtime.kv.attention_match_checkpoint.Encoding, admission: Admission, control: runtime.kv.attention_match.Control) !HostPlan {
+        return hostPlanForStateWithPolicy(config, state, encoding, admission, 1024, control);
+    }
+
+    pub fn hostPlanForStateWithPolicy(config: gpt_mod.Config, state: runtime.kv.attention_match_checkpoint.State, encoding: runtime.kv.attention_match_checkpoint.Encoding, admission: Admission, chunk_rows: u16, control: runtime.kv.attention_match.Control) !HostPlan {
+        return hostPlanForStateWithQualityPolicy(config, state, encoding, admission, chunk_rows, false, control);
+    }
+
+    pub fn hostPlanForStateWithQualityPolicy(config: gpt_mod.Config, state: runtime.kv.attention_match_checkpoint.State, encoding: runtime.kv.attention_match_checkpoint.Encoding, admission: Admission, chunk_rows: u16, reject_exact_active_fixed_point: bool, control: runtime.kv.attention_match.Control) !HostPlan {
+        try (FitPolicy{ .admission = admission, .chunk_rows = chunk_rows, .reject_exact_active_fixed_point = reject_exact_active_fixed_point }).validate(encoding, true);
+        if (comptime !build_options.enable_metal) return error.UnsupportedCompactionQueryRoute;
+        if (encoding != .f16 and encoding != .fp8 and encoding != .rotated4)
+            return error.UnsupportedMetalKvCheckpointEncoding;
+        if ((admission == .fixed and (chunk_rows != 1024 or reject_exact_active_fixed_point)) or
+            (admission == .cumulative_ladder_4_3_2 and
+                ((encoding != .f16 and encoding != .fp8 and encoding != .rotated4) or
+                    (chunk_rows != 128 and chunk_rows != 256 and chunk_rows != 1024)))) return error.InvalidNativeCheckpointRequest;
+        if (config.family != .gemma or !config.usesGemma4Channels() or config.num_hidden_layers == 0 or
+            config.num_hidden_layers > 256 or config.num_hidden_layers != state.layer_donors.len or
+            config.vocab_size != state.logits.len or state.logical_length < 2)
+            return error.UnsupportedCompactionQueryModel;
+        try state.validateWithControl(native_kv_checkpoint.serving_limits, control);
+        var options = fittingOptionsForQualityPolicy(admission, chunk_rows, reject_exact_active_fixed_point);
+        options.independent_fp64_publication = true;
+        if (nativeMetalBatch64Validation(config)) options.independent_validation_policy = .native_accelerate_fp64_summary64_v1;
+        options.fp8_checkpoint = encoding == .fp8;
+        options.rotated4_checkpoint = encoding == .rotated4;
+        if (admission == .fixed) options.retention_divisor = options.min_retention_divisor.?;
+        const samples = @min(@min(state.tokens.len, max_repeat_tokens), collection_options.samples_per_consumer);
+        const heldout = (samples - 1) / collection_options.heldout_stride + 1;
+        var maximum: usize = 0;
+        var heads: usize = 0;
+        var expected_donors: usize = 0;
+        for (0..config.num_hidden_layers) |layer| {
+            const geometry = try config.kvDonorGeometry(layer);
+            const donor = state.donors[state.layer_donors[layer]];
+            if (donor.layer != geometry.donor_layer or donor.heads.len != geometry.num_kv_heads or
+                donor.heads[0].dim != geometry.head_dim or
+                donor.window != (if (config.layerUsesSlidingAttention(layer)) config.sliding_window else @as(u32, 0)))
+                return error.UnsupportedKvSnapshotLayout;
+            expected_donors += @intFromBool(config.isKvDonorLayer(layer));
+        }
+        if (state.donors.len != expected_donors) return error.UnsupportedKvSnapshotLayout;
+        for (state.donors, 0..) |donor, di| {
+            try control.check();
+            if (donor.window != 0) continue;
+            heads = try std.math.add(usize, heads, donor.heads.len);
+            var consumers: usize = 0;
+            for (state.layer_donors) |mapped| {
+                if (mapped == di) consumers += 1;
+            }
+            if (consumers == 0 or config.num_attention_heads == 0 or config.num_attention_heads % donor.heads.len != 0)
+                return error.InvalidCompactionQueries;
+            for (donor.heads) |head| {
+                try control.check();
+                const plan = (try runtime.kv.attention_match_engine.headPlan(state.logical_length, head, options)) orelse continue;
+                const width = try std.math.mul(usize, try std.math.mul(usize, consumers, config.num_attention_heads / donor.heads.len), head.dim);
+                const workspace = try @import("../ops/metal_attention_match_fit.zig").Fitter.headHostWorkspace(head.positions.len, plan.target_rows, plan.block_rows, try std.math.mul(usize, width, samples - heldout), try std.math.mul(usize, width, heldout), head.dim, options);
+                if (workspace.solver_bytes > options.fit.max_workspace_bytes) return error.CompactionWorkspaceLimit;
+                maximum = @max(maximum, workspace.bytes);
+            }
+        }
+        return finishHostPlan(try state.residentBytes(), heads, maximum, true, admission, chunk_rows, reject_exact_active_fixed_point);
+    }
+
+    pub fn finishHostPlan(source_bytes: usize, heads: usize, maximum: usize, metal: bool, admission: Admission, chunk_rows: u16, reject_exact_active_fixed_point: bool) !HostPlan {
+        const engine = runtime.kv.attention_match_engine;
+        const fit_bytes, const workers = if (metal) plan: {
+            if (comptime build_options.enable_metal) {
+                const resident = try engine.parallelResidentBytes(source_bytes, heads);
+                const aggregate_limit = if (resident <= metal_parallel_target_host_bytes)
+                    metal_parallel_target_host_bytes
+                else
+                    metal_large_source_target_host_bytes;
+                const maximum_workers = if (resident <= metal_parallel_target_host_bytes)
+                    fit_workers
+                else
+                    metal_large_source_fit_workers;
+                const worker_plan = try @import("../ops/metal_attention_match_fit.zig").Fitter.parallelPlan(
+                    source_bytes,
+                    heads,
+                    maximum,
+                    aggregate_limit,
+                    maximum_workers,
+                );
+                break :plan .{ worker_plan.admitted_bytes, worker_plan.workers };
+            }
+            unreachable;
+        } else plan: {
+            const resident = try engine.parallelResidentBytes(source_bytes, heads);
+            if (resident > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
+            const selected = if (maximum == 0) fit_workers else @min(fit_workers, (max_transient_host_bytes - resident) / maximum);
+            if (selected == 0) return error.CompactionWorkspaceLimit;
+            const bytes = try engine.parallelHostBytes(source_bytes, heads, maximum, selected);
+            if (bytes > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
+            break :plan .{ bytes, selected };
+        };
+        return .{ .fit_bytes = fit_bytes, .reservation_bytes = try std.math.add(usize, fit_bytes, auxiliary_host_bytes), .source_bytes = source_bytes, .head_workspace_bytes = maximum, .workers = workers, .admission = admission, .chunk_rows = chunk_rows, .reject_exact_active_fixed_point = reject_exact_active_fixed_point };
+    }
+
+    pub const PreparedQualitySourceSink = struct {
+        context: *anyopaque,
+        write_all_fn: *const fn (*anyopaque, []const u8) anyerror!void,
+        pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+            return self.write_all_fn(self.context, bytes);
+        }
+    };
+    pub const PreparedQualityHeldoutSink = struct {
+        context: *anyopaque,
+        write_fn: *const fn (*anyopaque, []const runtime.kv.attention_match_engine.ReferenceBatch, runtime.kv.attention_match_future_decode_training.Authority, runtime.kv.attention_match_engine.Layout) anyerror!void,
+        pub fn write(self: *@This(), batches: []const runtime.kv.attention_match_engine.ReferenceBatch, authority: runtime.kv.attention_match_future_decode_training.Authority, layout: runtime.kv.attention_match_engine.Layout) !void {
+            return self.write_fn(self.context, batches, authority, layout);
+        }
+    };
+
+    test_native_fault: @import("../context_native_checkpoint_fault.zig").Slot = if (builtin.is_test) null else {},
+    fp64_accelerated_value_solves: u64 = 0,
+    prepare_host_owner_profile: NativeCheckpointOperatorGrant.PrepareHostOwnerProfile = .none,
+    prepare_host_owner_identity: u64 = 0,
 
     planned_fit_host_bytes: ?usize = null,
     planned_fit_workers: ?usize = null,
+    planned_fit_head_workspace_bytes: ?usize = null,
+    planned_private_query_bytes: ?usize = null,
+    admission: Admission = .fixed,
+    chunk_rows: u16 = 1024,
+    reject_exact_active_fixed_point: bool = false,
+    quality_fit_strategy: QualityFitStrategy = .legacy,
+    /// Set only from a validated process-local operator grant. It does not
+    /// enroll v18 in the registry or change the legacy default.
+    staged_operator_strategy: bool = false,
+    /// Explicit process-local opt-in for the private >96-candidate bounded
+    /// geometry numerator backend. Never enabled by legacy or registry state.
+    bounded_delta_accelerated: bool = false,
+    /// Candidate-v4-only authorization for the bounded 32K TSQR value phase.
+    /// This does not alter the CPU FP64 heldout/publication path.
+    private_bounded_tsqr_value_backend: bool = false,
+    /// Process-local private flat-route performance tuple; never HTTP-derived.
+    private_capture_summary: bool = false,
+    /// Process-local diagnostic selection of the incremental Gram chooser for
+    /// the private capture/summary tuple. Never populated from HTTP input.
+    private_incremental_budget: bool = false,
+    /// Sealed private flat-route TRAIN reduction. This is process-local
+    /// operator authority, never HTTP-derived, and requires the complete
+    /// capture/summary/incremental tuple.
+    private_training_reduction: bool = false,
+    /// Test/diagnostic-only paired flat capture+Gram batch experiment. Only
+    /// the focused test worker's explicit environment gate sets this field;
+    /// server/grant paths and ordinary requests remain 64.
+    private_capture_gram_batch256_diagnostic: bool = false,
+    /// Request-private independent TRAIN domain. This is set only from the
+    /// process-local operator grant; ordinary requests and enrolled profiles
+    /// retain primary-only fitting.
+    training_policy: NativeCheckpointTrainingPolicy = .primary_only,
+    future_decode_training_policy_sha256: [32]u8 = @splat(0),
+    future_training_authority: ?runtime.kv.attention_match_future_decode_training.Authority = null,
+    /// Test-only, diagnostic complete future-mix export. The writer runs after
+    /// the whole-fit parent commits and before numerical fitting starts.
+    future_mix_output_dir: ?[]const u8 = null,
+    future_training_capture: ?runtime.kv.attention_match_future_augmentation.FutureTrainingCaptureEvidence = null,
+    future_historical_study_tokens_sha256: [32]u8 = @splat(0),
+    /// Private staged route only. Null retains the eager checkpoint producer.
+    compiled_prefill_exact_kv_handoff: ?CompiledPrefillExactKvHandoff = null,
+    compiled_prefill_exact_kv_receipt: ?CompiledPrefillExactKvReceipt = null,
+    compiled_prefill_preparation_wall_started_at: ?std.Io.Timestamp = null,
+    compiled_prefill_preparation_wall_ns: u64 = 0,
+    /// Ephemeral synchronous handoff owned by prepareNativeCheckpoint. Never
+    /// serialized or retained after prepareMetalAttentionMatchFit returns.
+    private_training_batches: ?[]const runtime.kv.attention_match_engine.ReferenceBatch = null,
+    /// Borrowed only for the synchronous resident-hybrid rewrite. Both owners
+    /// remain in prepareNativeCheckpoint until probeAttentionMatchFit returns.
+    private_dense_training: ?*const runtime.kv.attention_match_training_augmentation.OwnedTraining = null,
+    private_future_training_batches: ?[]const runtime.kv.attention_match_engine.ReferenceBatch = null,
+    /// Actual collector authority borrowed only by the synchronous resident
+    /// bridge. These values come from the live collector, never staged config.
+    private_collector_source_length: usize = 0,
+    private_collector_repeat_length: usize = 0,
+    private_collector_required_bytes: usize = 0,
+    private_collector_manifest_sha256: [32]u8 = @splat(0),
+    /// Frozen pre-evaluation authorities supplied by the authenticated staged
+    /// configuration. They are not interchangeable with training digests.
+    resident_hybrid_authority: ?ResidentHybridAuthority = null,
+    private_dense512_query_rows: usize = 0,
+    private_query_live_bytes: usize = 0,
+    /// Process-local qualification telemetry. Ordinary requests leave this null.
+    qualification_phase_telemetry: ?@import("../pipelines/native_checkpoint_prepare_phase_observer.zig").Owned = null,
+    primary_query_collection: quality_mod.QueryCollectionDiagnostic = .{},
+    dense512_query_collection: quality_mod.QueryCollectionDiagnostic = .{},
+    query_collection_combined_before_fit_ns: u64 = 0,
+    /// Only the independent quality collector requests these extra seals.
+    capture_quality_evidence: bool = false,
+    quality_source_sha256: [32]u8 = @splat(0),
+    quality_calibration: ?runtime.kv.attention_match_queries.Seal = null,
+    whole_fit_input: ?WholeFitInputExport = null,
+    producer_profile_sha256: [32]u8 = @splat(0),
+    producer_profile_semantic_sha256: [32]u8 = @splat(0),
+    /// Set from the validated process-local operator grant before resident
+    /// preparation. Never populated from public checkpoint request input.
+    producer_binary_sha256: [32]u8 = @splat(0),
+    /// Process-local request from the public producer to retain a strict
+    /// prepared-serving quality closure after AFATT002 export.
+    prepared_quality_closure_requested: bool = false,
+    prepared_quality_source_sink: ?PreparedQualitySourceSink = null,
+    prepared_quality_heldout_sink: ?PreparedQualityHeldoutSink = null,
+    prepared_quality_prompt_sha256: [32]u8 = @splat(0),
+    prepared_quality_prompt_tokens: usize = 0,
 
     encoding: runtime.kv.attention_match_checkpoint.Encoding = .f16,
     minimum_savings_ratio: f64 = 1.5,
     validation_workers: usize = 1,
     result: ?Result = null,
+    pub const DevicePayload = struct {
+        allocator: std.mem.Allocator,
+        device: @import("../ops/metal_attention_match_storage.zig").DeviceState,
+        metadata: runtime.kv.attention_match_checkpoint.StreamingMetadata,
+        maximum_head_download_bytes: usize,
+
+        fn deinit(self: *@This()) void {
+            self.device.deinit();
+            self.allocator.free(self.metadata.donors);
+            self.allocator.free(self.metadata.layer_donors);
+            self.allocator.free(self.metadata.logits);
+            self.allocator.free(self.metadata.tokens);
+            self.* = undefined;
+        }
+    };
+    pub const Payload = union(enum) {
+        host: runtime.kv.attention_match_checkpoint.Owned,
+        device: DevicePayload,
+
+        pub fn deinit(self: *@This()) void {
+            switch (self.*) {
+                .host => |*owned| owned.deinit(),
+                .device => |*owned| owned.deinit(),
+            }
+            self.* = undefined;
+        }
+        pub fn identity(self: *const @This()) runtime.kv.attention_match_checkpoint.Identity {
+            return switch (self.*) {
+                .host => |owned| owned.state.identity,
+                .device => |owned| owned.metadata.identity,
+            };
+        }
+        pub fn logicalLength(self: *const @This()) usize {
+            return switch (self.*) {
+                .host => |owned| owned.state.logical_length,
+                .device => |owned| owned.metadata.logical_length,
+            };
+        }
+        pub fn encodedSize(self: *@This(), encoding: runtime.kv.attention_match_checkpoint.Encoding, control: runtime.kv.attention_match.Control) !usize {
+            return switch (self.*) {
+                .host => |owned| runtime.kv.attention_match_checkpoint.encodedSize(owned.state, runtime.kv.attention_match_checkpoint.serving_limits, encoding, control),
+                .device => |*owned| blk: {
+                    var provider: runtime.kv.attention_match_device_checkpoint_provider.Context = .{ .allocator = owned.allocator, .state = &owned.device, .donors = owned.metadata.donors, .maximum_head_download_bytes = owned.maximum_head_download_bytes };
+                    defer provider.deinit();
+                    break :blk runtime.kv.attention_match_checkpoint.encodedSizeFromProvider(owned.metadata, provider.provider(), runtime.kv.attention_match_checkpoint.serving_limits, encoding, control);
+                },
+            };
+        }
+        pub fn exportEncoded(self: *@This(), encoding: runtime.kv.attention_match_checkpoint.Encoding, sink: anytype, control: runtime.kv.attention_match.Control) !runtime.kv.attention_match_checkpoint.ExportDigest {
+            return switch (self.*) {
+                .host => |owned| runtime.kv.attention_match_checkpoint.exportEncoded(owned.state, runtime.kv.attention_match_checkpoint.serving_limits, encoding, sink, control),
+                .device => |*owned| blk: {
+                    var provider: runtime.kv.attention_match_device_checkpoint_provider.Context = .{ .allocator = owned.allocator, .state = &owned.device, .donors = owned.metadata.donors, .maximum_head_download_bytes = owned.maximum_head_download_bytes };
+                    defer provider.deinit();
+                    break :blk runtime.kv.attention_match_checkpoint.exportEncodedFromProvider(owned.metadata, provider.provider(), runtime.kv.attention_match_checkpoint.serving_limits, encoding, sink, control);
+                },
+            };
+        }
+        pub fn artifactDigest(self: *@This(), encoding: runtime.kv.attention_match_checkpoint.Encoding, control: runtime.kv.attention_match.Control) ![32]u8 {
+            const Sink = struct {
+                pub fn writeAll(_: *@This(), _: []const u8) !void {}
+            };
+            var sink: Sink = .{};
+            return (try self.exportEncoded(encoding, &sink, control)).file_sha256;
+        }
+    };
     pub const Result = struct {
-        checkpoint: runtime.kv.attention_match_checkpoint.Owned,
+        payload: Payload,
+        /// Source owner revision observed before snapshot/export. This is
+        /// producer provenance only; a receiver creates its own revision.
+        source_revision: u64,
         outcome: enum { compacted, unchanged_insufficient_savings },
         stats: runtime.kv.attention_match_engine.Stats,
         source_host_bytes: usize,
         query_ns: u64,
         snapshot_ns: u64,
         fit_ns: u64,
+        quality_fit_strategy: QualityFitStrategy = .legacy,
+        v18_policy_sha256: [32]u8 = @splat(0),
+        v18_eligible_heads: usize = 0,
+        v18_attempted_heads: usize = 0,
+        v18_accepted_heads: usize = 0,
+        v18_preserved_heads: usize = 0,
+        v18_fallback_heads: usize = 0,
+        v18_cache_ready_heads: usize = 0,
+        v18_planned_exact_heads: usize = 0,
+        incremental_gram_chooser_calls: usize = 0,
+        v18_query_batch_rows: usize = 0,
+        v18_planned_head_workspace_bytes: usize = 0,
+        v18_cache_phase_peak_bound_bytes: usize = 0,
+        v18_evidence_profile: quality_mod.V18EvidenceProfile = .none,
+        v18_evidence_profile_sha256: [32]u8 = @splat(0),
+        v18_codec_physical_profile: quality_mod.V18EvidenceProfile = .none,
+        v18_codec_physical_profile_sha256: [32]u8 = @splat(0),
+        v18_bounded_tsqr_policy_sha256: [32]u8 = @splat(0),
+        v18_bounded_tsqr_heads: usize = 0,
+        v18_bounded_tsqr_calls: usize = 0,
+        v18_bounded_tsqr_workspace_peak_bytes: usize = 0,
+        v18_bounded_tsqr_cancellation_checks: usize = 0,
+        v18_exact_f32_probability_heads: usize = 0,
+        v18_gram_heads: usize = 0,
+        v18_scored_reuse_heads: usize = 0,
+        v18_gram_backend_calls: usize = 0,
+        v18_bounded_heads: usize = 0,
+        v18_primary_budget_percent: u8 = 0,
+        v18_budget_fallback_heads: usize = 0,
+        v18_bounded_provider_calls: u64 = 0,
+        v18_bounded_provider_rows: u64 = 0,
+        v18_bounded_workspace_bound_bytes: usize = 0,
+        v18_bounded_scoring_cache_prepares: usize = 0,
+        v18_bounded_scoring_selection_hits: usize = 0,
+        v18_bounded_scoring_fit_hits: usize = 0,
+        v18_bounded_range_cache_prepares: usize = 0,
+        v18_bounded_geometry_cache_requests: usize = 0,
+        v18_bounded_geometry_cache_hits: usize = 0,
+        v18_bounded_geometry_cache_loads: usize = 0,
+        v18_bounded_delta_heads: usize = 0,
+        v18_bounded_delta_tiles: usize = 0,
+        v18_bounded_delta_backend_calls: usize = 0,
+        v18_bounded_delta_packed_bytes_peak: usize = 0,
+        v18_bounded_delta_staged_bytes_peak: usize = 0,
+        v18_bounded_delta_fallbacks: usize = 0,
+        v18_numerical_policy: runtime.kv.attention_match_engine.Options.AdaptiveV18NumericalPolicy = .legacy_dense_f64,
+        v18_cache_prepare_ns: u64 = 0,
+        v18_selection_freeze_ns: u64 = 0,
+        v18_joint_value_fit_ns: u64 = 0,
+        v18_gram_construction_ns: u64 = 0,
+        v18_chooser_ns: u64 = 0,
+        v18_final_heldout_ns: u64 = 0,
+        training_reduction_local_original_calls: usize = 0,
+        training_reduction_rounded_harm_calls: usize = 0,
+        training_reduction_tiles: usize = 0,
+        training_reduction_backend_calls: usize = 0,
+        training_reduction_workspace_peak_bytes: usize = 0,
+        training_policy: NativeCheckpointTrainingPolicy = .primary_only,
+        future_training_authority: ?runtime.kv.attention_match_future_decode_training.Authority = null,
+        private_dense512_query_rows: usize = 0,
+        private_query_live_bytes: usize = 0,
+        planned_private_query_bytes: usize = 0,
+        primary_query_collection: quality_mod.QueryCollectionDiagnostic = .{},
+        dense512_query_collection: quality_mod.QueryCollectionDiagnostic = .{},
+        query_collection_combined_before_fit_ns: u64 = 0,
+        /// Set only after full candidate validation and request-private
+        /// publication have completed. This is not a consumer installation.
+        validation_complete: bool = false,
+        request_private_publish_complete: bool = false,
+        prompt_tokens_sha256: [32]u8 = @splat(0),
+        prompt_tokens: usize = 0,
+        source_checkpoint_sha256: [32]u8 = @splat(0),
     };
     pub fn deinit(self: *@This()) void {
-        if (self.result) |*result| result.checkpoint.deinit();
+        if (self.result) |*result| result.payload.deinit();
         self.result = null;
+        if (self.qualification_phase_telemetry) |*owned| owned.deinit();
+        self.qualification_phase_telemetry = null;
     }
 };
 
@@ -179,16 +842,22 @@ pub const QueryOptions = struct {
     max_repeat_tokens: ?usize = null,
     /// Select prefix-wide study passages within the same repeat budget.
     representative_repeat: bool = false,
+    study_pass: u8 = 0,
+    explicit_repeat_tokens: ?[]const i64 = null,
+    explicit_repeat_sha256: ?[32]u8 = null,
+    explicit_sample_offsets: ?[]const u32 = null,
     max_source_tokens: usize = native_kv_checkpoint.max_context_tokens,
     /// Additional shadow KV capacity, including growth copies. Activations
     /// still use the backend's observed request allocation budget.
     max_shadow_kv_bytes: usize = 4 * 1024 * 1024 * 1024,
+    owner_component_diagnostic_request: u64 = 0,
 };
 
 pub const QueryStats = struct {
     ragged_repeat_calls: usize = 0,
     prefix_ns: u64 = 0,
     repeat_ns: u64 = 0,
+    forward_calls: usize = 0,
     repeat_kernel_launches: usize = 0,
     split_kernel_launches: usize = 0,
     scratch_bytes: usize = 0,
@@ -196,6 +865,33 @@ pub const QueryStats = struct {
     cleanup_ns: u64 = 0,
     cloned_bytes: usize = 0,
     shadow_allocation_bound_bytes: usize = 0,
+    shadow_owner_id: u64 = 0,
+    shadow_scope_generation: u64 = 0,
+    shadow_owner_peak_bytes: u64 = 0,
+    shadow_scope_released: bool = false,
+    shadow_scope_delta_bytes: ?u64 = null,
+    shadow_uses_source_owner: bool = false,
+    shadow_scope_before_bytes: u64 = 0,
+    shadow_scope_after_bytes: u64 = 0,
+    shadow_scope_before_logical_bytes: u64 = 0,
+    shadow_scope_after_logical_bytes: u64 = 0,
+    shadow_scope_before_physical_bytes: u64 = 0,
+    shadow_scope_after_physical_bytes: u64 = 0,
+    shadow_scope_before_shared_bytes: u64 = 0,
+    shadow_scope_after_shared_bytes: u64 = 0,
+    shadow_scope_before_private_bytes: u64 = 0,
+    shadow_scope_after_private_bytes: u64 = 0,
+    parent_retained_before_bytes: u64 = 0,
+    parent_retained_after_bytes: u64 = 0,
+    parent_retained_delta_bytes: ?i64 = null,
+    parent_retained_before_logical_bytes: u64 = 0,
+    parent_retained_after_logical_bytes: u64 = 0,
+    parent_retained_before_physical_bytes: u64 = 0,
+    parent_retained_after_physical_bytes: u64 = 0,
+    parent_retained_before_shared_bytes: u64 = 0,
+    parent_retained_after_shared_bytes: u64 = 0,
+    parent_retained_before_private_bytes: u64 = 0,
+    parent_retained_after_private_bytes: u64 = 0,
 };
 
 /// Diagnostic sink deliberately cannot publish a checkpoint. The probe has
@@ -492,7 +1188,7 @@ pub const Runtime = struct {
     pub fn prepareNativeCheckpoint(self: *Runtime, request: *PrepareRequest, tokens: []const i64, logits: []const f32, source: *const NativeDecodeState) !void {
         if (request.result != null or !std.math.isFinite(request.minimum_savings_ratio) or request.minimum_savings_ratio <= 1 or request.minimum_savings_ratio > 4 or request.validation_workers != 1)
             return error.InvalidNativeCheckpointRequest;
-        const plan = try PrepareRequest.hostPlan(self.context.model.*, tokens.len, request.encoding);
+        const plan = try PrepareRequest.hostPlan(self.context.model.*, tokens.len, request.encoding, false);
         if (request.planned_fit_host_bytes) |admitted| {
             if (admitted != plan.fit_bytes) return error.InvalidNativeCheckpointRequest;
         }

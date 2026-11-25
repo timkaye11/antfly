@@ -15,6 +15,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
@@ -77,17 +78,50 @@ class LogFormatTests(unittest.TestCase):
                 patch.object(q.time, "sleep"),
                 self.assertRaises(TimeoutError),
             ):
-                q.wait_prefill_route(log, offset, 1)
+                q.wait_prefill_route(SimpleNamespace(backend="cuda"), log, offset, 1)
             with log.open("a") as f:
                 f.write("info: " + MARKER + "\n")
-            self.assertEqual(q.wait_prefill_route(log, offset, 1), MARKER)
+            self.assertEqual(q.wait_prefill_route(SimpleNamespace(backend="cuda"), log, offset, 1), MARKER)
 
     def test_log_truncation_does_not_reuse_old_request(self):
         with tempfile.TemporaryDirectory(dir=HERE) as directory:
             log = Path(directory) / "worker.log"
             log.write_text("")
             with self.assertRaisesRegex(RuntimeError, "truncated"):
-                q.wait_prefill_route(log, 100, 1)
+                q.wait_prefill_route(SimpleNamespace(backend="cuda"), log, 100, 1)
+
+    def test_metal_prefill_uses_fresh_owner_ledger(self):
+        row = {"schema": "antfly.metal-checkpoint-phase.v1", "phase": "prefill_started",
+               "request": 1, "owner_id": 7, "owner_available": True,
+               "physical_available": True, "combined_available": True}
+        with tempfile.TemporaryDirectory(dir=HERE) as directory:
+            log = Path(directory) / "worker.log"
+            log.write_text("metal_checkpoint_qualification " + json.dumps(row) + "\n")
+            offset = log.stat().st_size
+            row.update(request=2, owner_id=9)
+            with log.open("a") as stream:
+                stream.write("metal_checkpoint_qualification " + json.dumps(row) + "\n")
+            self.assertEqual(q.wait_prefill_route(SimpleNamespace(backend="metal"), log, offset, 1), row)
+
+    def test_metal_prefill_rejects_ambiguous_fresh_owners(self):
+        row = {"schema": "antfly.metal-checkpoint-phase.v1", "phase": "prefill_started",
+               "request": 1, "owner_id": 7, "owner_available": True,
+               "physical_available": True, "combined_available": True}
+        with tempfile.TemporaryDirectory(dir=HERE) as directory:
+            log = Path(directory) / "worker.log"
+            log.write_text(("metal_checkpoint_qualification " + json.dumps(row) + "\n") * 2)
+            with self.assertRaisesRegex(AssertionError, "ambiguous"):
+                q.wait_prefill_route(SimpleNamespace(backend="metal"), log, 0, 1)
+
+    def test_metal_prefill_requires_complete_owner_accounting(self):
+        row = {"schema": "antfly.metal-checkpoint-phase.v1", "phase": "prefill_started",
+               "request": 1, "owner_id": 7, "owner_available": True,
+               "physical_available": False, "combined_available": True}
+        with tempfile.TemporaryDirectory(dir=HERE) as directory:
+            log = Path(directory) / "worker.log"
+            log.write_text("metal_checkpoint_qualification " + json.dumps(row) + "\n")
+            with self.assertRaisesRegex(AssertionError, "invalid Metal prefill"):
+                q.wait_prefill_route(SimpleNamespace(backend="metal"), log, 0, 1)
 
     def test_observed_standalone_log_reproduces_the_fixed_parse(self):
         # Exact format observed in the failed standalone qualification log.

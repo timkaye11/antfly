@@ -14,6 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const Cleanup = @import("../execution/cleanup_context.zig").Context;
 const cache_mod = @import("cache.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
@@ -22,6 +24,14 @@ const platform = @import("antfly_platform");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const runtime = @import("../runtime/root.zig");
 const view_metadata = @import("../runtime/kv/view_metadata.zig");
+const metal_kv_storage = @import("../backends/metal_kv_storage.zig");
+const context_teacher_forced = @import("../backends/context_teacher_forced.zig");
+const qualification_identity = @import("../runtime/qualification_identity.zig");
+
+pub const RequestKvNumericalAuthority = enum {
+    outer_storage,
+    compiled_whole_model,
+};
 
 fn selectedScoreCancellationCheck(raw: ?*anyopaque) callconv(.c) c_int {
     const control: *const InferenceExecutionControl = @ptrCast(@alignCast(raw orelse return 0));
@@ -81,8 +91,30 @@ pub const NativeDecodeState = struct {
     execution_backend: ?@import("../ops/ops.zig").ComputeBackend = null,
     execution_control: ?InferenceExecutionControl = null,
     allocator: std.mem.Allocator,
+    context_metadata_allocator: ?std.mem.Allocator = null,
+    context_session: ?runtime.kv.context_session.Hook = null,
+    last_context_metrics: ?runtime.kv.context_session.Metrics = null,
+    last_context_split_decode_dispatches: u64 = 0,
+    last_context_flash_prefill_dispatches: u64 = 0,
+    last_context_optimization_dispatches_available: bool = false,
+    last_context_framed_attention_dispatches: u64 = 0,
+    last_context_standalone_attention_dispatches: u64 = 0,
+    last_context_device_allocation_start: runtime.kv.storage_runtime.DeviceAllocationSnapshot = .{},
+    last_context_device_allocation_end: runtime.kv.storage_runtime.DeviceAllocationSnapshot = .{},
+    last_context_session_allocation_start: runtime.kv.host_allocation_tracker.Snapshot = .{},
+    last_context_session_allocation_end: runtime.kv.host_allocation_tracker.Snapshot = .{},
+    last_context_owner_committed: ?runtime.kv.host_allocation_tracker.Snapshot = null,
+    last_context_packed_singleton_seal: @import("../backends/packed_context_session.zig").Session.SingletonDecodeSealEvidence = .{},
+    last_context_fault_before: if (builtin.is_test) ?@import("../backends/packed_context_session.zig").FailureFingerprint else void = if (builtin.is_test) null else {},
+    last_context_fault_after: if (builtin.is_test) ?@import("../backends/packed_context_session.zig").FailureFingerprint else void = if (builtin.is_test) null else {},
+    last_context_fault_partial: if (builtin.is_test) ?@import("../backends/packed_context_session.zig").FailureFingerprint else void = if (builtin.is_test) null else {},
+    last_context_session_allocation_exclusive: bool = false,
+    last_context_session_released: bool = false,
+    last_context_session_post_release_live_bytes: ?u64 = null,
+    last_context_full_owner_physical_available: bool = false,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
+    kv_numerical_authority: RequestKvNumericalAuthority = .outer_storage,
     /// Optional external lock for shared paged KV metadata/storage. Batch
     /// generation wires every decode state in a group to the same manager and
     /// storage runtime, so admission reads and KV mutations must share this
@@ -116,6 +148,7 @@ pub const NativeDecodeState = struct {
     selection_capture_enabled: bool = false,
     selection_queries: std.ArrayListUnmanaged(SelectionQueryEntry) = .empty,
     selection_protected_spans: []const runtime.kv.selection.ProtectedSpan = &.{},
+    quality_context_instance_id: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
 
     pub fn initContiguous(allocator: std.mem.Allocator) NativeDecodeState {
         return .{
@@ -165,7 +198,11 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn isPaged(self: *const NativeDecodeState) bool {
-        return self.kv_manager != null and !self.force_full_recompute;
+        return self.context_session != null or (self.kv_manager != null and !self.force_full_recompute);
+    }
+
+    pub fn hasRetainedAttention(self: *const NativeDecodeState) bool {
+        return self.context_session != null or self.kvView() != null;
     }
 
     pub fn isKvCompacted(self: *const NativeDecodeState) bool {
@@ -305,6 +342,10 @@ pub const NativeDecodeState = struct {
     }
 
     fn ensureAttachedUnlocked(self: *NativeDecodeState) !void {
+        // Packed context sessions own retained KV and sequence positions. They
+        // are paged from the decoder's point of view, but must never attach a
+        // legacy KvManager sequence or allocate legacy pages.
+        if (self.context_session != null) return;
         if (!self.isPaged()) return;
         if (self.sequence_id != null) return;
         self.sequence_id = try self.kv_manager.?.attachSequence(self.pool_id orelse return error.InvalidPoolId);
@@ -499,7 +540,7 @@ pub const NativeDecodeState = struct {
         }
     }
 
-    fn kvPageSizeTokens(self: *const NativeDecodeState) ?usize {
+    pub fn kvPageSizeTokens(self: *const NativeDecodeState) ?usize {
         const manager = self.kv_manager orelse return null;
         const pool_id = self.pool_id orelse return null;
         const pool = manager.getPool(pool_id) orelse return null;
@@ -567,13 +608,17 @@ pub const NativeDecodeState = struct {
         };
     }
 
+    fn contextMetadataAllocator(self: *const NativeDecodeState) std.mem.Allocator {
+        return self.context_metadata_allocator orelse self.allocator;
+    }
+
     const PreparedKvView = struct {
         state: *NativeDecodeState,
         count: usize,
         replacement: view_metadata.Table = .empty,
 
         fn deinit(self: *@This()) void {
-            self.replacement.deinit(self.state.allocator);
+            self.replacement.deinit(self.state.contextMetadataAllocator());
             self.replacement = .empty;
         }
 
@@ -610,13 +655,14 @@ pub const NativeDecodeState = struct {
         var prepared = PreparedKvView{ .state = self, .count = count };
         errdefer prepared.deinit();
         if (count > self.kv_block_ids.capacity) {
-            try prepared.replacement.ensureTotalCapacityPrecise(self.allocator, try view_metadata.capacityForBlocks(count));
-            if (self.kv_block_ids.capacity != 0) try self.retired_kv_block_ids.ensureTotalCapacityPrecise(self.allocator, try view_metadata.capacityForBlocks(self.retired_kv_block_ids.items.len + 1));
+            const allocator = self.contextMetadataAllocator();
+            try prepared.replacement.ensureTotalCapacityPrecise(allocator, try view_metadata.capacityForBlocks(count));
+            if (self.kv_block_ids.capacity != 0) try self.retired_kv_block_ids.ensureTotalCapacityPrecise(allocator, try view_metadata.capacityForBlocks(self.retired_kv_block_ids.items.len + 1));
         }
         return prepared;
     }
 
-    fn syncPagedKvBlockTable(self: *NativeDecodeState) !void {
+    pub fn syncPagedKvBlockTable(self: *NativeDecodeState) !void {
         self.kv_block_ids_synchronized = false;
         const manager = self.kv_manager orelse {
             self.kv_block_ids.clearRetainingCapacity();
@@ -693,8 +739,9 @@ pub const NativeDecodeState = struct {
     }
 
     fn deinitRetiredKvBlockIds(self: *NativeDecodeState) void {
-        for (self.retired_kv_block_ids.items) |*table| table.deinit(self.allocator);
-        self.retired_kv_block_ids.deinit(self.allocator);
+        const allocator = self.contextMetadataAllocator();
+        for (self.retired_kv_block_ids.items) |*table| table.deinit(allocator);
+        self.retired_kv_block_ids.deinit(allocator);
         self.retired_kv_block_ids = .empty;
     }
 
@@ -756,7 +803,7 @@ pub const NativeDecodeState = struct {
         self.selection_queries = .empty;
         self.deinitRetiredKvBlockIds();
         self.kv_block_ids_synchronized = false;
-        self.kv_block_ids.deinit(self.allocator);
+        self.kv_block_ids.deinit(self.contextMetadataAllocator());
         self.kv_block_ids = .empty;
         self.sequence_id = null;
         self.kv_view = null;
@@ -788,7 +835,7 @@ pub const NativeDecodeState = struct {
         self.selection_queries.deinit(self.allocator);
         self.deinitRetiredKvBlockIds();
         self.kv_block_ids_synchronized = false;
-        self.kv_block_ids.deinit(self.allocator);
+        self.kv_block_ids.deinit(self.contextMetadataAllocator());
         self.sequence_id = null;
         self.kv_view = null;
         self.kv_compacted = false;
@@ -917,6 +964,10 @@ pub const NativeDecodeState = struct {
         return self.notePrefillWithCleanup(token_count, .{});
     }
     pub fn notePrefillWithCleanup(self: *NativeDecodeState, token_count: usize, current: Cleanup) !void {
+        if (self.context_session != null) {
+            self.total_tokens = token_count;
+            return;
+        }
         if (self.isPaged()) {
             const lock = self.lockPagedKv();
             defer if (lock) |mutex| mutex.unlock();
@@ -947,6 +998,10 @@ pub const NativeDecodeState = struct {
         return self.appendPrefillChunkWithCleanup(token_count, .{});
     }
     pub fn appendPrefillChunkWithCleanup(self: *NativeDecodeState, token_count: usize, current: Cleanup) !void {
+        if (self.context_session != null) {
+            self.total_tokens = try std.math.add(usize, self.total_tokens, token_count);
+            return;
+        }
         if (self.isPaged()) {
             const lock = self.lockPagedKv();
             defer if (lock) |mutex| mutex.unlock();
@@ -1031,6 +1086,10 @@ pub const NativeDecodeState = struct {
         return self.appendGeneratedTokenWithCleanup(.{});
     }
     pub fn appendGeneratedTokenWithCleanup(self: *NativeDecodeState, current: Cleanup) !void {
+        if (self.context_session != null) {
+            self.total_tokens = try std.math.add(usize, self.total_tokens, 1);
+            return;
+        }
         const lock = if (self.isPaged()) self.lockPagedKv() else null;
         defer if (lock) |mutex| mutex.unlock();
         try self.appendGeneratedTokenWithKvLockHeldWithCleanup(current);
@@ -1042,6 +1101,10 @@ pub const NativeDecodeState = struct {
         return self.appendGeneratedTokenWithKvLockHeldWithCleanup(.{});
     }
     pub fn appendGeneratedTokenWithKvLockHeldWithCleanup(self: *NativeDecodeState, current: Cleanup) !void {
+        if (self.context_session != null) {
+            self.total_tokens = try std.math.add(usize, self.total_tokens, 1);
+            return;
+        }
         if (try self.tryAtomicGeneratedAppend(1, current)) return;
         self.kv_block_ids_synchronized = false;
         self.total_tokens += 1;
@@ -1071,6 +1134,10 @@ pub const NativeDecodeState = struct {
         return self.appendGeneratedTokensWithCleanup(count, .{});
     }
     pub fn appendGeneratedTokensWithCleanup(self: *NativeDecodeState, count: usize, current: Cleanup) !void {
+        if (self.context_session != null) {
+            self.total_tokens = try std.math.add(usize, self.total_tokens, count);
+            return;
+        }
         if (count > 0 and self.isPaged() and self.sequence_id != null) {
             const lock = self.lockPagedKv();
             defer if (lock) |mutex| mutex.unlock();
@@ -1109,6 +1176,7 @@ pub const NativeDecodeState = struct {
     }
     pub fn truncateTokensWithCleanup(self: *NativeDecodeState, count: usize, current: Cleanup) !void {
         if (count > self.total_tokens) return error.TruncateBeyondStart;
+        if (count != 0 and self.context_session != null) return error.ContextRollbackUnsupported;
         if (count != 0 and self.isPaged()) {
             const lock = self.lockPagedKv();
             defer if (lock) |mutex| mutex.unlock();
@@ -1214,7 +1282,128 @@ pub const NativeDecodeState = struct {
         return self.kv_view;
     }
 
+    /// Qualification-only ordinary exact context fingerprint. Packed exact
+    /// and attention-matching owners have distinct authenticated inventories.
+    pub fn qualificationOrdinaryExactFingerprint(
+        self: *NativeDecodeState,
+        allocator: std.mem.Allocator,
+        expected_prompt_tokens: usize,
+        layout: runtime.context_policy.Layout,
+    ) !context_teacher_forced.QualityFingerprint {
+        if (comptime !builtin.is_test) return error.QualificationOnly;
+        if (!build_options.enable_metal or self.context_session != null or self.kv_compacted or self.force_full_recompute)
+            return error.OrdinaryExactMetalKvRequired;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const storage = self.kv_storage orelse return error.OrdinaryExactMetalKvRequired;
+        const hook = storage.device_write_hook orelse return error.OrdinaryExactMetalKvRequired;
+        const view = self.kv_view orelse return error.InvalidQualificationFingerprint;
+        if (expected_prompt_tokens == 0 or self.total_tokens != expected_prompt_tokens or
+            view.token_count != expected_prompt_tokens or self.sequence_id == null or
+            view.sequence_id != self.sequence_id.?) return error.InvalidQualificationFingerprint;
+        const logical_blocks = view.logical_blocks orelse return error.InvalidQualificationFingerprint;
+        if (layout.len == 0 or layout.len > gpt_mod.max_attention_layers) return error.InvalidQualificationFingerprint;
+        var owner_layers: [gpt_mod.max_attention_layers]u32 = undefined;
+        var owner_count: usize = 0;
+        for (layout.layers[0..layout.len], 0..) |layer, index| {
+            if (layer.owner != index) continue;
+            owner_layers[owner_count] = @intCast(index);
+            owner_count += 1;
+        }
+        if (owner_count == 0) return error.InvalidQualificationFingerprint;
+        if (self.quality_context_instance_id == 0)
+            self.quality_context_instance_id = try qualification_identity.allocate();
+        return metal_kv_storage.MetalKvStorage.qualificationFingerprintDeviceHook(hook, allocator, .{
+            .context_instance_id = self.quality_context_instance_id,
+            .sequence_id = view.sequence_id,
+            .logical_tokens = std.math.cast(u32, expected_prompt_tokens) orelse return error.QualificationFingerprintOverflow,
+            .position_offset = std.math.cast(u32, view.position_offset) orelse return error.QualificationFingerprintOverflow,
+            .logical_blocks = logical_blocks,
+            .owner_layers = owner_layers[0..owner_count],
+        });
+    }
+
+    pub fn qualificationOrdinaryExactInventory(
+        self: *NativeDecodeState,
+        allocator: std.mem.Allocator,
+        expected_prompt_tokens: usize,
+        layout: runtime.context_policy.Layout,
+    ) !metal_kv_storage.MetalKvStorage.QualificationInventoryOwned {
+        if (comptime !builtin.is_test) return error.QualificationOnly;
+        if (self.quality_context_instance_id == 0)
+            self.quality_context_instance_id = try qualification_identity.allocate();
+        return self.ordinaryExactInventoryImpl(allocator, expected_prompt_tokens, layout, self.quality_context_instance_id, null);
+    }
+
+    /// Read-only production census of the current raw source. The live storage
+    /// owner supplies its identity; the device hook authenticates the exact
+    /// token, shape, binary and freeze tuple before returning any inventory.
+    pub fn ordinaryExactInventory(
+        self: *const NativeDecodeState,
+        allocator: std.mem.Allocator,
+        expected_prompt_tokens: usize,
+        layout: runtime.context_policy.Layout,
+        seal: metal_kv_storage.MetalKvStorage.RawInventorySeal,
+    ) !metal_kv_storage.MetalKvStorage.QualificationInventoryOwned {
+        try seal.validate();
+        const storage = self.kv_storage orelse return error.OrdinaryExactMetalKvRequired;
+        const tracker = storage.ownerAllocationTracker() orelse return error.ContextPhysicalAccountingUnavailable;
+        const owner = tracker.snapshot();
+        if (!owner.available or !owner.physical_available or owner.owner_identity == 0)
+            return error.ContextPhysicalAccountingUnavailable;
+        return self.ordinaryExactInventoryImpl(allocator, expected_prompt_tokens, layout, owner.owner_identity, seal);
+    }
+
+    fn ordinaryExactInventoryImpl(
+        self: *const NativeDecodeState,
+        allocator: std.mem.Allocator,
+        expected_prompt_tokens: usize,
+        layout: runtime.context_policy.Layout,
+        context_instance_id: u64,
+        seal: ?metal_kv_storage.MetalKvStorage.RawInventorySeal,
+    ) !metal_kv_storage.MetalKvStorage.QualificationInventoryOwned {
+        if (!build_options.enable_metal or self.context_session != null or self.kv_compacted or self.force_full_recompute)
+            return error.OrdinaryExactMetalKvRequired;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const storage = self.kv_storage orelse return error.OrdinaryExactMetalKvRequired;
+        const hook = storage.device_write_hook orelse return error.OrdinaryExactMetalKvRequired;
+        const view = self.kv_view orelse return error.InvalidQualificationFingerprint;
+        const logical_blocks = view.logical_blocks orelse return error.InvalidQualificationFingerprint;
+        if (expected_prompt_tokens == 0 or self.total_tokens != expected_prompt_tokens or view.token_count != expected_prompt_tokens or
+            self.sequence_id == null or view.sequence_id != self.sequence_id.? or layout.len == 0 or layout.len > gpt_mod.max_attention_layers)
+            return error.InvalidQualificationFingerprint;
+        var owner_layers: [gpt_mod.max_attention_layers]u32 = undefined;
+        var owner_count: usize = 0;
+        for (layout.layers[0..layout.len], 0..) |layer, index| if (layer.owner == index) {
+            owner_layers[owner_count] = @intCast(index);
+            owner_count += 1;
+        };
+        if (owner_count == 0) return error.InvalidQualificationFingerprint;
+        const request: metal_kv_storage.MetalKvStorage.QualificationFingerprintRequest = .{
+            .context_instance_id = context_instance_id,
+            .sequence_id = view.sequence_id,
+            .logical_tokens = std.math.cast(u32, expected_prompt_tokens) orelse return error.QualificationFingerprintOverflow,
+            .position_offset = std.math.cast(u32, view.position_offset) orelse return error.QualificationFingerprintOverflow,
+            .logical_blocks = logical_blocks,
+            .owner_layers = owner_layers[0..owner_count],
+        };
+        if (seal) |authority|
+            return metal_kv_storage.MetalKvStorage.rawStructuralInventoryDeviceHook(hook, allocator, request, authority);
+        return metal_kv_storage.MetalKvStorage.qualificationInventoryDeviceHook(hook, allocator, request);
+    }
+
     pub fn gptDecodeContext(self: *NativeDecodeState, seq_len: usize, query_seq_len: usize) gpt_arch.DecodeContext {
+        if (self.context_session) |hook| return .{
+            .context_session = hook,
+            .attention_mode = if (query_seq_len == 1 and seq_len > 1) .paged_decode else .paged_prefill,
+            .total_sequence_len = seq_len,
+            .query_sequence_len = query_seq_len,
+            .kv_sequence_len = seq_len,
+            .moe_runtime = &self.moe_runtime,
+            .dense_ffn_program = self.dense_ffn_program,
+            .gemma4_layer_spec_cache = &self.gemma4_layer_spec_cache,
+        };
         const decode_positions: ?[]const u32 = if (self.qwen3vl_mrope_position_delta != null and query_seq_len == 1 and seq_len > 0) blk: {
             const position = @as(i64, @intCast(seq_len - 1)) + self.qwen3vl_mrope_position_delta.?;
             if (position < 0 or position > std.math.maxInt(u32)) break :blk null;
@@ -1315,6 +1504,12 @@ fn StateRuntime(comptime ownership: enum { owned, borrowed }) type {
             return self.rollbackReservedPrefillWithCleanup(reserved, .{});
         }
         pub fn rollbackReservedPrefillWithCleanup(self: *Self, reserved: usize, current: Cleanup) !void {
+            // A packed session advances its own retained context during the
+            // physical forward, not during this legacy reservation step. A
+            // reservation rollback is therefore a no-op; direct token
+            // truncation remains rejected by NativeDecodeState because that
+            // would be a real context rollback.
+            if (self.state.context_session != null) return;
             if (reserved != 0) try self.truncateGeneratedTokensWithCleanup(reserved, current);
         }
 

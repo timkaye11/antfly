@@ -21,8 +21,35 @@ const Interruption = @import("../execution_control.zig").Interruption;
 const UninterruptibleGuard = @import("../execution_control.zig").UninterruptibleGuard;
 const ops = @import("../ops/ops.zig");
 const contracts = @import("backend_contracts.zig");
+const recent_prefill_query_capture = @import("recent_prefill_query_capture.zig");
+const kv_storage = @import("../runtime/kv/storage_runtime.zig");
+const owner_alloc = @import("../runtime/kv/host_allocation_tracker.zig");
+const checkpoint = @import("../runtime/kv/attention_match_checkpoint.zig");
 const CloseScope = @import("../backends/session.zig").Session.CloseScope;
 const CleanupContext = @import("../execution/cleanup_context.zig").Context;
+
+/// Ephemeral authority binding a mutable compiled runtime to one request scope.
+pub const ContextOwnerBinding = struct {
+    owner: *owner_alloc.RequestAllocationOwner,
+    witness: owner_alloc.RequestAllocationOwner.ContextScopeWitness,
+
+    pub fn validate(self: ContextOwnerBinding) !void {
+        try self.owner.validateContextScopeWitness(self.witness);
+    }
+};
+
+pub fn sameOptionalModelIdentity(a: ?checkpoint.Identity, b: ?checkpoint.Identity) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.eql(b.?);
+}
+
+pub const RecentPrefillQueryCaptureDescriptor = recent_prefill_query_capture.Descriptor;
+pub const RecentPrefillQueryNativePlanRequest = recent_prefill_query_capture.NativePlanRequest;
+pub const RecentPrefillQueryNativePlan = recent_prefill_query_capture.NativePlan;
+pub const RecentPrefillQueryNativePlanBatch = recent_prefill_query_capture.NativePlanBatch;
+pub const RecentPrefillQueryNativeBatchTransport = recent_prefill_query_capture.NativeBatchTransport;
+pub const RecentPrefillQueryCaptureEncodeRequest = recent_prefill_query_capture.EncodeRequest;
+pub const RecentPrefillQueryCaptureCompletion = recent_prefill_query_capture.Completion;
 
 /// Backend-owned model runtime state.
 ///
@@ -45,6 +72,8 @@ pub const ModelRuntime = struct {
 
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Immutable authority scope copied from the executor at construction.
+    model_identity: ?checkpoint.Identity = null,
 
     pub const VTable = struct {
         capabilities: ?*const fn (ctx: *anyopaque) RuntimeCapabilities = null,
@@ -86,16 +115,39 @@ pub const ModelRuntime = struct {
             allocator: std.mem.Allocator,
             request: DecodeRequest,
         ) anyerror!GreedyDecodeOutput = null,
+        verify_greedy_transaction: ?*const fn (
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: GreedyVerifyRequest,
+        ) anyerror!GreedyVerifyOutput = null,
         /// Retain resources needed by resident outputs independently of cache
         /// ownership. Host-only outputs do not pin the runtime.
         retain_output_owner: ?*const fn (ctx: *anyopaque) OutputOwner = null,
         deinit: *const fn (ctx: *anyopaque) void,
         cold_cleanup_services: ?*const ColdCleanupServices = null,
         reset: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        finish_prefill_for_decode: ?*const fn (ctx: *anyopaque, request: PrepareRequest) anyerror!bool = null,
+        exact_paged_kv_authority: ?*const fn (ctx: *anyopaque) anyerror!ExactPagedKvSourceAuthority = null,
+        export_exact_paged_kv_ranges: ?*const fn (ctx: *anyopaque, request: ExactPagedKvRangeExportRequest) anyerror!kv_storage.ExactLayerRangeExportResult = null,
+        handoff_exact_paged_kv: ?*const fn (ctx: *anyopaque, request: ExactPagedKvHandoffRequest) anyerror!ExactPagedKvHandoffReceipt = null,
+        discard_exact_paged_kv_source: ?*const fn (ctx: *anyopaque, request: ExactPagedKvSourceDiscardRequest) anyerror!ExactPagedKvSourceDiscardReceipt = null,
+        bind_context_owner: ?*const fn (ctx: *anyopaque, binding: ContextOwnerBinding) anyerror!void = null,
+        /// Drain backend-owned request storage and reconcile its owner ledger
+        /// before a committed owner snapshot is observed.
+        drain_context_owner_snapshot: ?*const fn (ctx: *anyopaque, binding: ContextOwnerBinding) anyerror!void = null,
+        context_owner_binding_state: ?*const fn (ctx: *anyopaque, binding: ContextOwnerBinding) ContextOwnerBindingState = null,
         debug_timing_stats: ?*const fn (ctx: *anyopaque) RuntimeDebugTimingStats = null,
         reset_debug_timing_stats: ?*const fn (ctx: *anyopaque) void = null,
         print_debug_timing: ?*const fn (ctx: *anyopaque) void = null,
     };
+
+    pub const ContextOwnerBindingState = enum { unbound, exact, other };
+
+    pub fn contextOwnerBindingState(self: *const ModelRuntime, binding: ContextOwnerBinding) !ContextOwnerBindingState {
+        try binding.validate();
+        const state_fn = self.vtable.context_owner_binding_state orelse return error.ContextPhysicalAccountingUnavailable;
+        return state_fn(self.ptr, binding);
+    }
 
     pub fn capabilities(self: *const ModelRuntime) RuntimeCapabilities {
         const caps_fn = self.vtable.capabilities orelse return .{
@@ -107,6 +159,8 @@ pub const ModelRuntime = struct {
         caps.supports_decode = caps.supports_decode and self.vtable.decode != null;
         caps.supports_sample_decode = caps.supports_sample_decode and self.vtable.decode_sample != null;
         caps.supports_greedy_decode = caps.supports_greedy_decode and self.vtable.decode_greedy != null;
+        caps.supports_greedy_verify_transaction = caps.supports_greedy_verify_transaction and
+            self.vtable.verify_greedy_transaction != null;
         return caps;
     }
 
@@ -169,6 +223,101 @@ pub const ModelRuntime = struct {
     }
     pub fn resetWithOperation(self: *ModelRuntime, borrowed: ?@import("../execution/backend_operation.zig").Borrowed) !void {
         if (self.vtable.reset) |reset_fn| try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), borrowed, reset_fn, .{self.ptr});
+    }
+
+    pub fn bindContextOwner(self: *ModelRuntime, binding: ContextOwnerBinding) !void {
+        try binding.validate();
+        const bind_fn = self.vtable.bind_context_owner orelse
+            return error.ContextPhysicalAccountingUnavailable;
+        try bind_fn(self.ptr, binding);
+    }
+
+    pub fn drainContextOwnerSnapshot(self: *ModelRuntime, binding: ContextOwnerBinding) !void {
+        try binding.validate();
+        const drain_fn = self.vtable.drain_context_owner_snapshot orelse
+            return error.ContextOwnerDrainUnsupported;
+        try drain_fn(self.ptr, binding);
+    }
+
+    pub fn finishPrefillForDecode(self: *ModelRuntime, request: PrepareRequest) !bool {
+        const finish_fn = self.vtable.finish_prefill_for_decode orelse {
+            try request.check();
+            return false;
+        };
+        // The backend hook owns both request checks so it can arm cleanup
+        // before the first cancellation point and retain that cleanup through
+        // the post-transition check.
+        return finish_fn(self.ptr, request);
+    }
+
+    /// Copies the completed exact prefill cache into a fresh request-owned
+    /// paged destination. The backend must leave the source unchanged. The
+    /// caller owns destination rollback if this operation fails.
+    pub fn handoffExactPagedKv(self: *ModelRuntime, request: ExactPagedKvHandoffRequest) !ExactPagedKvHandoffReceipt {
+        try request.validate();
+        const handoff_fn = self.vtable.handoff_exact_paged_kv orelse return error.UnsupportedExactPagedKvHandoff;
+        var hard_cancellation = if (request.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
+        const receipt = try handoff_fn(self.ptr, request);
+        try request.validateReceipt(receipt);
+        try request.check();
+        return receipt;
+    }
+
+    pub fn exactPagedKvAuthority(self: *ModelRuntime) !ExactPagedKvSourceAuthority {
+        const authority_fn = self.vtable.exact_paged_kv_authority orelse return error.UnsupportedExactPagedKvHandoff;
+        const authority = try authority_fn(self.ptr);
+        try authority.validate();
+        return authority;
+    }
+
+    pub fn exportExactPagedKvRanges(self: *ModelRuntime, request: ExactPagedKvRangeExportRequest) !kv_storage.ExactLayerRangeExportResult {
+        try request.validate();
+        const expected = try (kv_storage.ExactLayerRangeExportRequest{
+            .source_sequence = request.authority.source_sequence,
+            .expected_written_tokens = request.authority.logical_tokens,
+            .ranges = request.ranges,
+            .max_bytes = request.max_copy_bytes,
+            .check_ctx = request.check_ctx,
+            .check_fn = request.check_fn,
+        }).validate();
+        const export_fn = self.vtable.export_exact_paged_kv_ranges orelse return error.UnsupportedExactPagedKvRangeExport;
+        const result = try export_fn(self.ptr, request);
+        if (!result.fenced or result.layers != request.ranges.len or result.copied_bytes != expected)
+            return error.InvalidExactPagedKvRangeExportReceipt;
+        try request.check();
+        return result;
+    }
+
+    pub fn exactPagedKvRangeExporter(self: *ModelRuntime) kv_storage.ExactLayerRangeExporter {
+        return .{ .ctx = self, .export_fn = exactPagedKvRangeExportThunk };
+    }
+
+    fn exactPagedKvRangeExportThunk(raw: *anyopaque, authority: kv_storage.ExactLayerRangeSourceAuthority, ranges: []const kv_storage.ExactLayerRangeExport, max_bytes: usize, check_ctx: ?*anyopaque, check_fn: ?*const fn (?*anyopaque) anyerror!void) !kv_storage.ExactLayerRangeExportResult {
+        const self: *ModelRuntime = @ptrCast(@alignCast(raw));
+        return self.exportExactPagedKvRanges(.{ .authority = authority, .ranges = ranges, .max_copy_bytes = max_bytes, .check_ctx = check_ctx, .check_fn = check_fn });
+    }
+
+    pub fn discardExactPagedKvSource(self: *ModelRuntime, request: ExactPagedKvSourceDiscardRequest) !ExactPagedKvSourceDiscardReceipt {
+        try request.check();
+        const discard_fn = self.vtable.discard_exact_paged_kv_source orelse return error.UnsupportedExactPagedKvHandoff;
+        var hard_cancellation = if (request.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
+        const receipt = try discard_fn(self.ptr, request);
+        if (!std.mem.eql(u8, &receipt.authority_sha256, &request.authority_sha256) or
+            receipt.source_revision != request.source_revision or receipt.source_sequence != request.source_sequence or
+            receipt.slots == 0 or receipt.physically_released_bytes == 0 or receipt.live_bytes_after != 0 or
+            receipt.live_bytes_before < receipt.live_bytes_after or
+            receipt.live_bytes_before - receipt.live_bytes_after != receipt.physically_released_bytes)
+            return error.InvalidExactPagedKvSourceDiscardReceipt;
+        try request.check();
+        return receipt;
     }
 
     pub fn prepare(
@@ -283,6 +432,24 @@ pub const ModelRuntime = struct {
         return output;
     }
 
+    pub fn verifyGreedyTransaction(
+        self: *ModelRuntime,
+        allocator: std.mem.Allocator,
+        request: GreedyVerifyRequest,
+    ) !GreedyVerifyOutput {
+        try request.check();
+        const verify_fn = self.vtable.verify_greedy_transaction orelse
+            return error.UnsupportedGreedyVerifyTransaction;
+        var hard_cancellation = if (request.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
+        const output = try verify_fn(self.ptr, allocator, request);
+        try request.check();
+        return output;
+    }
+
     pub fn supportsSampleDecodeRequest(
         self: *const ModelRuntime,
         request: SampledDecodeRequest,
@@ -310,6 +477,168 @@ pub const ModelRuntime = struct {
         self.* = undefined;
     }
 };
+
+pub const ExactPagedKvDonor = struct {
+    layer: u32,
+    heads: u32,
+    dim: u32,
+    capacity_rows: u32 = 0,
+    host_staged_ring: bool = false,
+};
+
+pub const ExactPagedKvSourceAuthority = struct {
+    model_weights_sha256: [32]u8,
+    model_identity_layout_sha256: [32]u8,
+    context_layout_sha256: [32]u8,
+    token_stream_sha256: [32]u8,
+    source_revision: u64,
+    source_sequence: u32,
+    logical_tokens: usize,
+
+    pub fn validate(self: @This()) !void {
+        if (std.mem.allEqual(u8, &self.model_weights_sha256, 0) or
+            std.mem.allEqual(u8, &self.model_identity_layout_sha256, 0) or
+            std.mem.allEqual(u8, &self.context_layout_sha256, 0) or
+            std.mem.allEqual(u8, &self.token_stream_sha256, 0) or
+            self.source_revision == 0 or self.source_sequence == 0 or self.logical_tokens == 0)
+            return error.InvalidExactPagedKvHandoffAuthority;
+    }
+};
+
+pub const ExactPagedKvRangeExportRequest = struct {
+    authority: kv_storage.ExactLayerRangeSourceAuthority,
+    ranges: []const kv_storage.ExactLayerRangeExport,
+    max_copy_bytes: usize,
+    check_ctx: ?*anyopaque = null,
+    check_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+
+    pub fn check(self: @This()) !void {
+        if (self.check_fn) |f| try f(self.check_ctx);
+    }
+    pub fn validate(self: @This()) !void {
+        try self.check();
+        try self.authority.validate();
+        if (self.ranges.len == 0 or self.ranges.len > 256 or self.max_copy_bytes == 0)
+            return error.InvalidExactPagedKvRangeExport;
+        _ = try (kv_storage.ExactLayerRangeExportRequest{
+            .source_sequence = self.authority.source_sequence,
+            .expected_written_tokens = self.authority.logical_tokens,
+            .ranges = self.ranges,
+            .max_bytes = self.max_copy_bytes,
+        }).validate();
+    }
+};
+
+pub const ExactPagedKvHandoffRequest = struct {
+    authority_sha256: [32]u8,
+    model_layout_sha256: [32]u8,
+    token_stream_sha256: [32]u8,
+    source_revision: u64,
+    destination_owner_id: u64,
+    logical_tokens: usize,
+    capacity_tokens: usize,
+    page_size_tokens: u16,
+    max_copy_bytes: usize,
+    max_host_staging_bytes: usize,
+    full_history_exact: bool = false,
+    donors: []const ExactPagedKvDonor,
+    destination: ops.KvCacheView,
+    execution_control: ?InferenceExecutionControl = null,
+
+    pub fn check(self: @This()) !void {
+        if (self.execution_control) |control| try control.check();
+    }
+    pub fn validate(self: @This()) !void {
+        try self.check();
+        if (std.mem.allEqual(u8, &self.authority_sha256, 0) or
+            std.mem.allEqual(u8, &self.model_layout_sha256, 0) or
+            std.mem.allEqual(u8, &self.token_stream_sha256, 0) or
+            self.source_revision == 0 or self.destination_owner_id == 0 or self.logical_tokens == 0 or
+            self.capacity_tokens < self.logical_tokens or self.page_size_tokens == 0 or
+            self.capacity_tokens % self.page_size_tokens != 0 or self.max_copy_bytes == 0 or
+            self.max_host_staging_bytes == 0 or self.donors.len == 0 or self.donors.len > 256 or
+            self.destination.kv_storage == null or self.destination.logical_blocks == null or self.destination.position_offset != 0)
+            return error.InvalidExactPagedKvHandoff;
+        for (self.donors, 0..) |donor, i| {
+            if (self.full_history_exact and (donor.host_staged_ring or donor.capacity_rows != self.capacity_tokens))
+                return error.InvalidExactPagedKvHandoff;
+            if (donor.heads == 0 or donor.dim == 0 or (donor.host_staged_ring and donor.capacity_rows == 0) or
+                (donor.capacity_rows != 0 and (donor.capacity_rows > self.capacity_tokens or donor.capacity_rows % self.page_size_tokens != 0)) or
+                (i > 0 and donor.layer <= self.donors[i - 1].layer))
+                return error.InvalidExactPagedKvHandoff;
+        }
+    }
+    pub fn validateReceipt(self: @This(), receipt: ExactPagedKvHandoffReceipt) !void {
+        if (!std.mem.eql(u8, &receipt.authority_sha256, &self.authority_sha256) or
+            !std.mem.eql(u8, &receipt.model_layout_sha256, &self.model_layout_sha256) or
+            !std.mem.eql(u8, &receipt.token_stream_sha256, &self.token_stream_sha256) or
+            receipt.source_revision != self.source_revision or receipt.destination_owner_id != self.destination_owner_id or
+            receipt.destination_storage_address != @intFromPtr(self.destination.kv_storage.?) or
+            receipt.logical_tokens != self.logical_tokens or receipt.donors != self.donors.len or receipt.copied_bytes == 0 or
+            !receipt.source_unchanged or !receipt.destination_complete or !receipt.fenced)
+            return error.InvalidExactPagedKvHandoffReceipt;
+    }
+};
+
+pub const ExactPagedKvHandoffReceipt = struct {
+    authority_sha256: [32]u8,
+    model_layout_sha256: [32]u8,
+    token_stream_sha256: [32]u8,
+    source_revision: u64,
+    destination_owner_id: u64,
+    destination_storage_address: usize,
+    logical_tokens: usize,
+    donors: usize,
+    allocation_bound_bytes: usize,
+    copied_bytes: usize,
+    peak_host_staging_bytes: usize,
+    source_unchanged: bool,
+    destination_complete: bool,
+    fenced: bool,
+};
+
+pub const ExactPagedKvSourceDiscardRequest = struct {
+    authority_sha256: [32]u8,
+    source_revision: u64,
+    source_sequence: u32,
+    token_stream_sha256: [32]u8,
+    logical_tokens: usize,
+    expected_materialized_tokens: usize,
+    execution_control: ?InferenceExecutionControl = null,
+    pub fn check(self: @This()) !void {
+        if (std.mem.allEqual(u8, &self.authority_sha256, 0) or self.source_revision == 0 or self.source_sequence == 0 or
+            std.mem.allEqual(u8, &self.token_stream_sha256, 0) or self.logical_tokens == 0 or
+            self.expected_materialized_tokens < self.logical_tokens)
+            return error.InvalidExactPagedKvSourceDiscard;
+        if (self.execution_control) |control| try control.check();
+    }
+};
+
+pub const ExactPagedKvSourceDiscardReceipt = struct {
+    authority_sha256: [32]u8,
+    source_revision: u64,
+    source_sequence: u32,
+    slots: usize,
+    live_bytes_before: u64,
+    live_bytes_after: u64,
+    physically_released_bytes: u64,
+};
+
+pub fn exactPagedKvTokenStreamDigest(tokens: []const i64) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly.compiled-prefill-token-stream.v1\x00");
+    var count_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count_bytes, @intCast(tokens.len), .little);
+    hash.update(&count_bytes);
+    for (tokens) |token| {
+        var token_bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &token_bytes, token, .little);
+        hash.update(&token_bytes);
+    }
+    var result: [32]u8 = undefined;
+    hash.final(&result);
+    return result;
+}
 
 /// One backend-owned session-runtime role per generation invocation. The
 /// retaining Model and its execution scope keep this selected runtime alive;
@@ -365,6 +694,7 @@ pub const RuntimeCapabilities = struct {
     supports_prepared_rows: bool = false,
     supports_sample_decode: bool = false,
     supports_greedy_decode: bool = false,
+    supports_greedy_verify_transaction: bool = false,
     state_ownership: RuntimeStateOwnership = .host_assisted_inputs,
     interruption: Interruption = .cooperative,
 };
@@ -501,19 +831,26 @@ pub const ModelOutput = struct {
             };
         }
 
-        fn greedyToken(self: *PreparedTail) !?i64 {
-            if (self.greedy_token_id) |token_id| return token_id;
+        fn greedyTokenSuppress(self: *PreparedTail, suppress_token_ids: []const i32) !?i64 {
+            // The cached token was selected under the policy active when the
+            // tail was produced. With no explicit request override that is
+            // the unchanged legacy policy. A nonempty request list has no
+            // retained origin key, so it must recompute even when the cached
+            // id itself is not newly suppressed.
+            if (suppress_token_ids.len == 0) {
+                if (self.greedy_token_id) |token_id| return token_id;
+            }
             // Final logit softcap is monotonic, so it changes sampling
             // probabilities but not the greedy argmax ordering.
             const token = switch (self.norm) {
-                .layer => try self.backend.decoderRuntimeApplyLayerNormLinearArgmax(&.{
+                .layer => if (suppress_token_ids.len == 0) try self.backend.decoderRuntimeApplyLayerNormLinearArgmax(&.{
                     .input = self.final_hidden,
                     .norm_slot = self.norm_slot,
                     .linear_slot = self.lm_head_slot,
                     .hidden_size = self.hidden_size,
                     .eps = self.eps,
                     .out_dim = self.vocab_size,
-                }),
+                }) else null,
                 .rms => try self.backend.decoderRuntimeApplyRmsNormLinearArgmax(&.{
                     .input = self.final_hidden,
                     .norm_slot = self.norm_slot,
@@ -521,9 +858,14 @@ pub const ModelOutput = struct {
                     .hidden_size = self.hidden_size,
                     .eps = self.eps,
                     .out_dim = self.vocab_size,
+                    .suppress_token_ids = suppress_token_ids,
                 }),
             };
-            return if (token) |token_id| @intCast(token_id) else null;
+            if (token) |token_id| {
+                const selected: i64 = @intCast(token_id);
+                if (!tokenIdSuppressed(selected, suppress_token_ids)) return selected;
+            }
+            return null;
         }
 
         pub fn deinit(self: *PreparedTail) void {
@@ -615,30 +957,42 @@ pub const ModelOutput = struct {
     pub fn greedyToken(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize) !i64 {
         return self.greedyTokenWithCleanup(allocator, vocab_size, .{ .outside_execution = true });
     }
+    pub fn greedyTokenSuppress(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, suppress_token_ids: []const i32) !i64 {
+        return self.greedyTokenSuppressWithCleanup(allocator, vocab_size, suppress_token_ids, .{ .outside_execution = true });
+    }
     pub fn greedyTokenWithBoundary(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) !i64 {
         return self.greedyTokenWithCleanup(allocator, vocab_size, .{ .boundary = boundary });
     }
     pub fn greedyTokenWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, cleanup_context: CleanupContext) !i64 {
+        return self.greedyTokenSuppressWithCleanup(allocator, vocab_size, &.{}, cleanup_context);
+    }
+    pub fn greedyTokenSuppressWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, suppress_token_ids: []const i32, cleanup_context: CleanupContext) !i64 {
         if (vocab_size == 0) return error.InvalidModelOutput;
         if (self.prepared_tail) |*tail| {
             if (tail.vocab_size == vocab_size) {
-                if (try tail.greedyToken()) |token_id| return token_id;
+                if (try tail.greedyTokenSuppress(suppress_token_ids)) |token_id| return token_id;
             }
         }
         if (self.device_logits) |device_logits| {
             const backend = self.device_logits_backend orelse return error.InvalidModelOutput;
-            if (try backend.argmaxLastRow(device_logits, 1, vocab_size)) |token_id| {
-                return @intCast(token_id);
+            if (suppress_token_ids.len == 0) {
+                if (try backend.argmaxLastRow(device_logits, 1, vocab_size)) |token_id| return @intCast(token_id);
+            } else if (try backend.argmaxRowsSuppress(device_logits, 0, 1, vocab_size, suppress_token_ids, allocator)) |token_ids| {
+                defer allocator.free(token_ids);
+                if (token_ids.len != 1) return error.InvalidModelOutput;
+                const token_id: i64 = @intCast(token_ids[0]);
+                if (!tokenIdSuppressed(token_id, suppress_token_ids)) return token_id;
             }
         }
 
         const logits = try self.hostLogitsWithCleanup(allocator, cleanup_context);
         if (logits.len < vocab_size) return error.InvalidModelOutput;
-        var best_idx: usize = 0;
-        for (logits[1..vocab_size], 1..) |value, idx| {
-            if (value > logits[best_idx]) best_idx = idx;
+        var best_idx: ?usize = null;
+        for (logits[0..vocab_size], 0..) |value, idx| {
+            if (tokenIdSuppressed(@intCast(idx), suppress_token_ids)) continue;
+            if (best_idx == null or value > logits[best_idx.?]) best_idx = idx;
         }
-        return @intCast(best_idx);
+        return @intCast(best_idx orelse return error.InvalidModelOutput);
     }
 
     pub fn deinit(self: *ModelOutput, allocator: std.mem.Allocator) void {
@@ -661,6 +1015,13 @@ pub const ModelOutput = struct {
     }
 };
 
+fn tokenIdSuppressed(token_id: i64, suppress_token_ids: []const i32) bool {
+    if (token_id < 0 or token_id > std.math.maxInt(i32)) return false;
+    const needle: i32 = @intCast(token_id);
+    for (suppress_token_ids) |candidate| if (candidate == needle) return true;
+    return false;
+}
+
 fn applyFinalLogitSoftcapInPlace(logits: []f32, softcap: f32) void {
     if (softcap <= 0.0) return;
     for (logits) |*value| {
@@ -672,9 +1033,14 @@ pub const PrepareRequest = struct {
     cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
     backend_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
     execution_control: ?InferenceExecutionControl = null,
+    e2b_f16_mirror_admission: ?ops.DecoderRuntimeE2bF16MirrorAdmission = null,
     /// Best-effort prompt/KV length hint. Backends may use this to prebuild
     /// shape-specific resources without mutating logical generation state.
     kv_tokens_hint: usize = 0,
+    /// Request-local transactional verification cannot share the greedy
+    /// decoder's speculative one-token lookahead: that lookahead advances KV
+    /// bookkeeping beyond the logical pending-token boundary.
+    disable_pipelined_decode: bool = false,
 
     pub fn check(self: PrepareRequest) !void {
         if (self.execution_control) |control| try control.check();
@@ -692,6 +1058,7 @@ pub const PrefillRequest = struct {
     seq_len: usize,
     query_seq_len: usize,
     attention_mode: cache_mod.AttentionMode,
+    prepare_after_fresh_reset: ?PrepareRequest = null,
     /// Largest KV suffix this request may write at once. Device runtimes use
     /// this with `allow_swa_ring` to size sliding-window rings before the first
     /// prefill write.
@@ -703,6 +1070,11 @@ pub const PrefillRequest = struct {
     kv_only: bool = false,
     force_host_logits: bool = false,
     prefer_greedy_token: bool = false,
+    /// Borrowed for this synchronous call only; runtimes must not retain it.
+    suppress_token_ids: []const i32 = &.{},
+    /// Borrowed for this synchronous compiled-prefill call only. This is a
+    /// development capture seam, not a selection/repack policy switch.
+    recent_query_capture: ?RecentPrefillQueryCaptureDescriptor = null,
 
     pub fn check(self: PrefillRequest) !void {
         if (self.prepared_rows) |rows| {
@@ -710,6 +1082,7 @@ pub const PrefillRequest = struct {
             try rows.validateGeometry(self.query_seq_len, rows.width);
         }
         if (self.execution_control) |control| try control.check();
+        if (self.recent_query_capture) |capture| try capture.validate();
     }
 };
 
@@ -747,6 +1120,13 @@ pub const DecodeRequest = struct {
     input_token_tensor: ?ops.CT = null,
     position: usize,
     attention_mode: cache_mod.AttentionMode = .paged_decode,
+    /// Borrowed for this synchronous call only; runtimes must not retain it.
+    suppress_token_ids: []const i32 = &.{},
+    /// Whether a pipelined runtime may encode the frame following the token
+    /// returned by this request. Callers with a known terminal output budget
+    /// set this false so the current pending frame is consumed without
+    /// speculatively advancing KV or submitting an unused continuation.
+    allow_pipeline_rearm: bool = true,
 
     /// Valid only during the current numerical call; never cached by a runtime.
     continuation: ?DecodeContinuation = null,
@@ -754,6 +1134,56 @@ pub const DecodeRequest = struct {
     pub fn check(self: DecodeRequest) !void {
         if (self.execution_control) |control| try control.check();
         if (self.continuation) |policy| try policy.check();
+    }
+};
+
+test "decode request preserves pipeline rearm unless caller marks a terminal token" {
+    const ordinary = DecodeRequest{ .token_id = 7, .position = 11 };
+    try std.testing.expect(ordinary.allow_pipeline_rearm);
+    const terminal = DecodeRequest{
+        .token_id = 7,
+        .position = 11,
+        .allow_pipeline_rearm = false,
+    };
+    try std.testing.expect(!terminal.allow_pipeline_rearm);
+}
+
+/// One model-authoritative prompt-lookup verification transaction. The backend
+/// materializes the pending token and proposal in a single q_len=2 forward,
+/// commits matched proposal rows, and rolls back every rejected reserved row
+/// before returning. Correction/bonus tokens are logical outputs and remain
+/// pending for the next transaction or ordinary decode.
+pub const GreedyVerifyRequest = struct {
+    execution_control: ?InferenceExecutionControl = null,
+    pending_token_id: i64,
+    proposal_token_id: i64,
+    position: usize,
+    attention_mode: cache_mod.AttentionMode = .paged_prefill,
+    suppress_token_ids: []const i32 = &.{},
+    eos_token_ids: []const i32 = &.{},
+    ignore_eos: bool = false,
+    accept_bonus: bool = true,
+
+    pub fn check(self: GreedyVerifyRequest) !void {
+        if (self.execution_control) |control| try control.check();
+        if (self.pending_token_id < 0 or self.proposal_token_id < 0)
+            return error.InvalidModelOutput;
+        if (self.attention_mode != .paged_prefill) return error.UnsupportedAttentionMode;
+    }
+};
+
+pub const GreedyVerifyOutput = struct {
+    accepted_token_ids: [2]i64 = .{ 0, 0 },
+    accepted_count: u8 = 0,
+    matched_proposals: u8 = 0,
+    correction_added: bool = false,
+    bonus_added: bool = false,
+    hit_eos: bool = false,
+    materialized_rows: u8 = 1,
+    rolled_back_rows: u8 = 0,
+
+    pub fn accepted(self: *const GreedyVerifyOutput) []const i64 {
+        return self.accepted_token_ids[0..self.accepted_count];
     }
 };
 
@@ -918,6 +1348,8 @@ pub const ModelExecutor = struct {
 
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Immutable loaded-generation identity. Never upgraded on a live cache.
+    model_identity: ?checkpoint.Identity = null,
 
     pub const VTable = struct {
         create_runtime: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!ModelRuntime,
@@ -926,7 +1358,13 @@ pub const ModelExecutor = struct {
     };
 
     pub fn createRuntime(self: *const ModelExecutor, allocator: std.mem.Allocator) !ModelRuntime {
-        return self.vtable.create_runtime(self.ptr, allocator);
+        var runtime = try self.vtable.create_runtime(self.ptr, allocator);
+        if (runtime.model_identity != null and !sameOptionalModelIdentity(runtime.model_identity, self.model_identity)) {
+            runtime.deinit();
+            return error.CompiledModelIdentityMismatch;
+        }
+        runtime.model_identity = self.model_identity;
+        return runtime;
     }
 
     pub fn deinit(self: *ModelExecutor) void {
@@ -951,20 +1389,35 @@ pub const ModelExecutor = struct {
 const MockModel = struct {
     runtime_resets: usize = 0,
     runtime_prepares: usize = 0,
+    runtime_finishes: usize = 0,
     last_prepare_hint: usize = 0,
     runtime_deinits: usize = 0,
     executor_deinits: usize = 0,
     saw_prefill_control: bool = false,
+    verify_calls: usize = 0,
+    fail_verify_rollback: bool = false,
 
     const runtime_vtable = ModelRuntime.VTable{
+        .capabilities = capabilities,
         .prepare = prepare,
+        .finish_prefill_for_decode = finishPrefillForDecode,
         .prefill = prefill,
         .decode = decode,
         .decode_sample = decodeSample,
         .decode_greedy = decodeGreedy,
+        .verify_greedy_transaction = verifyGreedyTransaction,
         .deinit = runtimeDeinit,
         .reset = runtimeReset,
     };
+
+    fn capabilities(_: *anyopaque) RuntimeCapabilities {
+        return .{
+            .supports_decode = true,
+            .supports_sample_decode = true,
+            .supports_greedy_decode = true,
+            .supports_greedy_verify_transaction = true,
+        };
+    }
 
     const executor_vtable = ModelExecutor.VTable{
         .create_runtime = createRuntime,
@@ -988,6 +1441,13 @@ const MockModel = struct {
     ) !bool {
         const self: *MockModel = @ptrCast(@alignCast(ctx));
         self.runtime_prepares += 1;
+        self.last_prepare_hint = request.kv_tokens_hint;
+        return true;
+    }
+
+    fn finishPrefillForDecode(ctx: *anyopaque, request: PrepareRequest) !bool {
+        const self: *MockModel = @ptrCast(@alignCast(ctx));
+        self.runtime_finishes += 1;
         self.last_prepare_hint = request.kv_tokens_hint;
         return true;
     }
@@ -1039,6 +1499,23 @@ const MockModel = struct {
         return .{ .token_id = @intCast(sampleTokenFromLogits(allocator, logits[0..], request.sampling, request.token_history)) };
     }
 
+    fn verifyGreedyTransaction(
+        ctx: *anyopaque,
+        _: std.mem.Allocator,
+        request: GreedyVerifyRequest,
+    ) !GreedyVerifyOutput {
+        const self: *MockModel = @ptrCast(@alignCast(ctx));
+        self.verify_calls += 1;
+        if (self.fail_verify_rollback) return error.GreedyVerifyRollbackFailed;
+        return .{
+            .accepted_token_ids = .{ request.proposal_token_id, request.proposal_token_id + 1 },
+            .accepted_count = 2,
+            .matched_proposals = 1,
+            .bonus_added = true,
+            .materialized_rows = 2,
+        };
+    }
+
     fn executorDeinit(ctx: *anyopaque) void {
         const self: *MockModel = @ptrCast(@alignCast(ctx));
         self.executor_deinits += 1;
@@ -1055,6 +1532,7 @@ test "ModelExecutor and ModelRuntime dispatch through vtables" {
     try std.testing.expect(caps.supports_decode);
     try std.testing.expect(caps.supports_sample_decode);
     try std.testing.expect(caps.supports_greedy_decode);
+    try std.testing.expect(caps.supports_greedy_verify_transaction);
     try std.testing.expectEqual(RuntimeStateOwnership.host_assisted_inputs, caps.state_ownership);
 
     try runtime.reset();
@@ -1063,6 +1541,10 @@ test "ModelExecutor and ModelRuntime dispatch through vtables" {
     try std.testing.expect(try runtime.prepare(allocator, .{ .kv_tokens_hint = 17 }));
     try std.testing.expectEqual(@as(usize, 1), mock.runtime_prepares);
     try std.testing.expectEqual(@as(usize, 17), mock.last_prepare_hint);
+
+    try std.testing.expect(try runtime.finishPrefillForDecode(.{ .kv_tokens_hint = 19 }));
+    try std.testing.expectEqual(@as(usize, 1), mock.runtime_finishes);
+    try std.testing.expectEqual(@as(usize, 19), mock.last_prepare_hint);
 
     var output = try runtime.prefill(allocator, .{
         .input_ids = &.{ 1, 2, 3 },
@@ -1096,6 +1578,20 @@ test "ModelExecutor and ModelRuntime dispatch through vtables" {
         .token_history = &.{ 1, 2, 3 },
     });
     try std.testing.expectEqual(@as(i64, 1), sampled.token_id);
+
+    const verified = try runtime.verifyGreedyTransaction(allocator, .{
+        .pending_token_id = 9,
+        .proposal_token_id = 10,
+        .position = 3,
+    });
+    try std.testing.expectEqualSlices(i64, &.{ 10, 11 }, verified.accepted());
+    try std.testing.expectEqual(@as(usize, 1), mock.verify_calls);
+    mock.fail_verify_rollback = true;
+    try std.testing.expectError(error.GreedyVerifyRollbackFailed, runtime.verifyGreedyTransaction(allocator, .{
+        .pending_token_id = 11,
+        .proposal_token_id = 12,
+        .position = 5,
+    }));
 
     runtime.deinit();
     executor.deinit();
@@ -1156,6 +1652,7 @@ test "ModelExecutor reports unsupported decode when backend has no decode path" 
     try std.testing.expect(!caps.supports_decode);
     try std.testing.expect(!caps.supports_sample_decode);
     try std.testing.expect(!caps.supports_greedy_decode);
+    try std.testing.expect(!try runtime.finishPrefillForDecode(.{ .kv_tokens_hint = 23 }));
 
     try std.testing.expectError(error.UnsupportedDecode, runtime.decode(allocator, .{
         .token_id = 1,

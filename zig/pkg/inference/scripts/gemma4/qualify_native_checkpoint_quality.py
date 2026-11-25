@@ -33,8 +33,32 @@ ROOT = Path(__file__).resolve().parents[5]
 sys.path.insert(0, str(ROOT / "py/packages/sdk/src"))
 from antfly import AntflyClient
 from antfly.client_generated.models import InferenceGenerateRequest
-from native_quality_score import evaluate, score
-from qualify_native_checkpoint_http import server, generate, git_provenance, sha256_file
+from native_quality_score import evaluate, score, validate_request_models
+from qualify_attention_match_queries import validate_quantization_evidence
+from qualify_native_checkpoint_http import (
+    server,
+    generate,
+    git_provenance,
+    metal_ledger_finish,
+    metal_ledger_start,
+    normalize_request_body,
+    sha256_file,
+    validate_backend_configuration,
+    validate_metal_memory,
+)
+
+
+def resident_representation(metadata, encoding):
+    """Keep wire encoding distinct from the codec that survived validation."""
+    if (
+        encoding not in ("f16", "fp8", "rotated4")
+        or metadata.get("encoding") != encoding
+    ):
+        raise ValueError("checkpoint encoding differs from requested quality campaign")
+    if encoding == "f16":
+        return "f16"
+    validate_quantization_evidence([metadata], encoding, require_actual=False)
+    return encoding if metadata[encoding + "_heads"] else "f16"
 
 
 def coverage(cases, baseline, resumed, checkpoints, encoding=None):
@@ -62,6 +86,37 @@ def coverage(cases, baseline, resumed, checkpoints, encoding=None):
                 raise ValueError("missing or inconsistent FP8 validation accounting")
         elif fp8 or fallback:
             raise ValueError("non-FP8 checkpoint claims quantization")
+        rotated4 = metadata.get("rotated4_compressed_rows", 0)
+        rotated4_eligible = metadata.get("rotated4_eligible_rows", 0)
+        rotated4_exact = metadata.get("rotated4_exact_rows", 0)
+        if any(
+            type(count) is not int or count < 0
+            for count in (rotated4, rotated4_eligible, rotated4_exact)
+        ):
+            raise ValueError("invalid rotated4 row accounting")
+        if metadata.get("encoding") == "rotated4":
+            try:
+                validate_quantization_evidence(
+                    [metadata],
+                    "rotated4",
+                    require_actual=metadata.get("outcome") == "compacted",
+                )
+            except AssertionError as error:
+                raise ValueError(str(error)) from error
+            if (
+                not all(
+                    field in metadata
+                    for field in (
+                        "rotated4_compressed_rows",
+                        "rotated4_eligible_rows",
+                        "rotated4_exact_rows",
+                    )
+                )
+                or rotated4 + rotated4_exact != rotated4_eligible
+            ):
+                raise ValueError("missing or inconsistent rotated4 row accounting")
+        elif rotated4 or rotated4_eligible or rotated4_exact:
+            raise ValueError("non-rotated4 checkpoint claims rotated4 rows")
         if not math.isfinite(metadata["global_savings_ratio"]):
             raise ValueError("nonfinite savings ratio")
         outcome = metadata["outcome"]
@@ -89,6 +144,9 @@ def coverage(cases, baseline, resumed, checkpoints, encoding=None):
                 "fp8_regression_case_ids": [],
                 "fp8_baseline_correct": 0,
                 "fp8_resume_correct": 0,
+                "rotated4_cases": 0,
+                "rotated4_case_ids": [],
+                "rotated4_regression_case_ids": [],
             },
         )
         if fp8:
@@ -100,6 +158,11 @@ def coverage(cases, baseline, resumed, checkpoints, encoding=None):
             group["fp8_resume_correct"] += after_correct
             if before_correct and not after_correct:
                 group["fp8_regression_case_ids"].append(case["case_id"])
+        if rotated4:
+            group["rotated4_cases"] += 1
+            group["rotated4_case_ids"].append(case["case_id"])
+            if score(case, before["response"]) and not score(case, after["response"]):
+                group["rotated4_regression_case_ids"].append(case["case_id"])
         group[outcome] += 1
         if outcome == "compacted":
             group["compacted_baseline_correct"] += score(case, before["response"])
@@ -132,6 +195,9 @@ def coverage(cases, baseline, resumed, checkpoints, encoding=None):
     fp8_exercised = bool(categories) and all(
         g["fp8_cases"] > 0 for g in categories.values()
     )
+    rotated4_exercised = bool(categories) and all(
+        g["rotated4_cases"] > 0 for g in categories.values()
+    )
     return {
         "categories": categories,
         "outcomes": dict(Counter(c["metadata"]["outcome"] for c in checkpoints)),
@@ -139,6 +205,9 @@ def coverage(cases, baseline, resumed, checkpoints, encoding=None):
         "every_category_exercised_fp8": fp8_exercised,
         "fp8_quality_passed": fp8_exercised
         and not any(g["fp8_regression_case_ids"] for g in categories.values()),
+        "every_category_exercised_rotated4": rotated4_exercised,
+        "rotated4_quality_passed": rotated4_exercised
+        and not any(g["rotated4_regression_case_ids"] for g in categories.values()),
         "compacted_drop_percentage_points": drop,
         "compacted_quality_passed": exercised
         and drop <= 2
@@ -199,14 +268,16 @@ def bounded_quality(cases, baseline, resumed, checkpoints, fp16_reference=None):
 
 
 def fp8_noninferiority(
-    cases, reference, resumed, checkpoints, quality_profile="extended"
+    cases, reference, resumed, checkpoints, quality_profile="extended", encoding="fp8"
 ):
     """Separate codec regressions from existing model/fitter failures.
 
     This report does not relax the runner's whole-system release gate.
     """
     quality = evaluate(cases, reference, resumed)
-    exercised = coverage(cases, reference, resumed, checkpoints, encoding="fp8")
+    if encoding not in ("fp8", "rotated4"):
+        raise ValueError("unsupported quantized noninferiority encoding")
+    exercised = coverage(cases, reference, resumed, checkpoints, encoding=encoding)
     critical_count = sum(case["critical"] is True for case in cases)
     if quality_profile not in ("bounded", "extended"):
         raise ValueError("unknown quality profile")
@@ -221,10 +292,10 @@ def fp8_noninferiority(
         )
     )
     return {
-        "scope": "Added FP8 failures versus separately prepared FP16, not absolute model accuracy or full production qualification",
+        "scope": f"Added {encoding} failures versus separately prepared FP16, not absolute model accuracy or full production qualification",
         "passed": count_met
         and critical_count >= 16
-        and exercised["fp8_quality_passed"]
+        and exercised[encoding + "_quality_passed"]
         and not quality["regression_case_ids"],
         "sample_count_met": count_met,
         "quality_profile": quality_profile,
@@ -237,11 +308,13 @@ def fp8_noninferiority(
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=["cuda", "metal"], default="cuda")
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument(
-        "--server-kind", choices=["inference", "standalone"], default="inference"
+        "--server-kind", choices=["inference", "standalone", "metal-test"], default="inference"
     )
     parser.add_argument("--models-dir", type=Path, default=Path(".models"))
+    parser.add_argument("--model", default="google/gemma-4-E4B-it-qat-q4_0-gguf")
     parser.add_argument(
         "--suite",
         type=Path,
@@ -255,7 +328,9 @@ def main():
         default="extended",
         help="Bounded requires 16 critical cases, four per category, and zero new failures versus full KV.",
     )
-    parser.add_argument("--encoding", choices=["f32", "f16", "fp8"], default="f16")
+    parser.add_argument(
+        "--encoding", choices=["f32", "f16", "fp8", "rotated4"], default="f16"
+    )
     parser.add_argument(
         "--size",
         choices=("8k", "32k"),
@@ -266,6 +341,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     args = parser.parse_args()
+    args.experimental_rotated4 = args.encoding == "rotated4"
+    try:
+        validate_backend_configuration(args)
+    except ValueError as error:
+        parser.error(str(error))
     if args.quality_profile == "bounded" and args.size is None:
         parser.error("bounded qualification requires --size")
     if args.output.exists() or args.checkpoint.exists():
@@ -277,6 +357,7 @@ def main():
     cases = [
         json.loads(line) for line in args.suite.read_text().splitlines() if line.strip()
     ]
+    validate_request_models(cases, args.model)
     if len({c["case_id"] for c in cases}) != len(cases):
         raise ValueError("duplicate case IDs")
     if args.cases:
@@ -311,6 +392,14 @@ def main():
         "checkpoints": [],
         "fp16_reference": [],
     }
+    if args.backend == "metal":
+        evidence.update(
+            backend="metal",
+            qualification_profile="metal_test_native_checkpoint_v1",
+            production_ready=False,
+            timing_scope="diagnostic_wall_intervals_not_matched_performance",
+            execution_mode="eager",
+        )
 
     def publish():
         temporary = args.output.with_suffix(".json.part")
@@ -324,8 +413,8 @@ def main():
 
             def attest(response):
                 if response.status_code == 200:
-                    if response.headers.get("x-antfly-inference-backend") != "cuda":
-                        raise AssertionError("missing CUDA backend")
+                    if response.headers.get("x-antfly-inference-backend") != args.backend:
+                        raise AssertionError("missing " + args.backend + " backend")
                     if (
                         int(response.headers.get("x-antfly-inference-pid", "0"))
                         != record["worker_pid"]
@@ -360,15 +449,16 @@ def main():
                             "response": baseline,
                         }
                     )
-                    body = copy.deepcopy(case["body"])
+                    body = normalize_request_body(args, copy.deepcopy(case["body"]))
                     body.pop("context_management", None)
                     request = InferenceGenerateRequest.from_dict(body)
-                    prepare_body = copy.deepcopy(
-                        case.get("checkpoint_body", case["body"])
+                    prepare_body = normalize_request_body(
+                        args,
+                        copy.deepcopy(case.get("checkpoint_body", case["body"])),
                     )
                     prepare_body.pop("context_management", None)
                     prepare_request = InferenceGenerateRequest.from_dict(prepare_body)
-                    if args.encoding == "fp8":
+                    if args.encoding in ("fp8", "rotated4"):
                         # Compare to the same fitted checkpoint at serving precision,
                         # as well as full KV, to isolate added quantization failures.
                         print(
@@ -377,12 +467,38 @@ def main():
                             ),
                             flush=True,
                         )
+                        ledger_offset = metal_ledger_start(args, record)
                         fp16 = client.prepare_native_kv_checkpoint(
                             prepare_request, args.checkpoint, encoding="f16"
                         )
+                        metal_ledger_finish(
+                            args,
+                            record,
+                            ledger_offset,
+                            "checkpoint_prepare",
+                            require_binding=False,
+                            required_phase="checkpoint_source",
+                        )
+                        if (
+                            args.backend == "metal"
+                            and dict(fp16.identity)
+                            != record["ready"]["loaded_identity"]
+                        ):
+                            raise AssertionError(
+                                "FP16 checkpoint identity differs from loaded Metal model"
+                            )
+                        ledger_offset = metal_ledger_start(args, record)
                         reference_result = client.resume_native_kv_checkpoint(
                             request, fp16
                         ).to_dict()
+                        metal_ledger_finish(
+                            args,
+                            record,
+                            ledger_offset,
+                            "checkpoint_resume",
+                            require_binding=True,
+                            expected_representation="f16",
+                        )
                         if (
                             reference_result["usage"]["cached_prompt_tokens"]
                             != fp16.metadata["logical_tokens"]
@@ -406,9 +522,24 @@ def main():
                         flush=True,
                     )
                     prepare_start = time.monotonic()
+                    ledger_offset = metal_ledger_start(args, record)
                     checkpoint = client.prepare_native_kv_checkpoint(
                         prepare_request, args.checkpoint, encoding=args.encoding
                     )
+                    metal_ledger_finish(
+                        args,
+                        record,
+                        ledger_offset,
+                        "checkpoint_prepare",
+                        require_binding=False,
+                        required_phase="checkpoint_source",
+                    )
+                    if (
+                        args.backend == "metal"
+                        and dict(checkpoint.identity)
+                        != record["ready"]["loaded_identity"]
+                    ):
+                        raise AssertionError("checkpoint identity differs from loaded Metal model")
                     if checkpoint.metadata.get("encoding") != args.encoding:
                         raise AssertionError("server did not honor requested encoding")
                     appended_tokens = (
@@ -442,9 +573,22 @@ def main():
                         flush=True,
                     )
                     resume_start = time.monotonic()
+                    ledger_offset = metal_ledger_start(args, record)
                     result = client.resume_native_kv_checkpoint(
                         request, checkpoint
                     ).to_dict()
+                    metal_ledger_finish(
+                        args,
+                        record,
+                        ledger_offset,
+                        "checkpoint_resume",
+                        require_binding=True,
+                        expected_representation=(
+                            resident_representation(checkpoint.metadata, args.encoding)
+                            if args.backend == "metal"
+                            else None
+                        ),
+                    )
                     if (
                         result["usage"]["cached_prompt_tokens"]
                         != checkpoint.metadata["logical_tokens"]
@@ -494,33 +638,41 @@ def main():
         evidence["coverage"] = coverage(
             cases, evidence["baseline"], evidence["resumed"], evidence["checkpoints"]
         )
-        if args.encoding == "fp8":
-            evidence["fp8_vs_fp16"] = evaluate(
+        if args.encoding in ("fp8", "rotated4"):
+            evidence[args.encoding + "_vs_fp16"] = evaluate(
                 cases, evidence["fp16_reference"], evidence["resumed"]
             )
-            evidence["fp8_coverage"] = coverage(
+            evidence[args.encoding + "_coverage"] = coverage(
                 cases,
                 evidence["fp16_reference"],
                 evidence["resumed"],
                 evidence["checkpoints"],
-                encoding="fp8",
+                encoding=args.encoding,
             )
-            evidence["fp8_noninferiority"] = fp8_noninferiority(
+            evidence[args.encoding + "_noninferiority"] = fp8_noninferiority(
                 cases,
                 evidence["fp16_reference"],
                 evidence["resumed"],
                 evidence["checkpoints"],
                 args.quality_profile,
+                args.encoding,
             )
         memory = evidence["worker"]["memory"]
-        if memory["samples"] < 2 or memory["errors"] or not memory["gpu_uuids"]:
-            raise AssertionError("incomplete memory evidence")
-        for key, cap in [
-            ("peak_host_rss_bytes", 8 * 1024**3),
-            ("peak_gpu_memory_bytes", 18 * 1024**3),
-        ]:
-            if memory[key] is None or not 0 < memory[key] <= cap:
-                raise AssertionError(f"{key} exceeds qualification cap")
+        if args.backend == "metal":
+            validate_metal_memory(memory)
+            if not evidence["worker"].get("graceful_stop") or evidence[
+                "worker"
+            ].get("remaining_group_members"):
+                raise AssertionError("Metal test server did not drain")
+        else:
+            if memory["samples"] < 2 or memory["errors"] or not memory["gpu_uuids"]:
+                raise AssertionError("incomplete memory evidence")
+            for key, cap in [
+                ("peak_host_rss_bytes", 8 * 1024**3),
+                ("peak_gpu_memory_bytes", 18 * 1024**3),
+            ]:
+                if memory[key] is None or not 0 < memory[key] <= cap:
+                    raise AssertionError(f"{key} exceeds qualification cap")
         if git_provenance(ROOT) != evidence["source"]:
             raise AssertionError("source changed")
         if (
@@ -541,12 +693,15 @@ def main():
                 evidence["baseline"],
                 evidence["resumed"],
                 evidence["checkpoints"],
-                evidence["fp16_reference"] if args.encoding == "fp8" else None,
+                evidence["fp16_reference"]
+                if args.encoding in ("fp8", "rotated4")
+                else None,
             )
             evidence["passed"] = evidence["bounded_quality"]["passed"]
-        if args.encoding == "fp8":
+        if args.encoding in ("fp8", "rotated4"):
             evidence["passed"] = (
-                evidence["passed"] and evidence["fp8_noninferiority"]["passed"]
+                evidence["passed"]
+                and evidence[args.encoding + "_noninferiority"]["passed"]
             )
         evidence.pop("active_case", None)
     except (Exception, KeyboardInterrupt) as error:

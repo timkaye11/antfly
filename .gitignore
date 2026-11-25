@@ -92,6 +92,7 @@ zig-out/
 /datasets/
 
 # Local inference benchmark inputs, outputs, and runtime lock directories
+/.qualification/
 /.benchmark-assets/
 /.benchmark-upstream/
 /.specialty-artifacts/

@@ -19,6 +19,12 @@ const program = @import("../../native_program.zig");
 
 pub const source_0 =
     program.join(&.{
+        \\           "__attribute__((always_inline)) inline void termite_paged_gqa_split_stage_body(device const float *q, device const uchar *encoded_key, device const uchar *v_bytes, device const uint *block_table, device float4 *partial_o, constant termite_metal_paged_attention_params &p, constant termite_metal_decode_gqa_split_params &schedule, threadgroup char *shmem, ushort tid, ushort lane, ushort sgitg, uint qi, uint kv_h, uint split, uint hd, uint split_count) {\n"
+        \\           TERMITE_MSL_PAGED_GQA_SPLIT_STAGE_TILE
+        \\           "__attribute__((always_inline)) inline void termite_paged_gqa_split_reduce_body(device const float4 *partial_o, device float4 *output, constant termite_metal_paged_attention_params &p, constant termite_metal_decode_gqa_split_params &schedule, ushort lane, ushort sgitg, uint qi, uint h, uint hd, uint split_count) {\n"
+        \\           TERMITE_MSL_PAGED_GQA_SPLIT_REDUCE_TILE
+        \\
+        ,
         \\           TERMITE_MSL_ABI_PAGED_GQA_SPLIT_STAGE(termite_paged_attention_kv_decode_gqa_split_stage)
         \\
         ,

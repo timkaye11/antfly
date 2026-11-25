@@ -46,6 +46,11 @@ SQL_OPERATIONS = [
         "poll_sql_notifications",
     )
 ]
+NATIVE_CHECKPOINT_BODY = re.compile(r"body:\s+File\s+\|\s+File\s+\|\s+Unset\s*=\s*UNSET")
+NATIVE_CHECKPOINT_RESUME_OPERATIONS = [
+    Path("api/default/resume_native_kv_checkpoint.py"),
+    Path("api/default/resume_native_kv_checkpoint_batch.py"),
+]
 EMBED_REQUEST = Path("models/inference_embed_request.py")
 NDJSON_RESPONSE = "response_200 = cast(str, response.content)"
 
@@ -240,6 +245,43 @@ def fix_generated_client(root: Path) -> None:
             (
                 "response = await client.get_async_httpx_client().request(",
                 "response = await sql_request_async(client.get_async_httpx_client()," + limit,
+            ),
+        ):
+            if source.count(original) != 1:
+                raise RuntimeError(f"unexpected generated shape in {operation}: {original}")
+            source = source.replace(original, replacement)
+        updates[path] = source
+
+    # HTTPX AsyncClient cannot consume the generated synchronous File stream.
+    # Keep native checkpoint uploads bounded through the handwritten adapter.
+    for operation in NATIVE_CHECKPOINT_RESUME_OPERATIONS:
+        path = root / operation
+        source = path.read_text(encoding="utf-8")
+        # AFATT001 and AFATT002 are two declared binary media alternatives for
+        # one File body. openapi-python-client emits two ordered isinstance
+        # branches; the latter selects v2 while retaining v1 in the contract.
+        # Accept only that exact pair so another media type or generator shape
+        # cannot silently alter upload framing.
+        if (
+            len(NATIVE_CHECKPOINT_BODY.findall(source)) != 5
+            or source.count('_kwargs["content"] = body.payload') != 2
+            or source.count('headers["Content-Type"] = "application/vnd.antfly.attachments.v1"') != 1
+            or source.count('headers["Content-Type"] = "application/vnd.antfly.attachments.v2"') != 1
+            or source.index("application/vnd.antfly.attachments.v1")
+            > source.index("application/vnd.antfly.attachments.v2")
+        ):
+            raise RuntimeError(f"unexpected generated shape in {operation}: binary file body")
+        # The schema requires one binary body. Duplicate media alternatives
+        # cause the generator to make it optional and omit the Unset import.
+        source = NATIVE_CHECKPOINT_BODY.sub("body: File", source)
+        for original, replacement in (
+            (
+                "from ...client import",
+                "from ....native_kv_transport import native_kv_request_async\nfrom ...client import",
+            ),
+            (
+                "response = await client.get_async_httpx_client().request(",
+                "response = await native_kv_request_async(client.get_async_httpx_client(),",
             ),
         ):
             if source.count(original) != 1:

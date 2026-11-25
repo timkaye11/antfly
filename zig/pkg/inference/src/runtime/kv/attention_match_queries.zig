@@ -19,6 +19,7 @@
 const std = @import("std");
 const checkpoint = @import("attention_match_checkpoint.zig");
 const engine = @import("attention_match_engine.zig");
+const Control = @import("attention_match.zig").Control;
 
 /// Build a bounded self-study sequence from the saved prefix only. Repeating
 /// just its tail can calibrate exclusively on boilerplate and miss identifiers
@@ -27,11 +28,18 @@ const engine = @import("attention_match_engine.zig");
 /// This selects calibration inputs; it never changes the authoritative history
 /// or authorizes a candidate without the independent numerical validation.
 pub fn studyTokens(allocator: std.mem.Allocator, source: []const i64, maximum: usize) ![]i64 {
+    return studyTokensPass(allocator, source, maximum, 0);
+}
+
+pub fn studyTokensPass(allocator: std.mem.Allocator, source: []const i64, maximum: usize, pass: u8) ![]i64 {
     if (source.len < 2 or source.len > checkpoint.max_context_tokens or maximum < 2 or maximum > checkpoint.max_context_tokens)
         return error.CompactionQueryLimit;
+    if (pass > 1) return error.CompactionQueryLimit;
     for (source) |token| if (token < 0) return error.InvalidCompactionQueries;
-    if (source.len <= maximum or maximum < 256)
+    if (source.len <= maximum or maximum < 256) {
+        if (pass != 0) return error.CompactionQueryLimit;
         return allocator.dupe(i64, source[source.len - @min(source.len, maximum) ..]);
+    }
     const window = 64;
     // Split the bounded budget between historical spans and recent context.
     // Two historical windows can both be occupied by tool declarations,
@@ -60,22 +68,24 @@ pub fn studyTokens(allocator: std.mem.Allocator, source: []const i64, maximum: u
     }
     const scores = try allocator.alloc(f64, count);
     defer allocator.free(scores);
-    const selected = try allocator.alloc(bool, count);
-    defer allocator.free(selected);
-    @memset(selected, false);
+    const rank = try allocator.alloc(u16, count);
+    defer allocator.free(rank);
+    @memset(rank, std.math.maxInt(u16));
+    const total_take = try std.math.mul(usize, take, @as(usize, pass) + 1);
+    if (total_take > count or total_take > std.math.maxInt(u16)) return error.CompactionQueryLimit;
     for (scores, 0..) |*value, i| {
         value.* = 0;
         for (frequency[i * window ..][0..window]) |n| value.* += 1.0 / @as(f64, @floatFromInt(n));
     }
-    for (0..take) |_| {
+    for (0..total_take) |selection_index| {
         var best: ?usize = null;
         var best_distance: usize = 0;
         for (scores, 0..) |value, i| {
-            if (selected[i]) continue;
+            if (rank[i] != std.math.maxInt(u16)) continue;
             // Equal-scoring boilerplate is spread across the prefix instead
             // of filling every remaining slot with adjacent early windows.
             var distance = count - i;
-            for (selected, 0..) |chosen, j| if (chosen) {
+            for (rank, 0..) |chosen, j| if (chosen != std.math.maxInt(u16)) {
                 distance = @min(distance, if (i > j) i - j else j - i);
             };
             if (best == null or value > scores[best.?] or
@@ -85,14 +95,17 @@ pub fn studyTokens(allocator: std.mem.Allocator, source: []const i64, maximum: u
                 best_distance = distance;
             }
         }
-        selected[best orelse return error.InvalidCompactionQueries] = true;
+        rank[best orelse return error.InvalidCompactionQueries] = @intCast(selection_index);
     }
     const result = try allocator.alloc(i64, maximum);
     var written: usize = 0;
-    for (selected, 0..) |chosen, i| if (chosen) {
+    const first_rank = @as(usize, pass) * take;
+    const last_rank = first_rank + take;
+    for (rank, 0..) |chosen, i| if (chosen >= first_rank and chosen < last_rank) {
         @memcpy(result[written..][0..window], source[i * window ..][0..window]);
         written += window;
     };
+    if (written != informative) return error.InvalidCompactionQueries;
     @memcpy(result[written..], source[source.len - recent ..]);
     return result;
 }
@@ -105,12 +118,88 @@ pub const Consumer = struct {
     dim: u32,
 };
 
+/// Canonical, allocation-free evidence for the exact calibration inputs. Train
+/// and held-out values have separate domains; neither role can impersonate the
+/// other. The consumer geometry includes every shared-layer query head.
+pub const Seal = struct {
+    source_length: usize,
+    repeat_length: usize,
+    consumer_count: usize,
+    batch_count: usize,
+    train_positions: usize,
+    heldout_positions: usize,
+    train_elements: usize,
+    heldout_elements: usize,
+    geometry_sha256: [32]u8,
+    train_positions_sha256: [32]u8,
+    heldout_positions_sha256: [32]u8,
+    train_values_sha256: [32]u8,
+    heldout_values_sha256: [32]u8,
+    sha256: [32]u8,
+
+    pub fn digest(self: Seal) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly.native-calibration-seal.v1\n");
+        inline for (.{ "source_length", "repeat_length", "consumer_count", "batch_count", "train_positions", "heldout_positions", "train_elements", "heldout_elements" }) |field|
+            hashInteger(&hash, @field(self, field));
+        inline for (.{ "geometry_sha256", "train_positions_sha256", "heldout_positions_sha256", "train_values_sha256", "heldout_values_sha256" }) |field|
+            hash.update(&@field(self, field));
+        return hash.finalResult();
+    }
+
+    pub fn validate(self: Seal) !void {
+        if (self.source_length == 0 or self.source_length > checkpoint.max_context_tokens or
+            self.repeat_length < 2 or self.repeat_length > checkpoint.max_context_tokens or
+            self.consumer_count == 0 or self.consumer_count > 256 or
+            self.batch_count < self.consumer_count or self.batch_count > 65536 or
+            self.train_positions == 0 or self.heldout_positions == 0 or
+            self.train_positions > 1024 or self.heldout_positions > 1024 or
+            self.train_positions + self.heldout_positions > 1024 or
+            self.train_elements == 0 or self.heldout_elements == 0 or
+            self.train_elements % self.train_positions != 0 or self.heldout_elements % self.heldout_positions != 0 or
+            self.train_elements / self.train_positions != self.heldout_elements / self.heldout_positions)
+            return error.InvalidCompactionQueries;
+        inline for (.{ "geometry_sha256", "train_positions_sha256", "heldout_positions_sha256", "train_values_sha256", "heldout_values_sha256", "sha256" }) |field|
+            if (std.mem.allEqual(u8, &@field(self, field), 0)) return error.InvalidCompactionQueries;
+        if (!std.mem.eql(u8, &self.sha256, &self.digest())) return error.InvalidCompactionQueries;
+    }
+};
+
+fn hashInteger(hash: *std.crypto.hash.sha2.Sha256, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    hash.update(&bytes);
+}
+
+fn hashFloats(hash: *std.crypto.hash.sha2.Sha256, values: []const f32, control: Control) !void {
+    var offset: usize = 0;
+    while (offset < values.len) {
+        try control.check();
+        const end = offset + @min(16384, values.len - offset);
+        const chunk = values[offset..end];
+        for (chunk) |value| if (!std.math.isFinite(value)) return error.NonFiniteAttention;
+        if (comptime @import("builtin").cpu.arch.endian() == .little) {
+            hash.update(std.mem.sliceAsBytes(chunk));
+        } else {
+            for (chunk) |value| {
+                var bytes: [4]u8 = undefined;
+                std.mem.writeInt(u32, &bytes, @bitCast(value), .little);
+                hash.update(&bytes);
+            }
+        }
+        offset = end;
+    }
+}
+
 pub const Options = struct {
     samples_per_consumer: usize = 80,
     /// Every fifth sampled position is held out, starting with position zero.
     heldout_stride: usize = 5,
     max_bytes: usize = 64 * 1024 * 1024,
     max_capture_rows: usize = 512,
+    /// DEV-only explicit positions within the repeat. Null preserves the
+    /// historical evenly-spaced sampler byte-for-byte.
+    explicit_sample_offsets: ?[]const u32 = null,
 };
 
 const Sample = struct { position: u64, heldout: bool, index: usize };
@@ -136,6 +225,12 @@ fn plan(consumers: []const Consumer, source_length: usize, repeat_length: usize,
     _ = try add(source_length, repeat_length);
     const samples = @min(repeat_length, options.samples_per_consumer);
     if (samples > 1024) return error.CompactionQueryLimit;
+    if (options.explicit_sample_offsets) |offsets| {
+        if (offsets.len != options.samples_per_consumer or offsets.len != samples) return error.InvalidCompactionQueries;
+        for (offsets, 0..) |offset, i| {
+            if (offset >= repeat_length or (i > 0 and offsets[i - 1] >= offset)) return error.InvalidCompactionQueries;
+        }
+    }
     const heldout = (samples - 1) / options.heldout_stride + 1;
     var heads: usize = 0;
     var width: usize = 0;
@@ -221,7 +316,8 @@ pub const Collector = struct {
         var nh: usize = 0;
         for (samples, 0..) |*sample, i| {
             // Include both ends of the repeat and keep integer positions unique.
-            const position = try add(source_length, (try mul(i, repeat_length - 1)) / (p.samples - 1));
+            const offset = if (options.explicit_sample_offsets) |offsets| offsets[i] else (try mul(i, repeat_length - 1)) / (p.samples - 1);
+            const position = try add(source_length, offset);
             const heldout = i % options.heldout_stride == 0;
             sample.* = .{ .position = position, .heldout = heldout, .index = if (heldout) nh else nt };
             if (heldout) {
@@ -253,6 +349,54 @@ pub const Collector = struct {
         self.allocator.free(self.heldout_positions);
         self.allocator.free(self.seen);
         self.* = undefined;
+    }
+
+    pub fn seal(self: *const Collector, control: Control) !Seal {
+        const batches = try self.finish();
+        try control.check();
+        var geometry = std.crypto.hash.sha2.Sha256.init(.{});
+        geometry.update("antfly.native-calibration-geometry.v1\n");
+        hashInteger(&geometry, self.source_length);
+        hashInteger(&geometry, self.repeat_length);
+        for (self.consumers) |consumer| inline for (.{ "layer", "donor", "query_heads", "kv_heads", "dim" }) |field|
+            hashInteger(&geometry, @field(consumer, field));
+        var train_positions = std.crypto.hash.sha2.Sha256.init(.{});
+        train_positions.update("antfly.native-calibration-train-positions.v1\n");
+        for (self.train_positions) |position| hashInteger(&train_positions, position);
+        var heldout_positions = std.crypto.hash.sha2.Sha256.init(.{});
+        heldout_positions.update("antfly.native-calibration-heldout-positions.v1\n");
+        for (self.heldout_positions) |position| hashInteger(&heldout_positions, position);
+        var train = std.crypto.hash.sha2.Sha256.init(.{});
+        train.update("antfly.native-calibration-train-values.v1\n");
+        var heldout = std.crypto.hash.sha2.Sha256.init(.{});
+        heldout.update("antfly.native-calibration-heldout-values.v1\n");
+        var train_elements: usize = 0;
+        var heldout_elements: usize = 0;
+        for (batches) |batch| {
+            try hashFloats(&train, batch.train, control);
+            try hashFloats(&heldout, batch.heldout, control);
+            train_elements = try add(train_elements, batch.train.len);
+            heldout_elements = try add(heldout_elements, batch.heldout.len);
+        }
+        var result: Seal = .{
+            .source_length = self.source_length,
+            .repeat_length = self.repeat_length,
+            .consumer_count = self.consumers.len,
+            .batch_count = batches.len,
+            .train_positions = self.train_positions.len,
+            .heldout_positions = self.heldout_positions.len,
+            .train_elements = train_elements,
+            .heldout_elements = heldout_elements,
+            .geometry_sha256 = geometry.finalResult(),
+            .train_positions_sha256 = train_positions.finalResult(),
+            .heldout_positions_sha256 = heldout_positions.finalResult(),
+            .train_values_sha256 = train.finalResult(),
+            .heldout_values_sha256 = heldout.finalResult(),
+            .sha256 = @splat(0),
+        };
+        result.sha256 = result.digest();
+        try result.validate();
+        return result;
     }
 
     /// Exact signature of DecodeContext's post-RoPE query capture hook. A fused
@@ -334,6 +478,30 @@ test "attention_match queries sample entire repeat and split every GQA/shared co
     try std.testing.expectEqual(@as(usize, 8), batches.len);
     try std.testing.expectEqualSlices(f32, &.{ 100, 101, 120, 121, 150, 151 }, batches[0].train);
     try std.testing.expectEqualSlices(f32, &.{ 2086, 2087 }, batches[7].heldout);
+}
+
+test "explicit sample offsets own exact positions and preserve default sampler" {
+    const one = [_]Consumer{.{ .layer = 0, .donor = 0, .query_heads = 1, .kv_heads = 1, .dim = 1 }};
+    const offsets = [_]u32{ 0, 2, 5, 7 };
+    var explicit = try Collector.init(std.testing.allocator, &one, 8, 8, .{ .samples_per_consumer = 4, .max_capture_rows = 4, .explicit_sample_offsets = &offsets });
+    defer explicit.deinit();
+    try std.testing.expectEqual(@as(u64, 8), explicit.samples[0].position);
+    try std.testing.expectEqual(@as(u64, 10), explicit.samples[1].position);
+    try std.testing.expectEqual(@as(u64, 13), explicit.samples[2].position);
+    try std.testing.expectEqual(@as(u64, 15), explicit.samples[3].position);
+    var baseline = try Collector.init(std.testing.allocator, &one, 8, 8, .{ .samples_per_consumer = 4, .max_capture_rows = 4 });
+    defer baseline.deinit();
+    try std.testing.expectEqual(@as(u64, 8), baseline.samples[0].position);
+    try std.testing.expectEqual(@as(u64, 10), baseline.samples[1].position);
+    try std.testing.expectEqual(@as(u64, 12), baseline.samples[2].position);
+    try std.testing.expectEqual(@as(u64, 15), baseline.samples[3].position);
+}
+
+test "explicit sample offsets reject count bounds and ordering before allocation" {
+    const one = [_]Consumer{.{ .layer = 0, .donor = 0, .query_heads = 1, .kv_heads = 1, .dim = 1 }};
+    try std.testing.expectError(error.InvalidCompactionQueries, Collector.init(std.testing.allocator, &one, 8, 8, .{ .samples_per_consumer = 4, .explicit_sample_offsets = &.{ 0, 2, 3 } }));
+    try std.testing.expectError(error.InvalidCompactionQueries, Collector.init(std.testing.allocator, &one, 8, 8, .{ .samples_per_consumer = 4, .explicit_sample_offsets = &.{ 0, 2, 2, 7 } }));
+    try std.testing.expectError(error.InvalidCompactionQueries, Collector.init(std.testing.allocator, &one, 8, 8, .{ .samples_per_consumer = 4, .explicit_sample_offsets = &.{ 0, 2, 3, 8 } }));
 }
 
 test "attention_match queries reject missing consumers bad shapes nonfinite values and budgets" {
@@ -436,4 +604,66 @@ fn studyAllocationFailure(allocator: std.mem.Allocator) !void {
 
 test "attention match bounded study unwinds every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, studyAllocationFailure, .{});
+}
+
+test "attention_match Metal calibration seal separates roles geometry positions and cancellation" {
+    var collector = try Collector.init(std.testing.allocator, &fixture, 8, 8, .{ .samples_per_consumer = 4, .max_capture_rows = 8 });
+    defer collector.deinit();
+    try std.testing.expectError(error.MissingCompactionConsumerQueries, collector.seal(.{}));
+    const input: [64]f32 = @splat(1);
+    for (fixture) |consumer| try Collector.capture(&collector, consumer.donor, consumer.layer, 8, 4, 2, &input);
+    const sealed = try collector.seal(.{});
+    try sealed.validate();
+    var tampered = sealed;
+    tampered.train_values_sha256[0] ^= 1;
+    try std.testing.expectError(error.InvalidCompactionQueries, tampered.validate());
+    collector.values[0] += 0.5;
+    const train_changed = try collector.seal(.{});
+    try std.testing.expect(!std.mem.eql(u8, &sealed.sha256, &train_changed.sha256));
+    try std.testing.expect(!std.mem.eql(u8, &sealed.train_values_sha256, &train_changed.train_values_sha256));
+    try std.testing.expectEqualSlices(u8, &sealed.heldout_values_sha256, &train_changed.heldout_values_sha256);
+    try std.testing.expectEqualSlices(u8, &sealed.geometry_sha256, &train_changed.geometry_sha256);
+    collector.values[0] -= 0.5;
+    const heldout_offset = collector.batches[0].train.len;
+    collector.values[heldout_offset] += 0.25;
+    const heldout_changed = try collector.seal(.{});
+    try std.testing.expectEqualSlices(u8, &sealed.train_values_sha256, &heldout_changed.train_values_sha256);
+    try std.testing.expect(!std.mem.eql(u8, &sealed.heldout_values_sha256, &heldout_changed.heldout_values_sha256));
+    collector.values[heldout_offset] -= 0.25;
+    collector.consumers[1].donor += 1;
+    const geometry_changed = try collector.seal(.{});
+    try std.testing.expect(!std.mem.eql(u8, &sealed.geometry_sha256, &geometry_changed.geometry_sha256));
+    collector.consumers[1].donor -= 1;
+    collector.train_positions[0] += 1;
+    const positions_changed = try collector.seal(.{});
+    try std.testing.expect(!std.mem.eql(u8, &sealed.train_positions_sha256, &positions_changed.train_positions_sha256));
+    try std.testing.expectEqualSlices(u8, &sealed.heldout_positions_sha256, &positions_changed.heldout_positions_sha256);
+    collector.train_positions[0] -= 1;
+    try std.testing.expectEqualSlices(u8, &sealed.sha256, &(try collector.seal(.{})).sha256);
+    const Stop = struct {
+        fn check(_: ?*anyopaque) anyerror!void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, collector.seal(.{ .check_fn = Stop.check }));
+    collector.values[0] = std.math.nan(f32);
+    try std.testing.expectError(error.NonFiniteAttention, collector.seal(.{}));
+}
+
+test "attention_match consecutive study pass is deterministic and historically disjoint" {
+    var source: [2048]i64 = undefined;
+    for (&source, 0..) |*token, i| token.* = @intCast(i);
+    const zero = try studyTokens(std.testing.allocator, &source, 512);
+    defer std.testing.allocator.free(zero);
+    const explicit_zero = try studyTokensPass(std.testing.allocator, &source, 512, 0);
+    defer std.testing.allocator.free(explicit_zero);
+    const one = try studyTokensPass(std.testing.allocator, &source, 512, 1);
+    defer std.testing.allocator.free(one);
+    try std.testing.expectEqualSlices(i64, zero, explicit_zero);
+    try std.testing.expectEqualSlices(i64, zero[256..], one[256..]);
+    for (0..4) |left| for (0..4) |right| try std.testing.expect(!std.mem.eql(i64, zero[left * 64 ..][0..64], one[right * 64 ..][0..64]));
+    const again = try studyTokensPass(std.testing.allocator, &source, 512, 1);
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqualSlices(i64, one, again);
+    try std.testing.expectError(error.CompactionQueryLimit, studyTokensPass(std.testing.allocator, &source, 512, 2));
 }

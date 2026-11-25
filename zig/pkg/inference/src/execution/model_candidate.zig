@@ -97,10 +97,10 @@ pub const Candidate = struct {
         vocab_size: usize,
     ) !?i64 {
         return switch (request) {
-            .prefill => blk: {
+            .prefill => |prefill_request| blk: {
                 var result = (try self.output(allocator, request)) orelse return null;
                 defer result.deinitWithCleanup(allocator, cleanupContext(request));
-                break :blk try result.greedyTokenWithCleanup(allocator, vocab_size, cleanupContext(request));
+                break :blk try result.greedyTokenSuppressWithCleanup(allocator, vocab_size, prefill_request.suppress_token_ids, cleanupContext(request));
             },
             .decode => |decode_request| blk: {
                 try decode_request.check();
@@ -419,4 +419,30 @@ test "opaque candidate keeps current cleanup epoch through materialization greed
         try std.testing.expectEqual(@as(usize, 1), probe.quota_releases);
         try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
     }
+}
+
+test "context compiled candidate preserves request suppression for prefill and decode" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn prefill(raw: *anyopaque, a: std.mem.Allocator, request: model_runtime.PrefillRequest) !model_runtime.ModelOutput {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqualSlices(i32, &.{1}, request.suppress_token_ids);
+            return .{ .logits = try a.dupe(f32, &.{ 0, 9, 8 }) };
+        }
+        fn decode(raw: *anyopaque, _: std.mem.Allocator, request: model_runtime.DecodeRequest) !model_runtime.GreedyDecodeOutput {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqualSlices(i32, &.{1}, request.suppress_token_ids);
+            return .{ .token_id = 2 };
+        }
+        fn deinit(_: *anyopaque) void {}
+        const table = model_runtime.ModelRuntime.VTable{ .prefill = prefill, .decode_greedy = decode, .deinit = deinit };
+    };
+    var probe = Probe{};
+    var runtime = model_runtime.ModelRuntime{ .ptr = &probe, .vtable = &Probe.table };
+    const candidate = Candidate{ .runtime = &runtime };
+    try std.testing.expectEqual(@as(?i64, 2), try candidate.greedy(std.testing.allocator, .{ .prefill = .{ .input_ids = &.{0}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill, .suppress_token_ids = &.{1} } }, 3));
+    try std.testing.expectEqual(@as(?i64, 2), try candidate.greedy(std.testing.allocator, .{ .decode = .{ .token_id = 0, .position = 1, .suppress_token_ids = &.{1} } }, 3));
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
 }

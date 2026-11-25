@@ -205,6 +205,11 @@ pub fn main(init: std.process.Init) !void {
             stale += 1;
             continue;
         };
+        if (r.native_source) {
+            // Canonical JIT input, not a generated copy or string splice.
+            if (!std.mem.eql(u8, contents, r.data)) return error.StaleNativeSource;
+            continue;
+        }
         const begin = std.mem.indexOf(u8, contents, r.begin) orelse {
             std.debug.print("{s}: missing marker {s}", .{ r.path, r.begin });
             stale += 1;

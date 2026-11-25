@@ -223,6 +223,7 @@ pub const EagerStepRequest = struct {
     compiled_sampling: ?graph_mod.model_runtime.SamplingConfig = null,
     compiled_sampling_eligible: bool = false,
     compiled_greedy_eligible: bool = false,
+    suppress_token_ids: []const i32 = &.{},
     prefetch_drain_budget: usize = 4,
     continuation: ?graph_mod.model_runtime.DecodeContinuation = null,
 };
@@ -928,7 +929,22 @@ pub const Runtime = struct {
         };
     }
 
-    fn forwardAllLogits(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
+    pub fn forwardAllLogits(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
+        // A context session is a request-scoped numerical owner. Prepared
+        // programs, graph caches and replay runtimes cannot retain its borrowed
+        // hook. Canonical GPT execution owns the framed transaction and routes
+        // every layer attention through the active session.
+        if (decode_context.context_session != null) {
+            return gpt_arch.forward(
+                self.context.cb,
+                self.context.allocator,
+                self.context.gpt_config.*,
+                input_ids,
+                batch,
+                seq_len,
+                decode_context,
+            );
+        }
         var fallback_count: u64 = 0;
         return graph_mod.decoder_step_executor.forwardAll(&self.context, self.graph_cache, input_ids, batch, seq_len, decode_context, self.replay_fallbacks orelse &fallback_count);
     }
@@ -1013,7 +1029,10 @@ pub const Runtime = struct {
     pub fn eagerStep(self: *Runtime, state: *NativeDecodeState, request: EagerStepRequest) !EagerStepResult {
         self.context.cb.drainPrefetchBudget(request.prefetch_drain_budget);
         var physical = BorrowedDecodeStateRuntime.init(state);
-        const query_rows = if (physical.kvView() != null and (request.generated_tokens > 0 or !request.has_prefill_logits)) 1 else request.sequence_length;
+        // Packed context sessions retain attention state without exposing the
+        // legacy KvView. Use the backend-neutral retained-attention predicate
+        // so decode submits only the newly accepted token for both owners.
+        const query_rows = if (state.hasRetainedAttention() and (request.generated_tokens > 0 or !request.has_prefill_logits)) 1 else request.sequence_length;
         var decode = physical.makeDecodeContext(request.sequence_length, query_rows);
         try self.context.bindDecoderCleanup(&decode);
         const input_ids = if (query_rows == request.sequence_length)
@@ -1037,7 +1056,7 @@ pub const Runtime = struct {
             if (try compiled.forwardCompiledSampled(input_ids, request.sequence_length, &decode, sampling, request.token_history[0..request.sequence_length], request.compiled_sampling_eligible)) |token| return .{ .token = token };
         }
         if (request.compiled_greedy_eligible) {
-            if (try compiled.forwardCompiledGreedy(input_ids, 1, request.sequence_length, &decode)) |token| return .{ .token = token };
+            if (try compiled.forwardCompiledGreedy(input_ids, 1, request.sequence_length, &decode, request.suppress_token_ids)) |token| return .{ .token = token };
         }
         return .{ .logits = try self.forwardLastLogits(input_ids, 1, request.sequence_length, &decode) };
     }
@@ -1064,6 +1083,24 @@ pub const Runtime = struct {
     ) ![]f32 {
         const query_seq_len = decode_context.query_sequence_len;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
+        // The hook is borrowed from the active decode state for exactly this
+        // synchronous call. Do not let any prepared/cached runtime capture it.
+        // GPT owns context-session frame begin/commit/cancel while preserving
+        // the caller's cleanup authority on this stack context.
+        if (decode_context.context_session != null) {
+            const logits = try gpt_arch.forward(
+                self.context.cb,
+                self.context.allocator,
+                self.context.gpt_config.*,
+                input_ids,
+                batch,
+                seq_len,
+                decode_context,
+            );
+            defer self.context.allocator.free(logits);
+            const last_pos_offset = (query_seq_len - 1) * @as(usize, @intCast(self.context.gpt_config.*.vocab_size));
+            return try self.context.allocator.dupe(f32, logits[last_pos_offset..][0..@intCast(self.context.gpt_config.*.vocab_size)]);
+        }
         const observation = @import("runtime_observation.zig");
         if (self.graph_cache == null) if (self.native_program) |program| {
             if (program.supportsCall(input_ids, batch, decode_context)) {
@@ -1124,19 +1161,20 @@ pub const Runtime = struct {
         return try self.context.allocator.dupe(f32, logits[last_pos_offset..][0..@intCast(self.context.gpt_config.*.vocab_size)]);
     }
 
-    pub fn forwardCompiledGreedy(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, provided_decode_context: *const gpt_arch.DecodeContext) !?usize {
+    pub fn forwardCompiledGreedy(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, provided_decode_context: *const gpt_arch.DecodeContext, suppress_token_ids: []const i32) !?usize {
         var current_decode_context = provided_decode_context.*;
         try self.context.bindDecoderCleanup(&current_decode_context);
         const decode_context = &current_decode_context;
-        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardCompiledGreedyUnobserved, .{ self, input_ids, batch, seq_len, decode_context });
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().forwardCompiledGreedyUnobserved, .{ self, input_ids, batch, seq_len, decode_context, suppress_token_ids });
     }
 
-    fn forwardCompiledGreedyUnobserved(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) !?usize {
+    fn forwardCompiledGreedyUnobserved(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext, suppress_token_ids: []const i32) !?usize {
         try self.rejectUnsupportedDeepSeekV4GraphMode();
+        if (decode_context.context_session != null) return null;
         const cache = self.graph_cache orelse return null;
         if (self.context.compiled_partition_backend == null or self.context.compiled_attachment_target != .whole_model) return null;
 
-        const token_id = (try graph_mod.execution.graphForwardCompiledModelGreedyToken(
+        const token_id = (try graph_mod.execution.graphForwardCompiledModelGreedyTokenSuppress(
             &self.context,
             cache,
             input_ids,
@@ -1144,6 +1182,8 @@ pub const Runtime = struct {
             seq_len,
             decode_context,
             self.context.gpt_config.*.vocab_size,
+            suppress_token_ids,
+            true,
         )) orelse return null;
         if (token_id < 0) return error.InvalidModelOutput;
         return @intCast(token_id);
@@ -1159,6 +1199,7 @@ pub const Runtime = struct {
     fn forwardCompiledSampledUnobserved(self: *Runtime, input_ids: []const i64, seq_len: usize, decode_context: *const gpt_arch.DecodeContext, sampling: graph_mod.model_runtime.SamplingConfig, token_history: []const i64, eligible: bool) !?usize {
         if (self.context.cb.kind() != .metal or !compiledSampledDecodeEnabled(self.context.gpt_config.*) or !eligible) return null;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
+        if (decode_context.context_session != null) return null;
         const cache = self.graph_cache orelse return null;
         if (self.context.compiled_partition_backend == null or self.context.compiled_attachment_target != .whole_model) return null;
         if (input_ids.len != 1 or decode_context.attention_mode != .paged_decode) return null;

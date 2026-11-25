@@ -74,6 +74,17 @@ fn getQuantizedStorageGeneric(
     };
 }
 
+pub fn isMappedQ40Weight(cb: *const ops.ComputeBackend, tensor: ops.CT, expected_elements: usize) bool {
+    const storage = getQuantizedStorageGeneric(cb, tensor) orelse return false;
+    var elements: usize = 1;
+    for (storage.shape) |dim| {
+        if (dim <= 0) return false;
+        elements = std.math.mul(usize, elements, @intCast(dim)) catch return false;
+    }
+    return std.meta.eql(storage.tensor_type, @import("../gguf/tensor_types.zig").TensorType{ .known = .Q4_0 }) and
+        storage.raw_mmap_backed and storage.raw_bytes.len != 0 and elements == expected_elements;
+}
+
 fn zeroBiasTensorGeneric(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,

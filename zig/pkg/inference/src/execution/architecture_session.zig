@@ -2921,6 +2921,9 @@ const ArchSession = struct {
     video_coefficient_suspended: bool = false,
     allocator: std.mem.Allocator,
     arch_config: ArchConfig,
+    artifact_identity_mutex: std.atomic.Mutex = .unlocked,
+    artifact_identity_checked: bool = false,
+    artifact_identity: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
     recurrent_execution: ?qwen35_execution.Decision = null,
     boundary_identity: ?boundary_bundle.Identity = null,
     gliner_decision_identity: ?gliner_decide_qualification.Identity = null,
@@ -4660,6 +4663,48 @@ pub fn getGptConfig(session: Session) ?gpt_mod.Config {
         .gpt => |cfg| cfg,
         else => null,
     };
+}
+
+fn retainedTensorStore(self: *const ArchSession) ?tensor_store_mod.TensorStore {
+    return switch (self.backend_type) {
+        .native => self.backend_data.native.tensor_store,
+        .pjrt => self.backend_data.pjrt.native.tensor_store,
+        .metal => if (comptime build_options.enable_metal)
+            gpuBackendData(@constCast(self)).tensor_store
+        else
+            null,
+        .cuda, .wasm => null,
+    };
+}
+
+fn retainedPrimaryGgufArtifactBytes(self: *const ArchSession) ?[]const u8 {
+    const store = retainedTensorStore(self) orelse return null;
+    if (store.ggufArtifactBytes()) |bytes| return bytes;
+    const projector_names_opt = tensor_store_mod.projectorAudioTensorNames(store, self.allocator) catch return null;
+    const projector_names = projector_names_opt orelse return null;
+    defer self.allocator.free(projector_names);
+    const composite: *const tensor_store_mod.CompositeProjectorStore = @ptrCast(@alignCast(store.ptr));
+    return composite.primary.tensorStore().ggufArtifactBytes();
+}
+
+pub fn getLoadedGgufArtifactBytes(session: Session) ?[]const u8 {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *const ArchSession = @ptrCast(@alignCast(session.ptr));
+    return retainedPrimaryGgufArtifactBytes(self);
+}
+
+pub fn getLoadedGgufArtifactDigest(session: Session) ?[std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    platform.sync.lockYielding(&self.artifact_identity_mutex);
+    defer self.artifact_identity_mutex.unlock();
+    if (self.artifact_identity_checked) return self.artifact_identity;
+    self.artifact_identity_checked = true;
+    const bytes = getLoadedGgufArtifactBytes(session) orelse return null;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    self.artifact_identity = digest;
+    return digest;
 }
 
 pub fn getEmbeddingGemma2ResidentConfig(session: Session) ?embedding_gemma2_model.Config {
@@ -7338,10 +7383,11 @@ pub fn configureSharedCacheAdmissionForSession(
     };
     const tier_cache: ?*runtime.tier.cache.SharedCache = switch (self.backend_type) {
         .native => if (self.backend_data.native.tier_cache) |*cache| cache else null,
-        .metal => if (build_options.enable_metal)
-            if (gpuBackendData(self).tier_cache) |*cache| cache else null
-        else
-            null,
+        .metal => if (build_options.enable_metal) blk: {
+            const data = gpuBackendData(self);
+            data.configureBorrowedMmapRawPrepayment(resident.backend_weight_bytes);
+            break :blk if (data.tier_cache) |*cache| cache else null;
+        } else null,
         .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*cache| cache else null,
         .cuda, .wasm => null,
     };

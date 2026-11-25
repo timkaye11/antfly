@@ -289,6 +289,14 @@ Metal encoding happens once at the Objective-C boundary. Existing Objective-C
 macro splices use `encodedMetalSourceFamily`. These files participate in the
 checked source-input manifest and backend qualification identity.
 
+For a complete Metal library compiled independently by a JIT adapter, use
+`metalSourceFile` in the same native-family registry and consume its registered
+source constant directly. Keep the canonical `.metal` file under the operation
+owner. The inventory checks the complete library bytes and build-input identity;
+it classifies this as authored native source, without generating a second copy
+or claiming shared arithmetic. Preserve the library's existing entrypoints,
+parameter layouts and separately compiled precision/schedule variants.
+
 `src/tile/cuda_standalone.zig` owns offline CUDA image identities, export names
 and fixed launch resources. Tile codegen exports its JSON for the Python
 producers; host launch owners consume the same typed catalog. Shared producer

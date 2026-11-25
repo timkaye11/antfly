@@ -200,7 +200,7 @@ fn qualifySelection(allocator: std.mem.Allocator, context: *Context, fitter: *Fi
                 norms[j] += probabilities[i * n + j] * probabilities[i * n + j];
             }
         }
-        _ = try backend.select_fn.?(backend.context, allocator, &probabilities, &norms, q, n, &indices, &weights, cfg);
+        _ = try backend.select_fn.?(backend.context, allocator, &probabilities, &norms, q, n, &.{}, &indices, &weights, cfg);
         for (indices, 0..) |idx, j| {
             if (idx >= n or std.mem.indexOfScalar(usize, indices[0..j], idx) != null) return error.InvalidSelectionResult;
             for (0..q) |i| basis[i * m + j] = probabilities[i * n + idx];
@@ -235,7 +235,7 @@ fn qualifySelection(allocator: std.mem.Allocator, context: *Context, fitter: *Fi
         if (fitter.workspace_limit != 0) {
             const expected_indices = indices;
             const expected_weights = weights;
-            _ = try backend.select_fn.?(backend.context, allocator, &probabilities, &norms, q, n, &indices, &weights, cfg);
+            _ = try backend.select_fn.?(backend.context, allocator, &probabilities, &norms, q, n, &.{}, &indices, &weights, cfg);
             if (!std.mem.eql(usize, &expected_indices, &indices) or !std.mem.eql(f64, &expected_weights, &weights)) return error.WorkspaceReuseChangedResult;
         }
         if (fitter.workspace_limit != 0) fitter.releaseWorkspace();
@@ -244,19 +244,19 @@ fn qualifySelection(allocator: std.mem.Allocator, context: *Context, fitter: *Fi
     }
     var cancel: Cancel = .{};
     cfg.control = .{ .context = &cancel, .check_fn = Cancel.check };
-    if (backend.select_fn.?(backend.context, allocator, &probabilities, &norms, q, n, &indices, &weights, cfg)) |_| return error.ExpectedCancellation else |err| if (err != error.CompactionCancelled) return err;
+    if (backend.select_fn.?(backend.context, allocator, &probabilities, &norms, q, n, &.{}, &indices, &weights, cfg)) |_| return error.ExpectedCancellation else |err| if (err != error.CompactionCancelled) return err;
     if (fitter.workspace_limit != 0) fitter.releaseWorkspace();
     if (cancel.calls != 8 or context.device_allocations.snapshot().live != live) return error.DeviceAllocationLeak;
     cfg.control = .{};
     cfg.max_sweeps = 1;
-    if (backend.select_fn.?(backend.context, allocator, &probabilities, &norms, q, n, &indices, &weights, cfg)) |_| return error.ExpectedWorkLimit else |err| if (err != error.MassFitDidNotConverge) return err;
+    if (backend.select_fn.?(backend.context, allocator, &probabilities, &norms, q, n, &.{}, &indices, &weights, cfg)) |_| return error.ExpectedWorkLimit else |err| if (err != error.MassFitDidNotConverge) return err;
     if (fitter.workspace_limit != 0) fitter.releaseWorkspace();
     if (context.device_allocations.snapshot().live != live) return error.DeviceAllocationLeak;
     cfg.max_sweeps = 4096;
     const old_limit = context.device_allocations.snapshot().limit;
     try context.device_allocations.setLimit(live + q * n * 8 + q * m * 8 + 128);
     defer context.device_allocations.setLimit(old_limit) catch {};
-    if (backend.select_fn.?(backend.context, allocator, &probabilities, &norms, q, n, &indices, &weights, cfg)) |_| return error.ExpectedMemoryLimit else |err| if (err != error.CudaMemoryLimitExceeded) return err;
+    if (backend.select_fn.?(backend.context, allocator, &probabilities, &norms, q, n, &.{}, &indices, &weights, cfg)) |_| return error.ExpectedMemoryLimit else |err| if (err != error.CudaMemoryLimitExceeded) return err;
     if (fitter.workspace_limit != 0) fitter.releaseWorkspace();
     if (context.device_allocations.snapshot().live != live) return error.DeviceAllocationLeak;
     std.debug.print("FAULTS cancellation=true work_limit=true partial_allocation_oom=true live_device_bytes={d}\n", .{live});

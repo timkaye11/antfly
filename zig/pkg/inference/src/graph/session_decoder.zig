@@ -32,6 +32,7 @@ pub const Definition = struct {
     configuration: gpt.OwnedConfig,
     kv_dtype: ?runtime.kv.pool.KvDType,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+    model_identity: ?runtime.kv.attention_match_checkpoint.Identity = null,
     create_runtime_fn: CreateRuntime,
     model_retention: ?*Session.ModelLifetime,
     shared_cache_retention: ?runtime.moe.shared.SharedExpertCache.Retention,
@@ -53,7 +54,9 @@ pub const Definition = struct {
             std.debug.assert(previous != 0);
             return self;
         }
-        return init(allocator, self.session, &self.configuration.value, self.kv_dtype, self.shared_moe_cache, self.create_runtime_fn);
+        const clone = try init(allocator, self.session, &self.configuration.value, self.kv_dtype, self.shared_moe_cache, self.create_runtime_fn);
+        clone.model_identity = self.model_identity;
+        return clone;
     }
 
     /// Equality with a request allocator is not lifetime provenance. Only
@@ -96,6 +99,12 @@ pub fn createExecutor(allocator: std.mem.Allocator, session: Session, configurat
     return .{ .ptr = try Definition.init(allocator, session, configuration, kv_dtype, shared_moe_cache, create_runtime), .vtable = &executor_vtable };
 }
 
+pub fn createExecutorWithIdentity(allocator: std.mem.Allocator, session: Session, configuration: *const gpt.Config, kv_dtype: ?runtime.kv.pool.KvDType, shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache, identity: ?runtime.kv.attention_match_checkpoint.Identity, create_runtime: CreateRuntime) !model.ModelExecutor {
+    const definition = try Definition.init(allocator, session, configuration, kv_dtype, shared_moe_cache, create_runtime);
+    definition.model_identity = identity;
+    return .{ .ptr = definition, .vtable = &executor_vtable, .model_identity = identity };
+}
+
 fn createRuntime(raw: *anyopaque, allocator: std.mem.Allocator) !model.ModelRuntime {
     const self: *Definition = @ptrCast(@alignCast(raw));
     return self.create_runtime_fn(self, allocator);
@@ -129,6 +138,36 @@ const TestRuntime = struct {
     }
     const vtable = model.ModelRuntime.VTable{ .prefill = prefill, .deinit = deinit };
 };
+
+test "context session decoder preserves model identity through runtime allocation" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    const table: Session.VTable = undefined;
+    const session = Session{ .ptr = &marker, .vtable = &table };
+    const config = gpt.Config{};
+    const identity = runtime.kv.attention_match_checkpoint.Identity{
+        .weights = @splat(1),
+        .tokenizer = @splat(2),
+        .template = @splat(3),
+        .layout = @splat(4),
+    };
+    for ([_]?runtime.kv.attention_match_checkpoint.Identity{ null, identity }) |expected| {
+        var executor = try createExecutorWithIdentity(a, session, &config, null, null, expected, TestRuntime.create);
+        defer executor.deinit();
+        try std.testing.expectEqualDeep(expected, executor.model_identity);
+        var shared_runtime = try executor.createRuntime(a);
+        defer shared_runtime.deinit();
+        try std.testing.expectEqualDeep(expected, shared_runtime.model_identity);
+
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var migrated_runtime = try executor.createRuntime(arena.allocator());
+        defer migrated_runtime.deinit();
+        const definition: *Definition = @ptrCast(@alignCast(migrated_runtime.ptr));
+        try std.testing.expectEqualDeep(expected, definition.model_identity);
+        try std.testing.expectEqualDeep(expected, migrated_runtime.model_identity);
+    }
+}
 
 fn checkRuntimeMigration(allocator: std.mem.Allocator, executor: *const model.ModelExecutor) !void {
     var result = try executor.createRuntime(allocator);

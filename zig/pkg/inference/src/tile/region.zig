@@ -27,7 +27,16 @@ pub const ProgramUse = struct {
     threads: ?[3]u32 = null,
     static_scratch_bytes: ?usize = null,
 };
-pub const Region = struct { path: []const u8, begin: []const u8, end: []const u8, data: []const u8, programs: []const ProgramUse = &.{} };
+pub const Region = struct {
+    path: []const u8,
+    begin: []const u8,
+    end: []const u8,
+    data: []const u8,
+    programs: []const ProgramUse = &.{},
+    /// A JIT library is consumed whole, without a generated string wrapper.
+    native_source: bool = false,
+    family: []const u8 = "",
+};
 
 pub const metal_kernels_m = "src/backends/metal_kernels.m";
 pub const cuda_bundle = "src/ops/cuda/artifacts/inference_cuda_kernels.cu";
@@ -101,7 +110,16 @@ pub const Family = struct {
     name: []const u8,
     source: type,
     programs: []const ProgramUse = &.{},
+    native_source: bool = false,
 };
+
+/// Register a complete, independently compiled Metal library in this same
+/// inventory. Its authored bytes are consumed directly by the runtime adapter.
+pub fn metalSourceFile(comptime name: []const u8, comptime path: []const u8, comptime text: []const u8) Family {
+    return .{ .path = path, .indent = "", .name = name, .native_source = true, .source = struct {
+        pub const source_0 = text;
+    } };
+}
 
 /// Provenance belongs to the existing family registry, not a parallel catalog.
 /// Select individual source indices when a family contains native ABI shells.
@@ -181,7 +199,10 @@ pub fn regions(comptime families: []const Family) [regionCount(families)]Region 
             for (0..count) |i| {
                 const key = if (count == 1) item.name else std.fmt.comptimePrint("{s}.{d}", .{ item.name, i });
                 const data = if (@hasDecl(item.source, "sources")) item.source.sources[i] else @field(item.source, std.fmt.comptimePrint("source_{d}", .{i}));
-                result[cursor] = region(item.path, item.indent, key, data);
+                result[cursor] = if (item.native_source)
+                    .{ .path = item.path, .begin = "", .end = "", .data = data, .native_source = true, .family = key }
+                else
+                    region(item.path, item.indent, key, data);
                 var uses: []const ProgramUse = &.{};
                 for (item.programs) |use| {
                     if (use.source_index == null or use.source_index.? == i) {
@@ -204,6 +225,16 @@ test "Metal source encoding preserves quotes backslashes blanks and line boundar
     try std.testing.expectEqualStrings("  \"kernel void k() {\\n\"\n  \"  // \\\"quoted\\\" \\\\n\\n\"\n  \"}\\n\"\n", comptime metalLines("  ", text));
     try std.testing.expectEqualStrings("", comptime metalLines("", "unterminated"));
     try std.testing.expectEqualStrings("\"a\\n\"\n", comptime metalLines("", "a\nunterminated"));
+}
+
+test "complete Metal library ownership preserves the directly consumed source" {
+    const source = "#include <metal_stdlib>\nkernel void operation() {}\n";
+    const owned = comptime regions(&.{metalSourceFile("attention.segmented", "src/tile/families/native/metal/attention_segmented.metal", source)});
+    try std.testing.expect(owned[0].native_source);
+    try std.testing.expectEqualStrings("attention.segmented", owned[0].family);
+    try std.testing.expectEqualStrings(source, owned[0].data);
+    try std.testing.expectEqualStrings("", owned[0].begin);
+    try std.testing.expectEqualStrings("", owned[0].end);
 }
 
 test "native family descriptors retain numbered keys and custom source paths" {

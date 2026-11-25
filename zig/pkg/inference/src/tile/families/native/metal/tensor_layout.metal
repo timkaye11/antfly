@@ -86,6 +86,15 @@ kernel void termite_copy_bytes(device const uchar *src [[buffer(0)]], device uch
 }
 // native-program:entry termite_gather_axis0_f32_2d
 // native-program:indent 11
+template<bool Bias> __attribute__((always_inline)) inline void termite_gather_axis0_impl(device const float *input, device const float *bias, device const float *indices, device float *output, constant termite_metal_gather_axis0_f32_2d_params &p, uint gid) {
+    uint total = p.index_count * p.cols; if (gid >= total || p.rows == 0u || p.cols == 0u) return;
+    uint out_row = gid / p.cols; uint col = gid - out_row * p.cols;
+    int row = int(indices[out_row]); if (row < 0) row += int(p.rows);
+    if (row >= 0 && uint(row) < p.rows) {
+        if (Bias) output[gid] = input[uint(row) * p.cols + col] + bias[col];
+        else output[gid] = input[uint(row) * p.cols + col];
+    } else output[gid] = 0.0f;
+}
 kernel void termite_gather_axis0_f32_2d(device const float *input [[buffer(0)]], device const float *indices [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_gather_axis0_f32_2d_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
     termite_gather_axis0_impl<false>(input, input, indices, output, p, gid);
 }

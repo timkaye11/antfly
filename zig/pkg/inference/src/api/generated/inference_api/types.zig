@@ -2596,6 +2596,14 @@ pub const GenerateChunk = struct {
     /// Authoritative token accounting. When `stream_options.include_usage` is true, streaming responses emit this only on the final chunk, after the finish chunk and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
     usage: OpenApiOptionalNullable(GenerateUsage) = .absent,
     speculation: OpenApiOptionalNullable(GenerateSpeculationStatus) = .absent,
+    /// Qualification-only unfiltered generated token IDs on terminal usage chunks.
+    generated_token_ids: ?[]const i32 = null,
+    /// Exact deduplicated request-local suppression union applied during token selection.
+    applied_suppress_token_ids: ?[]const i32 = null,
+    /// EOS token IDs used by the request-scoped fixed-length mask.
+    eos_token_ids: ?[]const i32 = null,
+    /// True when request-scoped EOS suppression was active.
+    fixed_length_mask_eos: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -2607,6 +2615,10 @@ pub const GenerateChunk = struct {
         .{ "context", "context", true },
         .{ "usage", "usage", false },
         .{ "speculation", "speculation", false },
+        .{ "generated_token_ids", "generated_token_ids", true },
+        .{ "applied_suppress_token_ids", "applied_suppress_token_ids", true },
+        .{ "eos_token_ids", "eos_token_ids", true },
+        .{ "fixed_length_mask_eos", "fixed_length_mask_eos", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2655,6 +2667,22 @@ pub const GenerateChunk = struct {
                 try jw.write(value);
             },
         }
+        if (self.generated_token_ids) |value| {
+            try jw.objectField("generated_token_ids");
+            try jw.write(value);
+        }
+        if (self.applied_suppress_token_ids) |value| {
+            try jw.objectField("applied_suppress_token_ids");
+            try jw.write(value);
+        }
+        if (self.eos_token_ids) |value| {
+            try jw.objectField("eos_token_ids");
+            try jw.write(value);
+        }
+        if (self.fixed_length_mask_eos) |value| {
+            try jw.objectField("fixed_length_mask_eos");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -2687,6 +2715,74 @@ pub const GenerateChunkChoice = struct {
         try jw.write(self.delta);
         if (self.finish_reason) |value| {
             try jw.objectField("finish_reason");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GenerateCompactionTarget = struct {
+    message_index: i64,
+    /// Zero-based text part; string message content is part zero.
+    part_index: i64,
+};
+
+/// Separate positional context limits from retained KV storage. Exact is the default. Approximate modes require a qualified Metal f16 implementation and reject unsupported combinations; setting a policy never extends the artifact's positional limit.
+pub const GenerateContextPolicy = struct {
+    /// Explicit user/tool text payloads eligible for attention matching. Other roles, metadata, special tokens and boundary-crossing tokens remain exact. Unsupported renderer/tokenizer provenance is rejected. Approximate serving is not yet qualified.
+    compaction_targets: ?[]const GenerateCompactionTarget = null,
+    mode: ?[]const u8 = null,
+    /// Optional cap on prompt plus output positions, bounded by the model limit.
+    max_context_tokens: ?i64 = null,
+    /// Retained rows per global KV head. Required for approximate modes.
+    max_kv_tokens: ?i64 = null,
+    /// Exact prefix protection in approximate modes; does not identify message boundaries.
+    keep_prefix_tokens: ?i64 = null,
+    /// Minimum recent exact tail in approximate modes.
+    keep_recent_tokens: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "compaction_targets", "compaction_targets", true },
+        .{ "mode", "mode", true },
+        .{ "max_context_tokens", "max_context_tokens", true },
+        .{ "max_kv_tokens", "max_kv_tokens", true },
+        .{ "keep_prefix_tokens", "keep_prefix_tokens", true },
+        .{ "keep_recent_tokens", "keep_recent_tokens", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.compaction_targets) |value| {
+            try jw.objectField("compaction_targets");
+            try jw.write(value);
+        }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.max_context_tokens) |value| {
+            try jw.objectField("max_context_tokens");
+            try jw.write(value);
+        }
+        if (self.max_kv_tokens) |value| {
+            try jw.objectField("max_kv_tokens");
+            try jw.write(value);
+        }
+        if (self.keep_prefix_tokens) |value| {
+            try jw.objectField("keep_prefix_tokens");
+            try jw.write(value);
+        }
+        if (self.keep_recent_tokens) |value| {
+            try jw.objectField("keep_recent_tokens");
             try jw.write(value);
         }
         try jw.endObject();
@@ -2892,6 +2988,8 @@ pub const GenerateRequest = struct {
     chat_template_kwargs: ?GenerateChatTemplateKwargs = null,
     /// inference-native benchmarking and controlled-generation extension. When true, generation does not stop on the model's end-of-sequence token and continues until another stop condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
     ignore_eos: ?bool = null,
+    /// Qualification-only fixed-length greedy policy. When true, every primary and additional end-of-sequence token is suppressed from request-local token selection until `max_tokens` is reached. Requires `ignore_eos=true`, deterministic greedy sampling, and no speculative decoding. HTTP serving also requires the operator qualification opt-in `ANTFLY_INFERENCE_JSON_TOKEN_IDS=1`. Omitted or false preserves the existing `ignore_eos` behavior.
+    fixed_length_mask_eos: ?bool = null,
     /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
     tools: ?[]const Tool = null,
     /// Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
@@ -2916,7 +3014,8 @@ pub const GenerateRequest = struct {
     speculation_calibration: ?[]const u8 = null,
     /// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
     cache_dtype: ?[]const u8 = null,
-    /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction. The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`; device-backed compaction is not yet supported.
+    context_policy: ?GenerateContextPolicy = null,
+    /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction. The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`; device-backed compaction is not yet supported. Cannot be combined with context_policy.
     cache_compaction_ratio: ?f32 = null,
     context_management: ?ContextManagement = null,
     kv_cache: ?KvCachePolicy = null,
@@ -2946,6 +3045,7 @@ pub const GenerateRequest = struct {
         .{ "stream_options", "stream_options", true },
         .{ "chat_template_kwargs", "chat_template_kwargs", true },
         .{ "ignore_eos", "ignore_eos", true },
+        .{ "fixed_length_mask_eos", "fixed_length_mask_eos", true },
         .{ "tools", "tools", true },
         .{ "min_p", "min_p", true },
         .{ "repetition_penalty", "repetition_penalty", true },
@@ -2958,6 +3058,7 @@ pub const GenerateRequest = struct {
         .{ "speculation_policy", "speculation_policy", true },
         .{ "speculation_calibration", "speculation_calibration", true },
         .{ "cache_dtype", "cache_dtype", true },
+        .{ "context_policy", "context_policy", true },
         .{ "cache_compaction_ratio", "cache_compaction_ratio", true },
         .{ "context_management", "context_management", true },
         .{ "kv_cache", "kv_cache", true },
@@ -3023,6 +3124,10 @@ pub const GenerateRequest = struct {
             try jw.objectField("ignore_eos");
             try jw.write(value);
         }
+        if (self.fixed_length_mask_eos) |value| {
+            try jw.objectField("fixed_length_mask_eos");
+            try jw.write(value);
+        }
         if (self.tools) |value| {
             try jw.objectField("tools");
             try jw.write(value);
@@ -3069,6 +3174,10 @@ pub const GenerateRequest = struct {
         }
         if (self.cache_dtype) |value| {
             try jw.objectField("cache_dtype");
+            try jw.write(value);
+        }
+        if (self.context_policy) |value| {
+            try jw.objectField("context_policy");
             try jw.write(value);
         }
         if (self.cache_compaction_ratio) |value| {
@@ -4054,6 +4163,68 @@ pub const NativeKvCheckpointMetadata = struct {
         try jw.write(self.preserved_heads);
         try jw.endObject();
     }
+};
+
+pub const NativeKvEnvelopeV2 = struct {
+    schema: []const u8,
+    /// Base64 of at most 16 KiB canonical NativeKvPreparedProducerV1 JSON. Resume clients forward this exact string unchanged.
+    prepared_metadata_base64: []const u8,
+    /// Optional JSON-encoded GenerateRequest or GenerateBatchRequest string. This is outer request metadata and is not part of NativeKvPreparedProducerV1.
+    request_json: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema", "schema", false },
+        .{ "prepared_metadata_base64", "prepared_metadata_base64", false },
+        .{ "request_json", "request_json", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema");
+        try jw.write(self.schema);
+        try jw.objectField("prepared_metadata_base64");
+        try jw.write(self.prepared_metadata_base64);
+        if (self.request_json) |value| {
+            try jw.objectField("request_json");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opaque producer authority embedded as canonical JSON and base64-encoded in NativeKvEnvelopeV2. Clients preserve its exact encoded bytes; they do not edit policy fields.
+pub const NativeKvPreparedProducerV1 = struct {
+    schema: []const u8,
+    model: []const u8,
+    model_artifact_sha256_hex: []const u8,
+    model_tokenizer_sha256_hex: []const u8,
+    model_template_sha256_hex: []const u8,
+    model_layout_sha256_hex: []const u8,
+    profile_sha256_hex: []const u8,
+    profile_semantic_sha256_hex: []const u8,
+    /// Compiled compaction implementation semantic digest. The sealed release receipt separately binds the complete source-freeze identity.
+    source_sha256_hex: []const u8,
+    binary_sha256_hex: []const u8,
+    policy_name: []const u8,
+    policy_sha256_hex: []const u8,
+    admission: []const u8,
+    chunk_rows: i64,
+    reject_exact_active_fixed_point: bool,
+    encoding: []const u8,
+    /// Producer lineage carried by the prepared result and forwarded unchanged. It is not compared to a nonexistent checkpoint-state revision field.
+    logical_revision: i64,
+    logical_tokens: i64,
+    checkpoint_bytes: i64,
+    outcome: []const u8,
 };
 
 pub const PredictRequest = struct {

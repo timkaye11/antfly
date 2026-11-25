@@ -1151,6 +1151,9 @@ from .inference_generate_choice_logprobs_type_0 import InferenceGenerateChoiceLo
 from .inference_generate_chunk import InferenceGenerateChunk
 from .inference_generate_chunk_choice import InferenceGenerateChunkChoice
 from .inference_generate_chunk_object import InferenceGenerateChunkObject
+from .inference_generate_compaction_target import InferenceGenerateCompactionTarget
+from .inference_generate_context_policy import InferenceGenerateContextPolicy
+from .inference_generate_context_policy_mode import InferenceGenerateContextPolicyMode
 from .inference_generate_delta import InferenceGenerateDelta
 from .inference_generate_delta_extra_content import InferenceGenerateDeltaExtraContent
 from .inference_generate_json_schema_config import InferenceGenerateJsonSchemaConfig
@@ -3938,6 +3941,9 @@ __all__ = (
     "InferenceGenerateChunk",
     "InferenceGenerateChunkChoice",
     "InferenceGenerateChunkObject",
+    "InferenceGenerateCompactionTarget",
+    "InferenceGenerateContextPolicy",
+    "InferenceGenerateContextPolicyMode",
     "InferenceGenerateDelta",
     "InferenceGenerateDeltaExtraContent",
     "InferenceGenerateJsonSchemaConfig",

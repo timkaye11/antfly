@@ -207,6 +207,13 @@ pub fn sessionF32WeightBorrowPolicy(
     return .canonical_mapped;
 }
 
+fn sessionF32WeightBorrowPolicyForConfig(backend_type: BackendType, override: ?TaskOverride, model_type: manifest_mod.ModelType, arch_config: ArchConfig, task: SessionTask, gliner_span_encoder_family: manifest_mod.GlinerSpanEncoderFamily) gpu_hosted_store_mod.F32WeightBorrow {
+    if (backend_type == .metal and override != .generic and arch_config == .gpt and model_type == .generator and task == .generic and
+        arch_config.gpt.family == .gemma and arch_config.gpt.gemma4_channel_protocol)
+        return .immutable_model_values;
+    return sessionF32WeightBorrowPolicy(backend_type, override, std.meta.activeTag(arch_config), task, gliner_span_encoder_family);
+}
+
 pub fn sessionPrefersImmutableGlinerF32Mps(
     backend_type: BackendType,
     arch_type: ArchType,
@@ -1130,6 +1137,8 @@ pub fn prepare(
     var gpu_jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null;
     errdefer if (gpu_jina_lora_adapter) |adapter| adapter.destroy();
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
+    const model_artifact_mmap_bytes = std.math.cast(usize, model_weight_bytes) orelse
+        return error.ResourceLimitExceeded;
 
     var arch_config = loaded_model.architecture;
     try host_weights.requireGlideBackend(mf, backend_type);
@@ -1399,6 +1408,7 @@ pub fn prepare(
     const weights: GpuHostedData = .{
         .allocator = allocator,
         .resident_weight_estimate_bytes = resident_weight_bytes_override,
+        .model_artifact_mmap_bytes = model_artifact_mmap_bytes,
         .prefix = resident_prefix,
         .lazy_weights = lazy_weights,
         .tensor_store = tensor_store,
@@ -1409,7 +1419,7 @@ pub fn prepare(
         .allow_direct_quant = session_direct_quant_enabled,
         .quant_execution_mode = quant_mode,
         .prefer_f32_dense_tensors = prefer_f32_dense_tensors,
-        .f32_weight_borrow = sessionF32WeightBorrowPolicy(backend_type, override, std.meta.activeTag(arch_config), task, mf.gliner_span_encoder_family),
+        .f32_weight_borrow = sessionF32WeightBorrowPolicyForConfig(backend_type, override, mf.model_type, arch_config, task, mf.gliner_span_encoder_family),
         .prefer_immutable_gliner_f32_mps = sessionPrefersImmutableGlinerF32Mps(backend_type, std.meta.activeTag(arch_config), task),
         .mirror_kv_to_manager = false,
         .jina_lora_adapter = gpu_jina_lora_adapter,

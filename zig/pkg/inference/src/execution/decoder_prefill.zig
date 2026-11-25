@@ -736,7 +736,11 @@ pub const Runtime = struct {
             .exact_repeat_probe = exact,
             .cuda_greedy = cuda_greedy,
             .metal_greedy = metal_greedy,
-            .metal_last_logits = decoder_routes.shouldUseMetalGemmaTargetLastLogits(backend, model, request.capture_hidden),
+            // The target-hidden shortcut uses the generic physical decoder and
+            // cannot retain a borrowed packed-session hook. Context sessions
+            // take the canonical GPT last-logits route below instead.
+            .metal_last_logits = self.state.context_session == null and
+                decoder_routes.shouldUseMetalGemmaTargetLastLogits(backend, model, request.capture_hidden),
             .typed_outputs = typed,
             .shared_kv = typed and !request.checkpoint and !request.capture_hidden and
                 (request.route.exact_hybrid or (build_options.enable_cuda and backend == .cuda and cuda_compute.CudaCompute.gemma4SharedKvPrefillEnabled(context.cb))),
@@ -819,7 +823,9 @@ pub const Runtime = struct {
         const output_intent = request.output_intent;
         const capture_last_hidden = request.capture_hidden;
         const allow_shared_kv_prefill = request.shared_kv_pruning;
-        const use_metal_target_last_logits = request.metal_target_last_logits;
+        // Defend the physical boundary as well as planPrompt: direct callers
+        // may construct ChunkRequest without going through request planning.
+        const use_metal_target_last_logits = request.metal_target_last_logits and self.state.context_session == null;
         const prefer_cuda_direct_last_logits = request.cuda_direct_last_logits;
         const can_use_typed_prefill_outputs = request.typed_outputs;
         var decode_runtime = BorrowedDecodeStateRuntime.init(self.state);
@@ -1005,6 +1011,7 @@ pub const Runtime = struct {
 
     pub const CompiledChunk = struct {
         token_ids: []const i64,
+        suppress_token_ids: ?[]const i32 = null,
         prepared_rows: ?@import("resident_rows.zig").Rows = null,
         total_sequence_length: usize,
         output: enum { kv_only, last_logits, greedy_token },
@@ -1032,6 +1039,7 @@ pub const Runtime = struct {
 
     fn runCompiledChunkWithOwnedLane(self: *Runtime, request: CompiledChunk, cache: *graph_mod.cache.GraphCache, comptime forward_fn: anytype) !Output {
         const allocator = self.forward.context.allocator;
+        const suppressions = request.suppress_token_ids orelse self.forward.context.gpt_config.suppressTokenIds();
         var logical = BorrowedDecodeStateRuntime.init(self.state);
         const context = try logical.preparePrefillWithCleanup(request.total_sequence_length, request.token_ids.len, .{ .boundary = self.forward.context.cleanupEpoch(), .operation = self.forward.context.cb.operationToken() });
         const cleanup_operation = self.forward.context.cb.operationToken();
@@ -1043,20 +1051,13 @@ pub const Runtime = struct {
             .kv_only => .kv_only,
             .last_logits => .last_logits,
             .greedy_token => .greedy_token,
-        } })) orelse return error.MissingCompiledModelRuntime;
+        }, .suppress_token_ids = suppressions })) orelse return error.MissingCompiledModelRuntime;
         defer output.deinitWithCleanup(allocator, cleanup);
         return switch (request.output) {
             .kv_only => .{},
             .last_logits => .{ .last_logits = try output.takeHostLogitsWithCleanup(allocator, cleanup) },
             .greedy_token => blk: {
-                const suppressions = self.forward.context.gpt_config.suppressTokenIds();
-                const token = if (suppressions.len == 0 or (if (output.prepared_tail) |tail| tail.greedy_token_id != null else false))
-                    try output.greedyTokenWithCleanup(allocator, self.forward.context.gpt_config.vocab_size, cleanup)
-                else masked: {
-                    const logits = try output.takeHostLogitsWithCleanup(allocator, cleanup);
-                    defer allocator.free(logits);
-                    break :masked @as(i64, @intCast(@import("../backends/activations.zig").argmaxSuppressedInPlace(logits, suppressions)));
-                };
+                const token = try output.greedyTokenSuppressWithCleanup(allocator, self.forward.context.gpt_config.vocab_size, suppressions, cleanup);
                 if (token < 0) return error.InvalidModelOutput;
                 break :blk .{ .greedy_token = @intCast(token) };
             },
@@ -1064,8 +1065,7 @@ pub const Runtime = struct {
     }
 
     fn forwardAllLogits(self: *Runtime, ids: []const i64, batch: usize, total: usize, decode: *const gpt_arch.DecodeContext) ![]f32 {
-        var fallback_count: u64 = 0;
-        return graph_mod.decoder_step_executor.forwardAll(&self.forward.context, self.forward.graph_cache, ids, batch, total, decode, self.forward.replay_fallbacks orelse &fallback_count);
+        return self.forward.forwardAllLogits(ids, batch, total, decode);
     }
     pub const PromptStateRequest = struct {
         prompt_tokens: usize,
@@ -1742,6 +1742,10 @@ pub fn retryAfterMemoryBudgetExceeded(
     err: anyerror,
 ) !bool {
     if (err != error.MemoryBudgetExceeded or attempted_chunk_size <= 1) return false;
+    // A packed context forward may already have committed owner KV before the
+    // budget error. It cannot roll that transaction back and replay a smaller
+    // chunk through the legacy reservation path.
+    if (decode_runtime.state.context_session != null) return false;
     try decode_runtime.rollbackReservedPrefill(reserved_tokens);
     if (!allow_resize) return false;
     current_chunk_size.* = @max(attempted_chunk_size / 2, 1);
@@ -1772,6 +1776,7 @@ fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
         decline: bool = false,
         fail_after: bool = false,
         expected_intent: decoder_routes.PrefillOutputIntent,
+        expected_suppressions: []const i32,
         fn get(raw: *anyopaque, name: []const u8) !ops.CT {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return gpt_arch.getTracedWeight(std.testing.allocator, &self.backend, self.config, name);
@@ -1780,6 +1785,7 @@ fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx.weights.?.ptr));
             self.calls += 1;
             try std.testing.expectEqual(self.expected_intent, options.output_intent);
+            try std.testing.expectEqualSlices(i32, self.expected_suppressions, options.suppress_token_ids);
             try std.testing.expect(@import("allocation_registry.zig").enabled());
             if (!self.lane.owned) return error.CompiledPrefillMissingExecutionLane;
             if (self.mutex.tryLock()) {
@@ -1796,12 +1802,13 @@ fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
             return output;
         }
     };
-    for (0..7) |scenario| {
-        model.suppress_token_ids_len = if (scenario == 6) 1 else 0;
+    for (0..9) |scenario| {
+        model.suppress_token_ids_len = if (scenario == 6 or scenario == 8) 1 else 0;
         model.suppress_token_ids[0] = if (expected[1] > expected[0]) 1 else 0;
+        const suppressions: ?[]const i32 = if (scenario == 7) model.suppress_token_ids[0..1] else if (scenario == 8) &.{} else null;
         var mutex: std.atomic.Mutex = .unlocked;
         var lane = control.ExecutionLane{};
-        var probe = Probe{ .backend = cb, .config = &model, .mutex = &mutex, .lane = &lane, .decline = scenario == 3, .fail_after = scenario == 4, .expected_intent = if (scenario == 0) .kv_only else if (scenario == 2 or scenario == 6) .greedy_token else .last_logits };
+        var probe = Probe{ .backend = cb, .config = &model, .mutex = &mutex, .lane = &lane, .decline = scenario == 3, .fail_after = scenario == 4, .expected_suppressions = suppressions orelse model.suppressTokenIds(), .expected_intent = if (scenario == 0) .kv_only else if (scenario == 2 or scenario >= 6) .greedy_token else .last_logits };
         var cache = graph_mod.cache.GraphCache.init(a);
         defer cache.deinit();
         var state = graph_mod.decode_state_runtime.NativeDecodeState.initContiguous(a);
@@ -1810,7 +1817,7 @@ fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
         diagnostics.configureBackend(true, &cb);
         const session = @import("../backends/session.zig").Session{ .ptr = &probe, .vtable = undefined, .invocation_diagnostics = .{ .diagnostics = &diagnostics } };
         var physical = Runtime{ .forward = .{ .context = .{ .session = session, .allocator = a, .cb = &cb, .gpt_config = &model, .weights = .{ .ptr = &probe, .get_fn = Probe.get } }, .graph_cache = &cache }, .state = &state, .execution = .{ .mutex = &mutex, .gate = &lane, .control = if (scenario == 5) .{ .deadline_ns = 0 } else null } };
-        const request = Runtime.CompiledChunk{ .token_ids = &ids, .total_sequence_length = ids.len, .output = if (scenario == 0) .kv_only else if (scenario == 2 or scenario == 6) .greedy_token else .last_logits };
+        const request = Runtime.CompiledChunk{ .token_ids = &ids, .suppress_token_ids = suppressions, .total_sequence_length = ids.len, .output = if (scenario == 0) .kv_only else if (scenario == 2 or scenario >= 6) .greedy_token else .last_logits };
         if (scenario == 5) {
             try std.testing.expectError(error.Timeout, physical.runCompiledChunkWith(request, Probe.forward));
         } else if (scenario == 3) {
@@ -1822,7 +1829,7 @@ fn checkNativeCompiledChunkCore(cb: ComputeBackend, _: ComputeBackend) !void {
             defer if (result.last_logits) |values| a.free(values);
             if (scenario == 0) try std.testing.expect(result.last_logits == null and result.greedy_token == null);
             if (scenario == 1) try std.testing.expectEqualSlices(f32, expected, result.last_logits.?);
-            if (scenario == 2 or scenario == 6) try std.testing.expectEqual(@as(usize, if (scenario == 6) (if (expected[1] > expected[0]) 0 else 1) else (if (expected[1] > expected[0]) 1 else 0)), result.greedy_token.?);
+            if (scenario == 2 or scenario >= 6) try std.testing.expectEqual(@as(usize, if (scenario == 6 or scenario == 7) (if (expected[1] > expected[0]) 0 else 1) else (if (expected[1] > expected[0]) 1 else 0)), result.greedy_token.?);
         }
         try std.testing.expectEqual(@as(usize, if (scenario == 5) 0 else 1), probe.calls);
         try std.testing.expectEqual(@as(usize, if (scenario == 3 or scenario == 5) 0 else 1), probe.numerical_calls);

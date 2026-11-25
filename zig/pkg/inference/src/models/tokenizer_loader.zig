@@ -388,21 +388,9 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
     var parsed = try gguf_format.parse(parse_allocator, region.data);
     defer parsed.deinit(parse_allocator);
 
-    const view = gguf_metadata.View.init(&parsed);
-    const model_name = view.getString("tokenizer.ggml.model") orelse return error.NoTokenizerFound;
-
-    const tokenizer_bytes = if (std.mem.eql(u8, model_name, "t5"))
-        try unigramTokenizerJsonFromGguf(allocator, &parsed)
-    else blk: {
-        const flavor: GgufBpeTokenizerFlavor = if (std.mem.eql(u8, model_name, "gpt2"))
-            .byte_level
-        else if (std.mem.eql(u8, model_name, "gemma4"))
-            .gemma4
-        else
-            return error.NoTokenizerFound;
-        break :blk try bpeTokenizerJsonFromGguf(allocator, &parsed, flavor);
-    };
+    const tokenizer_bytes = try tokenizerJsonFromParsedGguf(allocator, &parsed);
     defer allocator.free(tokenizer_bytes);
+    const source_identity = ggufTokenizerIdentity(&parsed, tokenizer_bytes);
 
     const tok = try hf_tokenizer.HfTokenizer.loadFromBytesAllowDuplicateFields(allocator, tokenizer_bytes);
     errdefer tok.deinitSelf();
@@ -447,7 +435,45 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
         }
         try tok.applyModelWrapTemplate(prepend, append);
     }
+    tok.source_identity = source_identity;
     return tok;
+}
+
+pub fn tokenizerJsonFromParsedGguf(allocator: std.mem.Allocator, parsed: *const gguf_format.File) ![]u8 {
+    const model_name = gguf_metadata.View.init(parsed).getString("tokenizer.ggml.model") orelse return error.NoTokenizerFound;
+    return if (std.mem.eql(u8, model_name, "t5"))
+        unigramTokenizerJsonFromGguf(allocator, parsed)
+    else blk: {
+        const flavor: GgufBpeTokenizerFlavor = if (std.mem.eql(u8, model_name, "gpt2"))
+            .byte_level
+        else if (std.mem.eql(u8, model_name, "gemma4"))
+            .gemma4
+        else
+            return error.NoTokenizerFound;
+        break :blk bpeTokenizerJsonFromGguf(allocator, parsed, flavor);
+    };
+}
+
+pub fn ggufTokenizerIdentity(parsed: *const gguf_format.File, tokenizer_json: []const u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly.hf-tokenizer.gguf.v1\x00");
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, @intCast(tokenizer_json.len), .little);
+    hash.update(&length);
+    hash.update(tokenizer_json);
+    inline for (.{ "tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id", "tokenizer.ggml.padding_token_id", "tokenizer.ggml.unknown_token_id" }) |key| {
+        if (metadataTokenId(parsed, key)) |value| {
+            hash.update(&.{1});
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(i32, &bytes, value, .little);
+            hash.update(&bytes);
+        } else hash.update(&.{0});
+    }
+    const view = gguf_metadata.View.init(parsed);
+    inline for (.{ "tokenizer.ggml.add_bos_token", "tokenizer.ggml.add_eos_token" }) |key| {
+        if (view.getBool(key)) |value| hash.update(&.{if (value) 2 else 1}) else hash.update(&.{0});
+    }
+    return hash.finalResult();
 }
 
 const GgufBpeTokenizerFlavor = enum {
@@ -624,7 +650,7 @@ fn appendSpecialTokensFromMetadata(
     }
 }
 
-fn metadataTokenId(parsed: *const gguf_format.File, key: []const u8) ?i32 {
+pub fn metadataTokenId(parsed: *const gguf_format.File, key: []const u8) ?i32 {
     const view = gguf_metadata.View.init(parsed);
     const raw_id = view.getU64(key) orelse return null;
     return std.math.cast(i32, raw_id);

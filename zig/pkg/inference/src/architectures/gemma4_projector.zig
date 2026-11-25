@@ -8715,7 +8715,10 @@ test "gemma4 video portable generation projects large edited AV1 and AVC transpo
     try std.testing.expectError(error.ResourceLimitExceeded, video_input.selectedPresentationUs(a, bytes, .{}, .{ .timestamps = .{} }, null));
     const reference = try video_input.selectedPresentationUs(a, bytes, .{}, .reference, null);
     defer a.free(reference);
-    try std.testing.expectEqualSlices(i64, &.{ 250000, 1250000 }, reference);
+    // Reference sampling returns the edited presentation timeline normalized
+    // to its playable origin. The packet-sampling refactor no longer exposes
+    // the source-track offset as a presentation timestamp.
+    try std.testing.expectEqualSlices(i64, &.{ 0, 875000 }, reference);
     var projected = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{}, a, projector, bytes);
     defer projected.deinit();
     try std.testing.expectEqualSlices(i64, &.{ 0, 1125000 }, projected.timestamps_us);
@@ -10709,7 +10712,10 @@ fn checkRetainedAudioStorage(cb: ComputeBackend, _: ComputeBackend) !void {
         tensor.deinit();
         try cb.decoderRuntimeSubmitAndWaitFrame();
         try std.testing.expect(runtime.antfly_metal_audio_storage_bytes(raw) <= 128 * 1024 * 1024);
-        if (iteration == 1) try std.testing.expect(runtime.antfly_metal_audio_storage_hits(raw) > hits);
+        if (iteration == 0)
+            try std.testing.expectEqual(@as(usize, 16 * 1024), runtime.antfly_metal_audio_storage_bytes(raw))
+        else
+            try std.testing.expectEqual(hits + 1, runtime.antfly_metal_audio_storage_hits(raw));
     }
     try std.testing.expectEqual(@as(c_int, -1), runtime.antfly_metal_audio_storage_clear(raw));
     try std.testing.expectEqual(@as(c_int, 0), runtime.antfly_metal_audio_storage_scope(raw, 0));

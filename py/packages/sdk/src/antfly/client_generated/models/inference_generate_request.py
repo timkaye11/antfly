@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..models.inference_chat_message import InferenceChatMessage
     from ..models.inference_context_management import InferenceContextManagement
     from ..models.inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
+    from ..models.inference_generate_context_policy import InferenceGenerateContextPolicy
     from ..models.inference_generate_response_format import InferenceGenerateResponseFormat
     from ..models.inference_generate_stream_options import InferenceGenerateStreamOptions
     from ..models.inference_kv_cache_policy import InferenceKvCachePolicy
@@ -56,6 +57,14 @@ class InferenceGenerateRequest:
             does not stop on the model's end-of-sequence token and continues until another stop
             condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
              Default: False.
+        fixed_length_mask_eos (bool | Unset): Qualification-only fixed-length greedy policy. When true, every primary
+            and additional
+            end-of-sequence token is suppressed from request-local token selection until `max_tokens`
+            is reached. Requires `ignore_eos=true`, deterministic greedy sampling, and no speculative
+            decoding. HTTP serving also requires the operator qualification opt-in
+            `ANTFLY_INFERENCE_JSON_TOKEN_IDS=1`. Omitted or false preserves the existing `ignore_eos`
+            behavior.
+             Default: False.
         tools (list[InferenceTool] | Unset): List of tools (functions) the model can call.
             Only supported by models with tool_call_format configured.
         min_p (float | Unset): Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to
@@ -84,12 +93,16 @@ class InferenceGenerateRequest:
         cache_dtype (InferenceGenerateRequestCacheDtype | Unset): inference-native KV cache quantization format. Lower
             precision reduces memory usage but may
             affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
+        context_policy (InferenceGenerateContextPolicy | Unset): Separate positional context limits from retained KV
+            storage. Exact is the default.
+            Approximate modes require a qualified Metal f16 implementation and reject unsupported
+            combinations; setting a policy never extends the artifact's positional limit.
         cache_compaction_ratio (float | Unset): inference-native KV cache compaction ratio applied after prefill via
             Attention Matching.
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
             The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
-            device-backed compaction is not yet supported.
+            device-backed compaction is not yet supported. Cannot be combined with context_policy.
         context_management (InferenceContextManagement | Unset):
         kv_cache (InferenceKvCachePolicy | Unset):
         prompt_cache_key (str | Unset): inference-native prompt prefix cache namespace key. Requests with the same key
@@ -135,6 +148,7 @@ class InferenceGenerateRequest:
     stream_options: InferenceGenerateStreamOptions | Unset = UNSET
     chat_template_kwargs: InferenceGenerateChatTemplateKwargs | Unset = UNSET
     ignore_eos: bool | Unset = False
+    fixed_length_mask_eos: bool | Unset = False
     tools: list[InferenceTool] | Unset = UNSET
     min_p: float | Unset = 0.0
     repetition_penalty: float | Unset = 1.0
@@ -147,6 +161,7 @@ class InferenceGenerateRequest:
     speculation_policy: InferenceGenerateRequestSpeculationPolicy | Unset = UNSET
     speculation_calibration: InferenceGenerateRequestSpeculationCalibration | Unset = UNSET
     cache_dtype: InferenceGenerateRequestCacheDtype | Unset = UNSET
+    context_policy: InferenceGenerateContextPolicy | Unset = UNSET
     cache_compaction_ratio: float | Unset = UNSET
     context_management: InferenceContextManagement | Unset = UNSET
     kv_cache: InferenceKvCachePolicy | Unset = UNSET
@@ -190,6 +205,8 @@ class InferenceGenerateRequest:
 
         ignore_eos = self.ignore_eos
 
+        fixed_length_mask_eos = self.fixed_length_mask_eos
+
         tools: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.tools, Unset):
             tools = []
@@ -226,6 +243,10 @@ class InferenceGenerateRequest:
         cache_dtype: str | Unset = UNSET
         if not isinstance(self.cache_dtype, Unset):
             cache_dtype = self.cache_dtype.value
+
+        context_policy: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.context_policy, Unset):
+            context_policy = self.context_policy.to_dict()
 
         cache_compaction_ratio = self.cache_compaction_ratio
 
@@ -289,6 +310,8 @@ class InferenceGenerateRequest:
             field_dict["chat_template_kwargs"] = chat_template_kwargs
         if ignore_eos is not UNSET:
             field_dict["ignore_eos"] = ignore_eos
+        if fixed_length_mask_eos is not UNSET:
+            field_dict["fixed_length_mask_eos"] = fixed_length_mask_eos
         if tools is not UNSET:
             field_dict["tools"] = tools
         if min_p is not UNSET:
@@ -313,6 +336,8 @@ class InferenceGenerateRequest:
             field_dict["speculation_calibration"] = speculation_calibration
         if cache_dtype is not UNSET:
             field_dict["cache_dtype"] = cache_dtype
+        if context_policy is not UNSET:
+            field_dict["context_policy"] = context_policy
         if cache_compaction_ratio is not UNSET:
             field_dict["cache_compaction_ratio"] = cache_compaction_ratio
         if context_management is not UNSET:
@@ -339,6 +364,7 @@ class InferenceGenerateRequest:
         from ..models.inference_chat_message import InferenceChatMessage
         from ..models.inference_context_management import InferenceContextManagement
         from ..models.inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
+        from ..models.inference_generate_context_policy import InferenceGenerateContextPolicy
         from ..models.inference_generate_response_format import InferenceGenerateResponseFormat
         from ..models.inference_generate_stream_options import InferenceGenerateStreamOptions
         from ..models.inference_kv_cache_policy import InferenceKvCachePolicy
@@ -384,6 +410,8 @@ class InferenceGenerateRequest:
             chat_template_kwargs = InferenceGenerateChatTemplateKwargs.from_dict(_chat_template_kwargs)
 
         ignore_eos = d.pop("ignore_eos", UNSET)
+
+        fixed_length_mask_eos = d.pop("fixed_length_mask_eos", UNSET)
 
         _tools = d.pop("tools", UNSET)
         tools: list[InferenceTool] | Unset = UNSET
@@ -435,6 +463,13 @@ class InferenceGenerateRequest:
             cache_dtype = UNSET
         else:
             cache_dtype = InferenceGenerateRequestCacheDtype(_cache_dtype)
+
+        _context_policy = d.pop("context_policy", UNSET)
+        context_policy: InferenceGenerateContextPolicy | Unset
+        if isinstance(_context_policy, Unset):
+            context_policy = UNSET
+        else:
+            context_policy = InferenceGenerateContextPolicy.from_dict(_context_policy)
 
         cache_compaction_ratio = d.pop("cache_compaction_ratio", UNSET)
 
@@ -509,6 +544,7 @@ class InferenceGenerateRequest:
             stream_options=stream_options,
             chat_template_kwargs=chat_template_kwargs,
             ignore_eos=ignore_eos,
+            fixed_length_mask_eos=fixed_length_mask_eos,
             tools=tools,
             min_p=min_p,
             repetition_penalty=repetition_penalty,
@@ -521,6 +557,7 @@ class InferenceGenerateRequest:
             speculation_policy=speculation_policy,
             speculation_calibration=speculation_calibration,
             cache_dtype=cache_dtype,
+            context_policy=context_policy,
             cache_compaction_ratio=cache_compaction_ratio,
             context_management=context_management,
             kv_cache=kv_cache,

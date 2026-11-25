@@ -3,6 +3,7 @@ from typing import Any
 
 import httpx
 
+from ....native_kv_transport import native_kv_request_async
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.inference_error import InferenceError
@@ -22,9 +23,14 @@ def _get_kwargs(
         "url": "/ai/v1/generate/context/resume",
     }
 
-    _kwargs["content"] = body.payload
+    if isinstance(body, File):
+        _kwargs["content"] = body.payload
 
-    headers["Content-Type"] = "application/vnd.antfly.attachments.v1"
+        headers["Content-Type"] = "application/vnd.antfly.attachments.v1"
+    if isinstance(body, File):
+        _kwargs["content"] = body.payload
+
+        headers["Content-Type"] = "application/vnd.antfly.attachments.v2"
 
     _kwargs["headers"] = headers
     return _kwargs
@@ -87,8 +93,10 @@ def sync_detailed(
 ) -> Response[InferenceError | InferenceGenerateResponse | InferenceTransientCapacityError]:
     """Generate from a portable native KV checkpoint
 
-     Accepts one AFATT001 envelope whose JSON metadata is a GenerateRequest
-    and whose single application/vnd.antfly.kv-checkpoint attachment is a
+     Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateRequest;
+    AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+    string contains the GenerateRequest. Its single
+    application/vnd.antfly.kv-checkpoint attachment is a
     complete native checkpoint. The metadata supplies the complete messages,
     tool definitions and template options. Their rendered tokens must have
     the checkpoint tokens as an exact prefix; prefix rewriting is rejected.
@@ -104,6 +112,7 @@ def sync_detailed(
     The original checkpoint remains immutable and reusable.
 
     Args:
+        body (File):
         body (File):
 
     Raises:
@@ -132,8 +141,10 @@ def sync(
 ) -> InferenceError | InferenceGenerateResponse | InferenceTransientCapacityError | None:
     """Generate from a portable native KV checkpoint
 
-     Accepts one AFATT001 envelope whose JSON metadata is a GenerateRequest
-    and whose single application/vnd.antfly.kv-checkpoint attachment is a
+     Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateRequest;
+    AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+    string contains the GenerateRequest. Its single
+    application/vnd.antfly.kv-checkpoint attachment is a
     complete native checkpoint. The metadata supplies the complete messages,
     tool definitions and template options. Their rendered tokens must have
     the checkpoint tokens as an exact prefix; prefix rewriting is rejected.
@@ -149,6 +160,7 @@ def sync(
     The original checkpoint remains immutable and reusable.
 
     Args:
+        body (File):
         body (File):
 
     Raises:
@@ -172,8 +184,10 @@ async def asyncio_detailed(
 ) -> Response[InferenceError | InferenceGenerateResponse | InferenceTransientCapacityError]:
     """Generate from a portable native KV checkpoint
 
-     Accepts one AFATT001 envelope whose JSON metadata is a GenerateRequest
-    and whose single application/vnd.antfly.kv-checkpoint attachment is a
+     Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateRequest;
+    AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+    string contains the GenerateRequest. Its single
+    application/vnd.antfly.kv-checkpoint attachment is a
     complete native checkpoint. The metadata supplies the complete messages,
     tool definitions and template options. Their rendered tokens must have
     the checkpoint tokens as an exact prefix; prefix rewriting is rejected.
@@ -190,6 +204,7 @@ async def asyncio_detailed(
 
     Args:
         body (File):
+        body (File):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -203,7 +218,7 @@ async def asyncio_detailed(
         body=body,
     )
 
-    response = await client.get_async_httpx_client().request(**kwargs)
+    response = await native_kv_request_async(client.get_async_httpx_client(), **kwargs)
 
     return _build_response(client=client, response=response)
 
@@ -215,8 +230,10 @@ async def asyncio(
 ) -> InferenceError | InferenceGenerateResponse | InferenceTransientCapacityError | None:
     """Generate from a portable native KV checkpoint
 
-     Accepts one AFATT001 envelope whose JSON metadata is a GenerateRequest
-    and whose single application/vnd.antfly.kv-checkpoint attachment is a
+     Accepts one AFATT001 or AFATT002 envelope. AFATT001 metadata is a GenerateRequest;
+    AFATT002 outer metadata conforms to NativeKvEnvelopeV2 and its request_json
+    string contains the GenerateRequest. Its single
+    application/vnd.antfly.kv-checkpoint attachment is a
     complete native checkpoint. The metadata supplies the complete messages,
     tool definitions and template options. Their rendered tokens must have
     the checkpoint tokens as an exact prefix; prefix rewriting is rejected.
@@ -232,6 +249,7 @@ async def asyncio(
     The original checkpoint remains immutable and reusable.
 
     Args:
+        body (File):
         body (File):
 
     Raises:
