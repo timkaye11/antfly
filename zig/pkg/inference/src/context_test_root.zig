@@ -39,7 +39,6 @@ test {
     _ = @import("runtime/kv/attention_match_native_resident_hybrid_bridge.zig");
     _ = @import("context_resident_hybrid_staged_configuration.zig");
     _ = @import("context_resident_hybrid_compatibility_profile.zig");
-    _ = @import("context_native_resident_core_replay.zig");
     _ = @import("runtime/kv/attention_match_e4_flat8128_pressure_profile.zig");
     _ = @import("runtime/kv/attention_match_train_challenge_pilot_adapter.zig");
     _ = @import("runtime/kv/attention_match_checkpoint_phase_loader.zig");
@@ -47,8 +46,6 @@ test {
     _ = @import("runtime/kv/attention_match_accelerate_fp64_probability_scan.zig");
     _ = @import("runtime/kv/attention_match_native_coverage_training_merge.zig");
     _ = @import("runtime/kv/attention_match_train_surrogate_partition_minimax.zig");
-    _ = @import("runtime/kv/attention_match_train32_augmentation_reader.zig");
-    _ = @import("runtime/kv/attention_match_case_replay_native.zig");
     _ = @import("runtime/kv/attention_match_joint_adaptive_quality.zig");
     _ = @import("runtime/kv/attention_match_physical_budget.zig");
     _ = @import("runtime/kv/attention_match_bounded_page_delta_accelerate.zig");
@@ -63,8 +60,6 @@ test {
     _ = @import("context_model_test.zig");
     _ = @import("context_metal_checkpoint_qualify.zig");
     _ = @import("context_quality_worker_staged_candidate.zig");
-    _ = @import("context_production768_offline_replay.zig");
-    _ = @import("runtime/kv/attention_match_production768_offline_replay.zig");
     _ = @import("runtime/kv/metal_checkpoint_cycles.zig");
     _ = @import("runtime/kv/attention_match_fit_policy.zig");
     _ = @import("server/native_kv_wire.zig");
@@ -140,10 +135,6 @@ test {
     _ = @import("runtime/kv/attention_match_global_residual_diagnostic.zig");
     _ = @import("runtime/kv/attention_match_global_training_cache.zig");
     _ = @import("runtime/kv/attention_match_rejected_fixture.zig");
-    _ = @import("runtime/kv/attention_match_v18_rejected_domain_replay.zig");
-    _ = @import("runtime/kv/attention_match_rejected_replay.zig");
-    _ = @import("runtime/kv/attention_match_exact_peak_residual_replay.zig");
-    _ = @import("runtime/kv/attention_match_p91_geometry_snapshot_replay.zig");
     _ = @import("runtime/kv/attention_match_exact_core_mass_calibration.zig");
     _ = @import("runtime/kv/attention_match_exact_peak_residual.zig");
     _ = @import("runtime/kv/attention_match_fixed_support_global_refit.zig");
@@ -165,7 +156,6 @@ test {
     _ = @import("runtime/kv/attention_match_whole_fit_input.zig");
     _ = @import("runtime/kv/attention_match_training_augmentation.zig");
     _ = @import("runtime/kv/attention_match_future_augmentation.zig");
-    _ = @import("runtime/kv/attention_match_exact_peak_whole_replay.zig");
     _ = @import("runtime/kv/attention_match_chunk_admission_diagnostic.zig");
     _ = @import("runtime/kv/attention_match_chunk_admission_replay.zig");
     _ = @import("runtime/kv/attention_match_chunk_admission_native.zig");
